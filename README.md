@@ -1,8 +1,8 @@
 # Eduardo-27B 实验：基础镜像与独立代码
 
-本仓库的 Dockerfile 只构建 **CUDA 12.8.1 + Ubuntu 22.04 的基础环境**，包含 Python 3、pip、venv、git、curl 与 uv 0.9.5。APT 与 Python 软件包默认使用阿里云镜像。**镜像不打包本仓库实验代码、vLLM、PyTorch、判分程序、模型或数据**；代码和额外依赖需按服务器规则另行下载、安装或挂载。
+本仓库的 Dockerfile 只构建 **CUDA 12.8.1 + Ubuntu 22.04 的基础环境**，包含 Python 3.10、pip、venv、Python 头文件、C/C++ 构建工具、git、curl 与 uv 0.9.5。Ubuntu 主软件源及 Python 软件包默认使用阿里云镜像；基础镜像自带的其他软件源需由管理员检查。**镜像不打包本仓库实验代码、vLLM、PyTorch、判分程序、模型或数据**；代码和额外依赖需按服务器规则另行下载、安装或挂载。
 
-本地没有 Docker daemon 权限，也没有连接目标服务器；镜像构建、驱动兼容、8×A100、依赖安装及 GPU 运行均未实测。CUDA 12.8 对驱动的要求、NVIDIA Container Toolkit、镜像和阿里镜像可用性请由站内管理员确认。`nvidia/cuda:12.8.1-runtime-ubuntu22.04` 标签尚未在此环境完成拉取或镜像摘要核验；如站点已有经批准镜像，可由管理员审核调整。Ubuntu APT 包并非逐项固定版本，严格复现需记录实际镜像摘要与包版本。
+本地没有 Docker daemon 权限，也没有连接目标服务器；已尝试构建但因权限不足失败，镜像构建、驱动兼容、8×A100、依赖安装及 GPU 运行均未实测。已通过 Docker Hub 核验 CUDA 基础镜像索引摘要并固定在 Dockerfile，尚未拉取该镜像。如站点已有经批准镜像，可由管理员审核调整。Ubuntu APT 包并非逐项固定版本，严格复现需记录实际镜像摘要与包版本。CUDA 12.8 的配套驱动和 NVIDIA Container Toolkit 须在站内确认；不要通过禁用版本检查绕过驱动不足。
 
 ## 数据边界
 
@@ -13,6 +13,8 @@
 按站点制度，由管理员或有权限的人使用本仓库中的 Dockerfile 构建基础镜像，或在批准的机器上构建并以批准方式单向导入。构建需要取得 NVIDIA CUDA 基础镜像和阿里云软件包，目标服务器是否允许访问这些地址必须先按其制度核实。示例为 `docker build -t eduardo-base:local .`；构建日志留在服务器内。基础镜像没有 `COPY` 实验代码，也没有安装 vLLM 或训练依赖。
 
 之后按允许方式把本私有仓库的代码单向取得到服务器本地，或由管理员提供只读目录。不要在目标服务器对源码执行 `git push`，不要把仓库凭据写入镜像、代码、命令行参数或日志。额外环境应单独安装在站内持久化目录：例如 Python 虚拟环境、`vllm==0.18.0`、兼容的 PyTorch/Transformers、OpenAI 兼容本机客户端、math-verify 等；实际版本及 CUDA/驱动兼容性需由管理员和单题测试确认，阿里镜像不保证包含每个 wheel。下载依赖属于批准的入站操作，不能解释成可外传实验数据。
+
+版本选择依据：作者的 Dockerfile 实际基于 `nvcr.io/nvidia/vllm:26.03.post1-py3`，文件注明面向 GH200/aarch64 且包含 veRL 训练环境；这里准备的是 A100 推理基础环境，不是作者训练镜像的逐项复刻。我们之前在 2×A100 上用 vLLM 0.18 和 BF16 加载 Eduardo-27B 并完成短生成；另一次 CPU 依赖核对使用 torch 2.10.0+cu128。那次完整评测因缺少 pandas 中断，因此新站需要安装并验证 pandas、parquet 相关依赖，不能仅凭模型加载通过便判定全链路已通过。vLLM 及其 PyTorch、transformers 依赖应在独立环境解析并冻结，避免预先强装未经验证的组合。
 
 ## 代码原型与评测
 
