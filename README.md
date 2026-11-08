@@ -1,8 +1,8 @@
 # Eduardo-27B 实验：基础镜像与独立代码
 
-本仓库的 Dockerfile 只构建 **CUDA 12.8.1 + Ubuntu 22.04 的基础环境**，包含 Python 3.10、pip、venv、Python 头文件、C/C++ 构建工具、git、curl 与 uv 0.9.5。Ubuntu 主软件源及 Python 软件包默认使用阿里云镜像；基础镜像自带的其他软件源需由管理员检查。**镜像不打包本仓库实验代码、vLLM、PyTorch、判分程序、模型或数据**；代码和额外依赖需按服务器规则另行下载、安装或挂载。
+本仓库的 Dockerfile 使用阿里云官方镜像构建 **CUDA 12.8.1 开发工具 + Ubuntu 24.04 的基础环境**，包含 `nvcc`、Python 3.12、pip、venv、Python 头文件、C/C++ 构建工具、git、curl 与 uv 0.9.5。按用户最新要求，不安装 Miniconda。基础镜像来自阿里云容器仓库，APT、pip 与 uv 配置使用阿里云源；不会内置实验代码、vLLM、PyTorch、判分程序、模型或数据，这些依赖和文件需按服务器规则另行准备。
 
-本地没有 Docker daemon 权限，也没有连接目标服务器；已尝试构建但因权限不足失败，镜像构建、驱动兼容、8×A100、依赖安装及 GPU 运行均未实测。已通过 Docker Hub 核验 CUDA 基础镜像索引摘要并固定在 Dockerfile，尚未拉取该镜像。如站点已有经批准镜像，可由管理员审核调整。Ubuntu APT 包并非逐项固定版本，严格复现需记录实际镜像摘要与包版本。CUDA 12.8 的配套驱动和 NVIDIA Container Toolkit 须在站内确认；不要通过禁用版本检查绕过驱动不足。
+本地没有 Docker daemon 权限，也没有连接目标服务器；镜像构建、驱动兼容、8×A100、依赖安装及 GPU 运行均未实测。已核验阿里官方 CUDA 开发镜像的索引摘要并固定在 Dockerfile，尚未拉取或构建该镜像。如站点已有经批准镜像，可由管理员审核调整。Ubuntu APT 包并非逐项固定版本，严格复现需记录实际镜像摘要与包版本。CUDA 12.8 的配套驱动和 NVIDIA Container Toolkit 须在站内确认；不要通过禁用版本检查绕过驱动不足。
 
 ## 数据边界
 
@@ -10,7 +10,9 @@
 
 ## 先准备基础镜像
 
-按站点制度，由管理员或有权限的人使用本仓库中的 Dockerfile 构建基础镜像，或在批准的机器上构建并以批准方式单向导入。构建需要取得 NVIDIA CUDA 基础镜像和阿里云软件包，目标服务器是否允许访问这些地址必须先按其制度核实。示例为 `docker build -t eduardo-base:local .`；构建日志留在服务器内。基础镜像没有 `COPY` 实验代码，也没有安装 vLLM 或训练依赖。
+按站点制度，由管理员或有权限的人使用本仓库中的 Dockerfile 构建基础镜像，或在批准的机器上构建并以批准方式单向导入。构建需要访问阿里云容器仓库、Ubuntu 软件源和 PyPI 软件源，目标服务器是否允许访问这些地址须先按其制度核实。示例为 `docker build -t eduardo-base:local .`；构建日志留在服务器内。基础镜像没有 `COPY` 实验代码，也没有安装 vLLM 或训练依赖。Ubuntu 24.04 的系统 Python 不应直接用 pip 改写；在可写目录使用 `python3 -m venv /path/to/eduardo-env` 创建虚拟环境，再以该环境的 `python -m pip` 安装依赖。
+
+在允许的 GPU 节点构建后，应分别运行 `docker run --rm IMAGE nvcc --version`、`docker run --rm IMAGE python3 --version` 和 `docker run --rm --gpus all IMAGE nvidia-smi`。镜像提供 CUDA 用户态工具，GPU 驱动由宿主机通过 NVIDIA Container Toolkit 注入；最后一项是否通过只能以目标机器实测为准。
 
 之后按允许方式把本公开仓库的代码单向取得到服务器本地，或由管理员提供只读目录。不要在目标服务器对源码执行 `git push`，不要把凭据写入镜像、代码、命令行参数或日志。额外环境应单独安装在站内持久化目录：例如 Python 虚拟环境、`vllm==0.18.0`、兼容的 PyTorch/Transformers、OpenAI 兼容本机客户端、math-verify 等；实际版本及 CUDA/驱动兼容性需由管理员和单题测试确认，阿里镜像不保证包含每个 wheel。下载依赖属于批准的入站操作，不能解释成可外传实验数据。
 
