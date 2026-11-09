@@ -1,4 +1,7 @@
 """Start local vLLM teacher/student services and a fresh offline evaluation."""
+import argparse
+import atexit
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -23,6 +26,25 @@ def file_sha(path):
     return h.hexdigest()
 
 
+def bind_config(marker, config):
+    from scoring import put_once
+    try:
+        put_once(marker, config)
+    except FileExistsError:
+        if json.loads(marker.read_text(encoding='utf-8')) != config:
+            raise ValueError('saved run configuration does not match; use a new output directory')
+
+
+def lock_results(directory):
+    fd = os.open(str(directory / '.run.lock'), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
 def ready(proc, port, timeout=1800):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -39,7 +61,12 @@ def ready(proc, port, timeout=1800):
 
 
 def main():
+    from offline_eval import parse_sources
     os.umask(0o077)
+    parser = argparse.ArgumentParser(description='Run one transfer difficulty in an independent result directory.')
+    parser.add_argument('--difficulty', choices=('paper', 'easy', 'medium', 'hard'), default='paper',
+                        help='paper: author transfer; easy/medium/hard: own dataset position')
+    args = parser.parse_args()
     teacher = Path(os.environ.get('TEACHER_MODEL', '/models/teacher'))
     student = Path(os.environ.get('STUDENT_MODEL', '/models/student'))
     sources = Path(os.environ.get('SOURCE_FILE', '/input/sources.jsonl'))
@@ -47,13 +74,10 @@ def main():
         raise ValueError('local teacher and student model directories must contain config.json')
     if not sources.is_file():
         raise ValueError('source JSONL is missing')
-    rows = [json.loads(line) for line in sources.read_text(encoding='utf-8').splitlines() if line.strip()]
-    keys = ('source_id', 'problem', 'answer', 'transfer_problem', 'transfer_answer')
-    if not rows or any(any(not isinstance(row.get(k), str) or not row[k].strip() for k in keys) for row in rows):
-        raise ValueError('invalid source JSONL')
-    if len({row['source_id'] for row in rows}) != len(rows):
-        raise ValueError('duplicate source IDs')
+    parse_sources(sources, args.difficulty)
     OUT.mkdir(parents=True, exist_ok=True)
+    lock_fd = lock_results(OUT)
+    atexit.register(os.close, lock_fd)
     config = {'protocol': 'author-transfer-fresh-offline-v1', 'source_sha256': file_sha(sources),
               'teacher_config_sha256': file_sha(teacher / 'config.json'),
               'student_config_sha256': file_sha(student / 'config.json'),
@@ -62,14 +86,14 @@ def main():
               'teacher_max_tokens': 4192, 'teacher_timeout': 1800,
               'student_max_tokens': 1024, 'student_samples_per_condition': 16,
               'student_temperature': 0.6, 'grading': 'ungraded-local-only'}
+    # Preserve the existing paper configuration so old checkpoints still resume.
+    if args.difficulty != 'paper':
+        config['protocol'] = 'own-transfer-fresh-offline-v1'
+        config['transfer_difficulty'] = args.difficulty
     config['installed_versions'] = {name: importlib.metadata.version(name)
         for name in ('vllm', 'torch', 'transformers', 'openai', 'math-verify')}
     marker = OUT / 'RUN_CONFIGURATION.json'
-    if marker.exists():
-        if json.loads(marker.read_text(encoding='utf-8')) != config:
-            raise ValueError('saved run configuration does not match; use a new output directory')
-    else:
-        marker.write_text(json.dumps(config, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    bind_config(marker, config)
     env = os.environ.copy()
     for k in ('OPENAI_API_KEY', 'HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'ANTHROPIC_API_KEY',
               'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
@@ -96,7 +120,7 @@ def main():
         ready(jobs[0][0], 8001); ready(jobs[1][0], 8002)
         with (OUT / 'eval.log').open('ab') as eval_log:
             subprocess.run([sys.executable, str(ROOT / 'app' / 'offline_eval.py'), '--sources', str(sources),
-                            '--teacher-model', str(teacher)], env=env, check=True,
+                            '--teacher-model', str(teacher), '--difficulty', args.difficulty], env=env, check=True,
                            stdout=eval_log, stderr=subprocess.STDOUT)
     finally:
         for proc, log in jobs:

@@ -31,8 +31,64 @@ def seed(source, target, phase, index):
     return int.from_bytes(hashlib.sha256(data).digest()[:4], 'big') & 0x7fffffff
 
 
-def parse_sources(path):
-    rows = [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines() if line.strip()]
+def select_source(row, difficulty):
+    """Select one existing transfer per source without changing its calibration."""
+    if difficulty == 'paper':
+        if 'paper_record' in row:
+            paper = row['paper_record']
+            our = row.get('our_record')
+            if (not isinstance(paper, dict) or not isinstance(our, dict)
+                    or row.get('source_id') != our.get('source_id')
+                    or our.get('source_problem') != paper.get('problem')
+                    or our.get('source_answer') != paper.get('answer')):
+                raise ValueError('paper and own source mismatch')
+            row = {'source_id': row['source_id'], 'problem': paper['problem'],
+                   'answer': paper['answer'], 'transfer_problem': paper['transfer_problem'],
+                   'transfer_answer': paper['transfer_answer']}
+        return row
+    if difficulty not in ('easy', 'medium', 'hard'):
+        raise ValueError('invalid difficulty')
+    our = row.get('our_record', row)
+    if not isinstance(our, dict) or row.get('source_id') != our.get('source_id'):
+        raise ValueError('source identity mismatch')
+    if 'paper_record' in row:
+        paper = row['paper_record']
+        if (our.get('source_problem') != paper.get('problem')
+                or our.get('source_answer') != paper.get('answer')):
+            raise ValueError('paper and own source mismatch')
+    questions = our.get('transfer_questions')
+    if not isinstance(questions, list) or len(questions) != 3:
+        raise ValueError('three transfer questions required')
+    by_position = {}
+    for question in questions:
+        if not isinstance(question, dict):
+            raise ValueError('invalid transfer question')
+        position = question.get('position_by_student_correct')
+        if type(position) is not int or position not in (1, 2, 3) or position in by_position:
+            raise ValueError('transfer positions must be unique')
+        if (type(question.get('student_correct')) is not int
+                or type(question.get('student_n_scored')) is not int
+                or question['student_n_scored'] != 16
+                or not 0 <= question['student_correct'] <= 16):
+            raise ValueError('invalid student calibration')
+        by_position[position] = question
+    scores = [by_position[i]['student_correct'] for i in (1, 2, 3)]
+    if scores != sorted(scores):
+        raise ValueError('transfer positions do not match student scores')
+    position = {'hard': 1, 'medium': 2, 'easy': 3}[difficulty]
+    selected = by_position[position]
+    if not isinstance(selected.get('candidate_id'), str) or not selected['candidate_id'].strip():
+        raise ValueError('candidate identity missing')
+    return {'source_id': our['source_id'], 'problem': our['source_problem'],
+            'answer': our['source_answer'], 'transfer_problem': selected['problem'],
+            'transfer_answer': selected['answer'], 'transfer_target': 'ours_' + difficulty,
+            'transfer_candidate_id': selected['candidate_id'], 'transfer_position': position,
+            'student_correct': selected['student_correct'], 'student_n_scored': 16,
+            'score_tie': len(set(scores)) < 3}
+
+
+def parse_sources(path, difficulty='paper'):
+    rows = [select_source(json.loads(line), difficulty) for line in Path(path).read_text(encoding='utf-8').splitlines() if line.strip()]
     if not rows or len({x['source_id'] for x in rows}) != len(rows):
         raise ValueError('source file is empty or has duplicated identifiers')
     for row in rows:
@@ -82,10 +138,18 @@ async def run_one(row, teacher_path, teacher_url, student_url, student_client):
         if read(folder / 'SOURCE.json')['sha256'] != source_hash:
             raise ValueError('source identity changed')
     else:
-        put_once(folder / 'SOURCE.json', {'sha256': source_hash, 'source_id': row['source_id']})
+        identity = {'sha256': source_hash, 'source_id': row['source_id']}
+        if row.get('transfer_target', '').startswith('ours_'):
+            identity.update(transfer_target=row['transfer_target'], candidate_id=row['transfer_candidate_id'],
+                            position_by_student_correct=row['transfer_position'],
+                            historical_student_correct=row['student_correct'],
+                            historical_student_n_scored=row['student_n_scored'],
+                            historical_group_score_tie=row['score_tie'])
+        put_once(folder / 'SOURCE.json', identity)
     sem = asyncio.Semaphore(4)
+    transfer_target = row.get('transfer_target', 'paper')
     targets = [('source', row['problem'], row['answer']),
-               ('paper', row['transfer_problem'], row['transfer_answer'])]
+               (transfer_target, row['transfer_problem'], row['transfer_answer'])]
     collected = []
     for name, problem, answer in targets:
         prompt = [{'role': 'user', 'content': _SOLVE_PROMPT.format(problem=problem)}]
@@ -105,7 +169,7 @@ async def run_one(row, teacher_path, teacher_url, student_url, student_client):
     dialogue = await make_dialogue(source, official_row, args)
     for name, problem, answer in targets:
         messages = _build_final_attempt_messages(dialogue['reward_messages'], source['problem'],
-            transfer_problem=problem if name == 'paper' else None, omit_teacher_turns=True)
+            transfer_problem=problem if name != 'source' else None, omit_teacher_turns=True)
         samples = await asyncio.gather(*(student_sample(student_client, source, name, 'post', i, messages, sem)
                                          for i in range(16)))
         collected.extend((name, 'post', problem, answer, i, sample) for i, sample in enumerate(samples))
@@ -114,7 +178,13 @@ async def run_one(row, teacher_path, teacher_url, student_url, student_client):
     # Local material for later offline scoring. Correctness is never guessed.
     score_input = [{'source_id': row['source_id'], 'target': target, 'phase': phase, 'index': index,
                     'problem': problem, 'reference_answer': answer, 'student_response': sample['text'],
-                    'finish_reason': sample['finish_reason'], 'grading_status': 'ungraded'}
+                    'finish_reason': sample['finish_reason'], 'grading_status': 'ungraded',
+                    **({'candidate_id': row['transfer_candidate_id'], 'difficulty': transfer_target[5:],
+                        'position_by_student_correct': row['transfer_position'],
+                        'historical_student_correct': row['student_correct'],
+                        'historical_student_n_scored': row['student_n_scored'],
+                        'historical_group_score_tie': row['score_tie']}
+                       if target == transfer_target and transfer_target.startswith('ours_') else {})}
                    for target, phase, problem, answer, index, sample in collected]
     if (folder / 'SCORE_INPUT.json').exists():
         if read(folder / 'SCORE_INPUT.json') != score_input:
@@ -128,7 +198,7 @@ async def run_one(row, teacher_path, teacher_url, student_url, student_client):
 
 async def main(args):
     os.environ['LOCAL_ONLY_KEY'] = 'loopback-only'
-    rows = parse_sources(args.sources)
+    rows = parse_sources(args.sources, args.difficulty)
     student = openai.AsyncClient(api_key='loopback-only', base_url=local_url(args.student_url),
                                  timeout=300, max_retries=0)
     try:
@@ -155,6 +225,7 @@ if __name__ == '__main__':
         p = SafeParser(add_help=False, prog='LOCAL_EVAL')
         p.add_argument('--sources', required=True)
         p.add_argument('--teacher-model', required=True)
+        p.add_argument('--difficulty', choices=('paper', 'easy', 'medium', 'hard'), default='paper')
         p.add_argument('--teacher-url', default='http://127.0.0.1:8001/v1')
         p.add_argument('--student-url', default='http://127.0.0.1:8002/v1')
         args = p.parse_args()

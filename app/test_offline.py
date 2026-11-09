@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import offline_eval
 import dialogue
+import launch
 import protocol
 import score_local
 
@@ -25,6 +26,77 @@ class FakeCompletion:
 
 
 class TestOffline(unittest.TestCase):
+    @staticmethod
+    def own_source(scores=(2, 8, 14)):
+        return {'source_id': 'synthetic-only', 'source_problem': 'Original?', 'source_answer': '4',
+                'transfer_questions': [
+                    {'position_by_student_correct': i, 'student_correct': score, 'student_n_scored': 16,
+                     'candidate_id': f'candidate-{i}', 'problem': f'transfer-{i}?', 'answer': str(i)}
+                    for i, score in enumerate(scores, 1)]}
+
+    def test_select_difficulty_and_paired_format(self):
+        own = self.own_source()
+        paper = {'problem': 'Original?', 'answer': '4', 'transfer_problem': 'author?', 'transfer_answer': '5'}
+        paired = {'source_id': own['source_id'], 'our_record': own, 'paper_record': paper}
+        for choice, pos in (('hard', 1), ('medium', 2), ('easy', 3)):
+            for item in (own, paired):
+                selected = offline_eval.select_source(item, choice)
+                self.assertEqual(selected['transfer_problem'], f'transfer-{pos}?')
+                self.assertEqual(selected['transfer_answer'], str(pos))
+                self.assertEqual(selected['transfer_candidate_id'], f'candidate-{pos}')
+                self.assertEqual(selected['transfer_target'], 'ours_' + choice)
+        self.assertEqual(offline_eval.select_source(paired, 'paper')['transfer_problem'], 'author?')
+        with self.assertRaises(ValueError):
+            offline_eval.select_source({**paired, 'paper_record': {**paper, 'problem': 'Different?'}}, 'paper')
+        self.assertTrue(offline_eval.select_source(self.own_source((2, 2, 14)), 'medium')['score_tie'])
+        for bad in (self.own_source((8, 2, 14)), {**own, 'transfer_questions': own['transfer_questions'][:2]}):
+            with self.assertRaises(ValueError):
+                offline_eval.select_source(bad, 'easy')
+
+    def test_result_configuration_prevents_cross_difficulty_reuse(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'RUN_CONFIGURATION.json'
+            launch.bind_config(marker, {'transfer_difficulty': 'easy'})
+            launch.bind_config(marker, {'transfer_difficulty': 'easy'})
+            with self.assertRaises(ValueError):
+                launch.bind_config(marker, {'transfer_difficulty': 'hard'})
+
+    def test_results_directory_cannot_be_opened_twice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fd = launch.lock_results(Path(temp))
+            try:
+                with self.assertRaises(BlockingIOError):
+                    launch.lock_results(Path(temp))
+            finally:
+                os.close(fd)
+
+    def test_own_transfer_is_labeled_and_bound(self):
+        async def fake_dialogue(source, row, args):
+            self.assertEqual(source['problem'], 'Original?')
+            return {'source_id': source['source_id'], 'stage': 'completed',
+                    'reward_messages': [{'role': 'user', 'content': 'I tried.'}]}
+
+        sample = offline_eval.select_source(self.own_source(), 'easy')
+        completion = FakeCompletion()
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completion))
+        with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'RESULTS_DIR': temp}), \
+                patch.object(offline_eval, 'make_dialogue', fake_dialogue):
+            asyncio.run(offline_eval.run_one(sample, '/fake', 'http://127.0.0.1:8001/v1',
+                                             'http://127.0.0.1:8002/v1', client))
+            folder = offline_eval.source_dir(sample)
+            identity = json.loads((folder / 'SOURCE.json').read_text())
+            self.assertEqual(identity['candidate_id'], 'candidate-3')
+            self.assertEqual(identity['transfer_target'], 'ours_easy')
+            self.assertEqual(identity['historical_student_correct'], 14)
+            results = json.loads((folder / 'SCORE_INPUT.json').read_text())
+            selected = [r for r in results if r['target'] == 'ours_easy']
+            self.assertEqual(len(selected), 48)
+            self.assertTrue(all(r['candidate_id'] == 'candidate-3' and r['difficulty'] == 'easy'
+                                and r['problem'] == 'transfer-3?' and r['reference_answer'] == '3'
+                                and r['historical_student_correct'] == 14
+                                for r in selected))
+            self.assertFalse(any(r['target'] == 'paper' for r in results))
+
     def test_refuses_non_loopback(self):
         self.assertEqual(offline_eval.local_url('http://127.0.0.1:8001/v1'), 'http://127.0.0.1:8001/v1')
         for endpoint in ('https://example.org/v1', 'http://10.0.0.1:8001/v1', 'http://user@localhost/v1'):
