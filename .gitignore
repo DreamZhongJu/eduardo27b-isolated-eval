@@ -19,6 +19,10 @@
 /parallel_eval_v3/*
 !/parallel_eval_v3/*.py
 !/parallel_eval_v3/README.md
+!/parallel_eval_v4/
+/parallel_eval_v4/*
+!/parallel_eval_v4/*.py
+!/parallel_eval_v4/README.md
 !/official/
 /official/*
 !/official/eduardo/
