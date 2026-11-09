@@ -56,10 +56,18 @@ class TestOffline(unittest.TestCase):
     def test_result_configuration_prevents_cross_difficulty_reuse(self):
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / 'RUN_CONFIGURATION.json'
-            launch.bind_config(marker, {'transfer_difficulty': 'easy'})
-            launch.bind_config(marker, {'transfer_difficulty': 'easy'})
+            launch.bind_config(marker, {'transfer_difficulty': 'easy', 'teacher_tp': 1})
+            launch.bind_config(marker, {'transfer_difficulty': 'easy', 'teacher_tp': 1})
             with self.assertRaises(ValueError):
-                launch.bind_config(marker, {'transfer_difficulty': 'hard'})
+                launch.bind_config(marker, {'transfer_difficulty': 'hard', 'teacher_tp': 1})
+            with self.assertRaises(ValueError):
+                launch.bind_config(marker, {'transfer_difficulty': 'easy', 'teacher_tp': 2})
+
+    def test_teacher_and_student_gpu_layout(self):
+        self.assertEqual(launch.gpu_layout(1), ('0', '1'))
+        self.assertEqual(launch.gpu_layout(2), ('0,1', '2'))
+        with self.assertRaises(ValueError):
+            launch.gpu_layout(3)
 
     def test_results_directory_cannot_be_opened_twice(self):
         with tempfile.TemporaryDirectory() as temp:

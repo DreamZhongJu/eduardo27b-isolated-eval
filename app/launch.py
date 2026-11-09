@@ -45,6 +45,12 @@ def lock_results(directory):
     return fd
 
 
+def gpu_layout(teacher_gpus):
+    if teacher_gpus not in (1, 2):
+        raise ValueError('teacher needs one or two GPUs')
+    return ','.join(str(i) for i in range(teacher_gpus)), str(teacher_gpus)
+
+
 def ready(proc, port, timeout=1800):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -66,6 +72,8 @@ def main():
     parser = argparse.ArgumentParser(description='Run one transfer difficulty in an independent result directory.')
     parser.add_argument('--difficulty', choices=('paper', 'easy', 'medium', 'hard'), default='paper',
                         help='paper: author transfer; easy/medium/hard: own dataset position')
+    parser.add_argument('--teacher-gpus', type=int, choices=(1, 2), default=2,
+                        help='teacher tensor-parallel GPU count; student uses one additional GPU')
     args = parser.parse_args()
     teacher = Path(os.environ.get('TEACHER_MODEL', '/models/teacher'))
     student = Path(os.environ.get('STUDENT_MODEL', '/models/student'))
@@ -81,7 +89,7 @@ def main():
     config = {'protocol': 'author-transfer-fresh-offline-v1', 'source_sha256': file_sha(sources),
               'teacher_config_sha256': file_sha(teacher / 'config.json'),
               'student_config_sha256': file_sha(student / 'config.json'),
-              'teacher_dtype': 'bfloat16', 'teacher_tp': 2, 'student_dtype': 'float16',
+              'teacher_dtype': 'bfloat16', 'teacher_tp': args.teacher_gpus, 'student_dtype': 'float16',
               'engine': 'vllm-0.18.0', 'teacher_max_model_len': 20000,
               'teacher_max_tokens': 4192, 'teacher_timeout': 1800,
               'student_max_tokens': 1024, 'student_samples_per_condition': 16,
@@ -104,12 +112,13 @@ def main():
     common = [sys.executable, '-m', 'vllm.entrypoints.openai.api_server', '--host', '127.0.0.1']
     jobs = []
     try:
-        teacher_env = dict(env, CUDA_VISIBLE_DEVICES='0,1')
+        teacher_devices, student_device = gpu_layout(args.teacher_gpus)
+        teacher_env = dict(env, CUDA_VISIBLE_DEVICES=teacher_devices)
         teacher_cmd = common + ['--port', '8001', '--model', str(teacher), '--served-model-name',
-            'Eduardo-27b', '--dtype', 'bfloat16', '--tensor-parallel-size', '2', '--max-model-len',
+            'Eduardo-27b', '--dtype', 'bfloat16', '--tensor-parallel-size', str(args.teacher_gpus), '--max-model-len',
             '20000', '--gpu-memory-utilization', '0.85', '--max-num-seqs', '1', '--enforce-eager',
             '--limit-mm-per-prompt', '{"image":0,"video":0}', '--seed', '42']
-        student_env = dict(env, CUDA_VISIBLE_DEVICES='2')
+        student_env = dict(env, CUDA_VISIBLE_DEVICES=student_device)
         student_cmd = common + ['--port', '8002', '--model', str(student), '--served-model-name',
             'Llama-3.1-8B-Instruct', '--dtype', 'float16', '--max-model-len', '20000',
             '--gpu-memory-utilization', '0.90', '--seed', '42']

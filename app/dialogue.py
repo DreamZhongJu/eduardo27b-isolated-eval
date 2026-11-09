@@ -2,7 +2,7 @@
 """Official Eduardo rollout with local vLLM API calls journaled per turn.
 
 Import only: the resource supervisor must independently provide isolated local
-teacher and student servers and a verified three-GPU lease before calling this.
+teacher and student servers and the appropriate GPU allocation before calling this.
 """
 import os
 from pathlib import Path

@@ -22,6 +22,8 @@
 
 `app/` 是在现有研究思路上改写的独立**离线评测原型**，不是正在其他服务器运行的冻结代码，也不是作者原版实验或 27B 的 DPPO 训练程序。程序期望本地教师和学生模型、题目及结果目录；可先用2张A100运行教师 TP=2、另1张A100运行学生，8卡足够不代表必须占满。教师 BF16、学生 FP16；本草稿建议同一依赖环境均用 vLLM 0.18，旧站学生用的是 vLLM 0.17，因此不能把两者直接当成完全相同的协议。`app/launch.py` 路径以其所在仓库自动解析，不需要将代码放进基础镜像 `/app`。
 
+针对 A100 80GB，新增 `--teacher-gpus 1`：教师使用 1 张卡（TP=1）、学生独占另 1 张卡；默认 `--teacher-gpus 2` 保留原两教师卡配置。单卡教师尚未实测，应先在目标机检查显存和 KV 缓存、短生成及长上下文，再运行单来源端到端测试；不能根据权重大小保证整个对话可以运行。
+
 初始数据由站内合规准备的 `sources.jsonl` 给出，每行 `source_id`、`problem`、`answer`、`transfer_problem`、`transfer_answer` 为非空字符串。不要把题目和参考答案提交到 GitHub。本原型为**独立新测量**，不含或复用其他服务器 test:296 的64份历史作答；如需对照已选的10个来源，见不含题目答案的 [来源身份及哈希](SOURCE_SELECTION.md)，在站内按获准数据核实内容。先运行1条并核对结果，再决定批量。每来源设前测、独立冷启动重复和后测，学生各16次、上限1024；后测按作者函数遮蔽教师发言。原始输出、日志、来源和未决留在本机，绝不外传。
 
 ### 选择迁移题难度
@@ -42,15 +44,17 @@
 代码和独立虚拟环境准备好后，在容器内分别运行（路径按站点挂载调整）：
 
 ```bash
-SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/easy /path/to/venv/bin/python app/launch.py --difficulty easy
-SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/medium /path/to/venv/bin/python app/launch.py --difficulty medium
-SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/hard /path/to/venv/bin/python app/launch.py --difficulty hard
+SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/easy /path/to/venv/bin/python app/launch.py --teacher-gpus 1 --difficulty easy
+SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/medium /path/to/venv/bin/python app/launch.py --teacher-gpus 1 --difficulty medium
+SOURCE_FILE=/input/test.jsonl RESULTS_DIR=/results/hard /path/to/venv/bin/python app/launch.py --teacher-gpus 1 --difficulty hard
 # 若使用含论文题的 paired_493.jsonl，另可用 --difficulty paper。
 ```
 
-这些命令每个都需要独立 `RESULTS_DIR`；程序将输入文件哈希、难度与环境写入运行配置，禁止不同难度复用同一目录，并使用目录锁阻止并发写入。每次运行会独立生成原题前测和教学对话，不能当作共享同一对话的严格配对试验。原型只导出待判分材料，不包含 Agnes 自动判分。若并行运行，必须给每个容器独立结果目录、独立网络命名空间和独立三张 GPU；当前程序每次教师占两卡、学生占一张，8 卡最多同时运行两组，第三组需等待。容器通过 `--gpus` 映射各自的物理卡，容器内部使用 0、1 给教师、2 给学生；不要只设置宿主的 `CUDA_VISIBLE_DEVICES`，因为程序会给子进程重新设置它。
+这些命令每个都需要独立 `RESULTS_DIR`；程序将输入文件哈希、难度、教师 GPU 数与环境写入运行配置，禁止不同配置复用同一目录，并使用目录锁阻止并发写入。每次运行会独立生成原题前测和教学对话，不能当作共享同一对话的严格配对试验。原型只导出待判分材料，不包含 Agnes 自动判分。若并行运行，必须给每个容器独立结果目录、独立网络命名空间及不重叠的物理 GPU。单卡教师模式每组需两张 GPU，单卡通过验证后 8 卡理论上最多同时运行 4 组；双卡教师模式每组需三张 GPU，最多同时运行 2 组。容器通过 `--gpus` 映射各自物理卡：单卡模式容器内部用 0 给教师、1 给学生；双卡模式用 0、1 给教师、2 给学生。不要只设置宿主的 `CUDA_VISIBLE_DEVICES`，因为程序会给子进程重新设置它。
 
-环境准备完成后，若已把代码、虚拟环境、模型和输入放在站内受控目录，可用**单独**的评测容器采用 `--network none`，将代码/环境/模型/输入只读挂载、结果挂载到站内可写目录；按管理员分配传入3张GPU，并在容器内执行虚拟环境 Python 和仓库 `app/launch.py`。为只读文件系统提供可写 `/tmp`，设置 `HOME`、`HF_HOME`、`XDG_CACHE_HOME`、`VLLM_CACHE_ROOT`、`TRITON_CACHE_DIR`、`CUDA_CACHE_PATH` 到 `/tmp`，并设置 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、`HF_HUB_DISABLE_TELEMETRY=1`、`VLLM_NO_USAGE_STATS=1`。不挂 Docker socket、不发布服务端口、不将云API密钥放入评测容器。站内启动日志不得向外展示；只可用 `app/status_summary.py` 反馈聚合数字/固定状态码。
+程序检查的是模型配置文件哈希，不自动校验权重文件；部署时需要只读挂载固定模型，并在站内额外记录权重版本或哈希，避免配置相同但权重被替换后续跑混入其他模型。
+
+环境准备完成后，若已把代码、虚拟环境、模型和输入放在站内受控目录，可用**单独**的评测容器采用 `--network none`，将代码/环境/模型/输入只读挂载、结果挂载到站内可写目录；按管理员分配、根据教师卡数传入 2 或 3 张 GPU，并在容器内执行虚拟环境 Python 和仓库 `app/launch.py`。管理员需确保并发容器使用的物理 GPU 不重叠；程序不负责全机 GPU 调度。实际设备型号、驱动和 GPU 分配应在站内记录。为只读文件系统提供可写 `/tmp`，设置 `HOME`、`HF_HOME`、`XDG_CACHE_HOME`、`VLLM_CACHE_ROOT`、`TRITON_CACHE_DIR`、`CUDA_CACHE_PATH` 到 `/tmp`，并设置 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、`HF_HUB_DISABLE_TELEMETRY=1`、`VLLM_NO_USAGE_STATS=1`。不挂 Docker socket、不发布服务端口、不将云API密钥放入评测容器。站内启动日志不得向外展示；只可用 `app/status_summary.py` 反馈聚合数字/固定状态码。
 
 本原型默认结果为未判；`app/score_local.py` 可在站内对明确的单数字 boxed 结果做保守 math_verify 比对，多部分、描述型、模糊或解析失败均为 unknown；这不是旧 GPT v5，结果不可混为一个口径。用户允许的 Agnes 判分仅限上述三字段，由**另一个**受控出站组件处理，不能把完整对话/日志交给 Agnes；若没有经过审批及全局限流的组件，保留未决而非擅自联网。
 
