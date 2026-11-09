@@ -10,6 +10,11 @@
 !/app/
 /app/*
 !/app/*.py
+!/agnes_eval_v2/
+/agnes_eval_v2/*
+!/agnes_eval_v2/*.py
+!/agnes_eval_v2/*.sh
+!/agnes_eval_v2/README.md
 !/official/
 /official/*
 !/official/eduardo/
