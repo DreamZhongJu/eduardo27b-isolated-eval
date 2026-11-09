@@ -2,6 +2,8 @@
 
 **双卡实验与 Agnes 判分：** 新增 [agnes_eval_v2](agnes_eval_v2/README.md)，提供教师与学生各一张 A100 的后台控制器、独立 Agnes 判分及状态汇总。先完成单来源验证，再按简单、中等、困难分档运行；各档教学对话独立。旧的 `app/` 生成器和原有结果不变。
 
+**并行接力：** [parallel_eval_v3](parallel_eval_v3/README.md) 是独立的并行调度器；它只在旧控制器退出并核对原结果、代码和模型后接手，继续使用原试验回执。
+
 本仓库的 Dockerfile 使用阿里云官方镜像构建 **CUDA 12.8.1 开发工具 + Ubuntu 24.04 的基础环境**，包含 `nvcc`、Python 3.12、pip、venv、Python 头文件、C/C++ 构建工具、git、curl 与 uv 0.9.5。按用户最新要求，不安装 Miniconda。基础镜像来自阿里云容器仓库，APT、pip 与 uv 配置使用阿里云源；不会内置实验代码、vLLM、PyTorch、判分程序、模型或数据，这些依赖和文件需按服务器规则另行准备。
 
 本地没有 Docker daemon 权限，也没有连接目标服务器；镜像构建、驱动兼容、8×A100、依赖安装及 GPU 运行均未实测。已核验阿里官方 CUDA 开发镜像的索引摘要并固定在 Dockerfile，尚未拉取或构建该镜像。如站点已有经批准镜像，可由管理员审核调整。Ubuntu APT 包并非逐项固定版本，严格复现需记录实际镜像摘要与包版本。CUDA 12.8 的配套驱动和 NVIDIA Container Toolkit 须在站内确认；不要通过禁用版本检查绕过驱动不足。
