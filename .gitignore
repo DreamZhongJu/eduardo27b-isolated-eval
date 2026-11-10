@@ -15,6 +15,10 @@
 !/agnes_eval_v2/*.py
 !/agnes_eval_v2/*.sh
 !/agnes_eval_v2/README.md
+!/agnes_eval_v3/
+/agnes_eval_v3/*
+!/agnes_eval_v3/*.py
+!/agnes_eval_v3/README.md
 !/parallel_eval_v3/
 /parallel_eval_v3/*
 !/parallel_eval_v3/*.py
