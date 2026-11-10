@@ -47,6 +47,8 @@
 !/diagnostics/test_agnes_unknown_shape_probe.py
 !/diagnostics/agnes_topbool_recovery.py
 !/diagnostics/test_agnes_topbool_recovery.py
+!/diagnostics/eduardo_local_speed_probe.py
+!/diagnostics/test_eduardo_local_speed_probe.py
 !/official/
 /official/*
 !/official/eduardo/
