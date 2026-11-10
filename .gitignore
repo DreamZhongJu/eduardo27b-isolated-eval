@@ -31,6 +31,10 @@
 /parallel_shared_eval/*
 !/parallel_shared_eval/*.py
 !/parallel_shared_eval/README.md
+!/parallel_shared_wait/
+/parallel_shared_wait/*
+!/parallel_shared_wait/*.py
+!/parallel_shared_wait/README.md
 !/diagnostics/
 /diagnostics/*
 !/diagnostics/agnes_unknown_diagnostic.py
