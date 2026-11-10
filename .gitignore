@@ -23,6 +23,9 @@
 /parallel_eval_v4/*
 !/parallel_eval_v4/*.py
 !/parallel_eval_v4/README.md
+!/diagnostics/
+/diagnostics/*
+!/diagnostics/agnes_unknown_diagnostic.py
 !/official/
 /official/*
 !/official/eduardo/
