@@ -27,6 +27,8 @@
 /diagnostics/*
 !/diagnostics/agnes_unknown_diagnostic.py
 !/diagnostics/test_agnes_unknown_diagnostic.py
+!/diagnostics/agnes_unknown_shape_probe.py
+!/diagnostics/test_agnes_unknown_shape_probe.py
 !/official/
 /official/*
 !/official/eduardo/
