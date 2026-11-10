@@ -26,6 +26,7 @@
 !/diagnostics/
 /diagnostics/*
 !/diagnostics/agnes_unknown_diagnostic.py
+!/diagnostics/test_agnes_unknown_diagnostic.py
 !/official/
 /official/*
 !/official/eduardo/

@@ -99,7 +99,11 @@ def diagnose(root):
                     if not isinstance(identity, dict):
                         missing += 1
                         continue
-                    blob = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+                    # grade_one() addresses receipts by digest({'identity': ident}),
+                    # not by the digest of ident alone. Preserve the grader's exact
+                    # UTF-8 canonical form without importing or calling the grader.
+                    blob = json.dumps({'identity': identity}, ensure_ascii=False,
+                                      sort_keys=True, separators=(',', ':')).encode('utf-8')
                     request_key = hashlib.sha256(blob).hexdigest()
                     folder = root / 'AGNES' / 'receipts' / stage / source_key / request_key
                     files = sorted(folder.glob('ATTEMPT-*-RESPONSE.json'))
