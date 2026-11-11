@@ -39,6 +39,10 @@
 /parallel_elastic/*
 !/parallel_elastic/*.py
 !/parallel_elastic/README.md
+!/parallel_adaptive/
+/parallel_adaptive/*
+!/parallel_adaptive/*.py
+!/parallel_adaptive/README.md
 !/diagnostics/
 /diagnostics/*
 !/diagnostics/agnes_unknown_diagnostic.py
