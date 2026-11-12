@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -363,6 +364,84 @@ def run(root=ROOT, dest=DEST):
             for stage in STAGES}
 
 
+def display_width(text):
+    """Width of basic CJK/ASCII text in terminals, without third-party packages."""
+    return sum(0 if unicodedata.combining(c) else
+               2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in str(text))
+
+
+def pad(text, width, *, right=False):
+    text = str(text)
+    spaces = ' ' * max(0, width - display_width(text))
+    return spaces + text if right else text + spaces
+
+
+def make_table(rows):
+    heads = ('项目', '简单', '中等', '困难', '合计')
+    cells = [heads] + [tuple(str(x) for x in row) for row in rows]
+    widths = [max(display_width(row[i]) for row in cells) for i in range(len(heads))]
+    border = '+' + '+'.join('-' * (w + 2) for w in widths) + '+'
+    def line(row):
+        return '| ' + ' | '.join(pad(cell, widths[i], right=(i > 0))
+                                  for i, cell in enumerate(row)) + ' |'
+    return '\n'.join([border, line(heads), border] + [line(row) for row in cells[1:]] + [border])
+
+
+def render_report(data):
+    """Render only fixed aggregate fields; PILOT is part of the easy tier."""
+    groups = (('PILOT', 'EASY'), ('MEDIUM',), ('HARD',))
+    def values(section, key):
+        numbers = []
+        for group in groups:
+            n = sum(data.get(stage, {}).get(section, {}).get(key, 0) for stage in group)
+            numbers.append(n)
+        return (*numbers, sum(numbers))
+    def rows(section, definitions):
+        return [(label, *values(section, key)) for label, key in definitions]
+
+    source_rows = rows('来源', (
+        ('生成完成来源', '有完成标记来源'),
+        ('暂停来源', '暂停来源'),
+        ('不完整来源', '不完整来源'),
+        ('已有学生回答（未完成来源）', '已落盘学生回答数'),
+        ('学生请求未收到回答', '学生请求有意图无回答数'),
+        ('对话请求未收到回执', '对话请求有意图无回执数'),
+        ('对话整体无回执来源', '对话整体无完成回执的来源'),
+        ('对话回执未完成来源', '已有未完成对话回执的来源'),
+    ))
+    grade_rows = rows('判分', (
+        ('未决作答', '报告中的未决作答'),
+        ('原回执可提取候选', '可由原始回执重新提取'),
+        ('其中已有叠层候选', '已有叠层已核验候选'),
+        ('尚无叠层可提取候选', '尚无叠层但原始回执可提取'),
+        ('叠层不符可提取候选', '叠层不符但原始回执可提取'),
+        ('未决减去候选', '未决减去可提取候选'),
+    ))
+    error_rows = rows('来源', (
+        ('来源结构异常', '来源结构异常'),
+        ('来源检查异常', '来源检查异常'),
+        ('学生样本错误回执', '学生样本错误回执数'),
+    )) + rows('判分', (
+        ('判分报告结构异常来源', '判分报告结构异常来源'),
+        ('无法完整核验的来源', '无法完整核验的来源'),
+        ('无法完整核验的未决作答', '无法完整核验的未决作答'),
+        ('叠层不符或无法读取来源', '叠层不符或无法读取来源'),
+    ))
+    reason_rows = rows('来源', tuple((kind, '暂停原因类型:' + kind) for kind in (
+        'TimeoutError', 'RuntimeError', 'ValueError', 'APIConnectionError',
+        'APITimeoutError', 'RateLimitError', 'OSError', '其他或未记录')))
+    reason_rows = [row for row in reason_rows if row[-1]]
+    sections = ['来源与回执', make_table(source_rows),
+                '判分回执', make_table(grade_rows),
+                '异常与核验情况', make_table(error_rows)]
+    if reason_rows:
+        sections += ['暂停原因类型（仅为记录的异常类别）', make_table(reason_rows)]
+    sections += ['说明：简单档含 PILOT；学生与对话回执只统计暂停或不完整来源。',
+                 '候选来自旧回执，尚不代表数学判分已复核；“未决减去候选”含无法核验项，不能等同可直接补判数。',
+                 '结果只读，不会修改原记录，也不会调用判分 API。']
+    return '\n'.join(sections)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -370,11 +449,9 @@ def main():
     parser.add_argument('--overlay', type=Path, default=DEST)
     args = parser.parse_args()
     try:
-        print(json.dumps({'状态': '只读扫描结束', '各档': run(args.root, args.overlay),
-                          '说明': '结构计数不是恢复许可；候选不是数学准确性的验证；未决减候选包含无法核验项。'},
-                         ensure_ascii=False, sort_keys=True, indent=2))
+        print(render_report(run(args.root, args.overlay)))
     except Exception:
-        print(json.dumps({'状态': '只读扫描失败'}, ensure_ascii=False))
+        print('只读扫描失败：请检查实验目录及读取权限。')
         return 1
     return 0
 
