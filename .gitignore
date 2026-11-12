@@ -30,6 +30,10 @@
 /evaluation/agnes_eval_v3/*
 !/evaluation/agnes_eval_v3/*.py
 !/evaluation/agnes_eval_v3/README.md
+!/evaluation/agnes_rejudge/
+/evaluation/agnes_rejudge/*
+!/evaluation/agnes_rejudge/*.py
+!/evaluation/agnes_rejudge/README.md
 !/parallel_eval_v3
 !/evaluation/parallel_eval_v3/
 /evaluation/parallel_eval_v3/*

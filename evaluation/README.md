@@ -12,6 +12,7 @@
 | [parallel_shared_wait/](parallel_shared_wait/README.md) | 原有四卡等待版：3 个教师服务和 1 个共享学生服务。 |
 | [parallel_elastic/](parallel_elastic/README.md) | 根据启动时可用资源选择拓扑的旧版；不支持运行中动态加卡。 |
 | [agnes_eval_v3/](agnes_eval_v3/README.md) | Agnes 判分与响应解析；其目录文档保留开发时状态，部署状态以运行回执为准。 |
+| [agnes_rejudge/](agnes_rejudge/README.md) | 未决判分的独立补判与分阶段只读汇总；目标环境需先做小批试点。 |
 | [agnes_eval_v2/](agnes_eval_v2/README.md)、`parallel_eval_v3/`、`parallel_eval_v4/`、`parallel_shared_eval/` | 历史版本与早期并行实现，保留用于追溯。 |
 | [diagnostics/](diagnostics/) | 未决判分、历史回执及吞吐的站内聚合检查；具体能力以脚本为准。 |
 
