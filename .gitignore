@@ -71,6 +71,8 @@
 !/evaluation/diagnostics/test_agnes_topbool_recovery.py
 !/evaluation/diagnostics/eduardo_local_speed_probe.py
 !/evaluation/diagnostics/test_eduardo_local_speed_probe.py
+!/evaluation/diagnostics/unresolved_inventory.py
+!/evaluation/diagnostics/test_unresolved_inventory.py
 !/evaluation/diagnostics/README.md
 !/official
 !/evaluation/official/
