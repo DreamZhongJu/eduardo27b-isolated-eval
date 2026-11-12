@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -256,10 +257,43 @@ def run(root, dest):
     return {stage: dict(sorted(counter.items())) for stage, counter in counters.items()}
 
 
+def _width(value):
+    return sum(0 if unicodedata.combining(c) else
+               2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1 for c in str(value))
+
+
+def format_report(counters):
+    """Format fixed aggregate counters; PILOT is included in the easy tier."""
+    columns = ('分档', '可提取候选', '新增来源', '已有来源', '来源异常')
+    groups = (('简单', ('PILOT', 'EASY')), ('中等', ('MEDIUM',)), ('困难', ('HARD',)))
+    keys = ('候选条数', '新增来源', '已有相同来源', '来源异常')
+    rows = []
+    for label, stages in groups:
+        values = [sum(counters.get(stage, {}).get(key, 0) for stage in stages) for key in keys]
+        rows.append((label, *values))
+    rows.append(('合计', *(sum(row[i] for row in rows) for i in range(1, len(columns)))))
+    cells = [columns] + [tuple(str(value) for value in row) for row in rows]
+    widths = [max(_width(row[i]) for row in cells) for i in range(len(columns))]
+    border = '+' + '+'.join('-' * (width + 2) for width in widths) + '+'
+
+    def line(row):
+        values = []
+        for i, cell in enumerate(row):
+            gap = ' ' * (widths[i] - _width(cell))
+            values.append(cell + gap if i == 0 else gap + cell)
+        return '| ' + ' | '.join(values) + ' |'
+
+    return '\n'.join(['旧判分回执候选恢复', border, line(cells[0]), border,
+                      *(line(row) for row in cells[1:]), border,
+                      '说明：简单包含 PILOT；候选为作答数，其余列为来源数。',
+                      '候选来自原回执，不代表数学判分已复核；结果写入独立恢复层，不覆盖原记录。',
+                      '不调用判分 API；来源异常未写入恢复层，需另行核查。'])
+
+
 if __name__ == '__main__':
     os.umask(0o077)
     try:
-        print(json.dumps({'状态': '完成', '汇总': run(ROOT, DEST)}, ensure_ascii=False, sort_keys=True))
+        print(format_report(run(ROOT, DEST)))
     except Exception:
-        print(json.dumps({'状态': '失败'}, ensure_ascii=False))
+        print('恢复失败，请检查目录与权限；旧记录未被覆盖。')
         sys.exit(1)

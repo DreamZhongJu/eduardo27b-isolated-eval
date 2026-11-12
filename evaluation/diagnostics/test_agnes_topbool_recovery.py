@@ -49,6 +49,28 @@ def setup_source(root, responses):
 
 
 class TestRecovery(unittest.TestCase):
+    def test_chinese_table_aggregates_pilot_and_exposes_conflicts(self):
+        counters = {
+            'PILOT': {'候选条数': 4, '已有相同来源': 1},
+            'EASY': {'候选条数': 413, '新增来源': 2, '已有相同来源': 40},
+            'MEDIUM': {'候选条数': 463, '新增来源': 1, '已有相同来源': 45, '来源异常': 2},
+            'HARD': {},
+        }
+        text = r.format_report(counters)
+        self.assertIn('可提取候选', text)
+        self.assertIn('来源异常', text)
+        self.assertIn('| 简单 |        417 |        2 |       41 |        0 |', text)
+        self.assertIn('| 合计 |        880 |        3 |       86 |        2 |', text)
+        self.assertIn('不覆盖原记录', text)
+        self.assertIn('不调用判分 API', text)
+        lines = [line for line in text.splitlines() if line.startswith(('|', '+'))]
+        self.assertEqual(len({r._width(line) for line in lines}), 1)
+
+    def test_table_never_displays_unknown_keys(self):
+        text = r.format_report({'EASY': {'私密题目或答案': '不得输出'}})
+        self.assertNotIn('私密题目或答案', text)
+        self.assertNotIn('不得输出', text)
+
     def test_offline_safe_idempotent_and_conflicts(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
