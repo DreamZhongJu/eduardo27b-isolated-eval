@@ -2,7 +2,6 @@
 import hashlib
 import json
 import re
-import time
 import urllib.error
 import urllib.request
 
@@ -63,34 +62,36 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def request_json(url, body, key, *, timeout=900):
-    """Retry only explicit HTTP failures; ambiguous transport results are held."""
+    """Submit once; preserve every non-success or ambiguous result as unknown.
+
+    A 429 or 5xx response does not prove that an upstream request had no side
+    effects. Without a provider idempotency contract, do not resend a job.
+    """
     raw = json.dumps(body, ensure_ascii=False).encode()
     # Direct connection only; do not inherit proxy or tunnel settings.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    statuses = []
-    for attempt in range(4):
-        req = urllib.request.Request(url, data=raw, headers={'Authorization':'Bearer '+key,
-                                     'Content-Type':'application/json'}, method='POST')
+    req = urllib.request.Request(url, data=raw, headers={'Authorization':'Bearer '+key,
+                                 'Content-Type':'application/json'}, method='POST')
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            data, status = res.read(), res.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
         try:
-            with opener.open(req, timeout=timeout) as res:
-                data, status = res.read(), res.status
-        except urllib.error.HTTPError as exc:
-            data, status = exc.read(), exc.code
-        except Exception as exc:
-            raise UnknownOutcome(type(exc).__name__) from None
-        statuses.append(status)
-        if status == 200:
-            try:
-                return json.loads(data), statuses
-            except (ValueError, UnicodeDecodeError):
-                raise UnknownOutcome('invalid_json_response',{'http_statuses':statuses,
-                    'raw_response':data.decode('utf-8','replace').replace(key,'[REDACTED]')}) from None
-        if status not in (408, 429) and not 500 <= status < 600:
-            raise UnknownOutcome('http_%s' % status,{'http_statuses':statuses,
-                'raw_response':data.decode('utf-8','replace').replace(key,'[REDACTED]')})
-        if attempt < 3:
-            time.sleep(min(2**attempt, 8))
-    raise UnknownOutcome('http_retries_exhausted_%s' % status,{'http_statuses':statuses,
+            data = exc.read()
+        except Exception:
+            raise UnknownOutcome('http_%s' % status, {'http_statuses': [status],
+                                                    'raw_response': None}) from None
+    except Exception as exc:
+        raise UnknownOutcome(type(exc).__name__) from None
+    statuses = [status]
+    if status == 200:
+        try:
+            return json.loads(data), statuses
+        except (ValueError, UnicodeDecodeError):
+            raise UnknownOutcome('invalid_json_response',{'http_statuses':statuses,
+                'raw_response':data.decode('utf-8','replace').replace(key,'[REDACTED]')}) from None
+    raise UnknownOutcome('http_%s' % status,{'http_statuses':statuses,
         'raw_response':data.decode('utf-8','replace').replace(key,'[REDACTED]')})
 
 
@@ -105,12 +106,18 @@ def api_message(base, key, model, prompt, *, thinking, temperature=0, limit=8192
         if isinstance(value,dict):return {k:redact(v) for k,v in value.items()}
         return value
     receipt={'http_statuses':statuses,'raw_response':redact(raw)}
+    if not isinstance(raw,dict):
+        raise UnknownOutcome('response_schema',receipt)
     if raw.get('model') != model:
         raise UnknownOutcome('unexpected_provider_model',receipt)
     choices=raw.get('choices')
-    if not isinstance(choices,list) or len(choices)!=1 or choices[0].get('finish_reason')!='stop':
+    if (not isinstance(choices,list) or len(choices)!=1 or
+            not isinstance(choices[0],dict) or choices[0].get('finish_reason')!='stop'):
         raise UnknownOutcome('incomplete_response',receipt)
-    text=choices[0].get('message',{}).get('content')
+    message=choices[0].get('message')
+    if not isinstance(message,dict):
+        raise UnknownOutcome('missing_content',receipt)
+    text=message.get('content')
     if not isinstance(text,str):
         raise UnknownOutcome('missing_content',receipt)
     text=text.strip()

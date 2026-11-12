@@ -4,11 +4,17 @@
 
 ## 流程和边界
 
-一个 API 生产者以 5 个线程处理 Agnes 出题、盲审、答案等价复核和最终答案判分，因此这些环节**合计**最多 5 个并发请求；不得在其他进程或机器绕开该限制。程序在本机使用一个共享文件锁防止多数据库同时启动生产者。每个可复算来源最多 6 次提案；保留作者迁移题并单独标注来源。独立 vLLM 学生消费者领取已审核候选的 16 个独立采样任务，判分请求随后进入同一 API 队列。GPU 不必等整片出题完毕。
+一个 API 生产者以最多 5 个线程处理 Agnes 出题、盲审、答案等价复核和最终答案判分，这些环节在本生产者内**合计**最多 5 个并发请求。并发窗口从 1 开始，成功后逐步增至 5；遇到限流、服务错误或网络异常时减半并退避。程序通过同一个本机 HOME 下的文件锁防止多个本程序生产者同时运行；**不同机器、容器、HOME 或其他程序不受此锁约束**，共享同一账户时必须另行协调总并发，不能据此声称账户全局不超过 5。
+
+API 任务按阶段轮转领取，避免大批出题排在审核、判分前面导致学生长期等题。所有队列都有工作时，判分、审核、等价复核、出题的领取比例为 16:1:1:1；空队列自动跳过。该比例考虑到每个候选有 16 个判分任务，但只是初始策略，实际调用延迟、审核拒绝率和截断比例会影响最优比例。每个可复算来源最多 6 次提案；作者迁移题单独标注来源。
 
 学生采用 Llama-3.1-8B-Instruct、FP16、温度 0.6、top_p 0.9、top_k 50、4096 输出 token、每题 16 个固定样本 ID；保持 `length` 截断判错，以及 boxed 附近各 1000 字符、无 boxed 时首尾各 1000 字符的答案截取规则。出题和盲审沿用原训练方向和 Skill 的核心要求。本实现重新组织了代码和提示词，不能直接断言判分、审核或学生推理与旧产线逐字逐项等价，须先用已保存样本校验。
 
-本版本把每个请求开始状态、完整成功响应、候选和结果写入站内 SQLite。显式 HTTP 408/429/5xx 最多再请求三次；传输中断、响应无法解析以及进程在途退出均保留 unknown/started，**不会自动重复请求**。这会让单题停留未决，但其他任务可以继续。身份碰撞或协议改变会报错。队列在单机本地磁盘使用 SQLite WAL；不要放在 NFS，也不要跨机器共享同一个数据库。需要磁盘权限隔离，不能把数据库、导出或数据加入 Git。
+本版本把每个请求开始状态、成功响应、候选和结果写入站内 SQLite。每个任务只提交一次；HTTP 408/429/5xx、网络中断、响应无法解析和进程在途退出等保留为 `unknown` 或 `started`，不会自动重复发送同一个任务。窗口退避之后只会领取其他待处理任务；401/403 或返回的模型与配置不符时会停止 API 生产者，连续三次响应结构或协议错误也会停止，保留未领取任务。正常的语义未决不触发格式熔断。这会产生待人工或后续程序核对的未决，但避免把结果不明的请求误当作一定没发生。身份碰撞或协议改变会报错。队列在单机本地磁盘使用 SQLite WAL；不要放在 NFS，也不要跨机器共享同一个数据库。需要磁盘权限隔离，不能把数据库、导出或数据加入 Git。
+
+队列操作完成后显式关闭 SQLite 连接，保留原有事务提交和出错回滚；本版本不降低 `synchronous=FULL`，也不通过减少 16 次采样或缩短输出上限换速度。
+
+**升级兼容性：**数据库绑定了运行代码和协议哈希，本版不应直接连接 v1 已初始化的数据库。若旧数据库已有作业，须保留原数据库与回执；本版使用新数据库，并通过已核验的旧来源冻结清单避免重复出题。当前没有实现旧队列的自动迁移或逐样本续跑。
 
 ## 迁移旧数据
 
@@ -24,7 +30,7 @@ python -m stream_train.history --old-root /input/old-a --old-root /input/old-b -
 
 ## 配置与启动
 
-下面是站内示例。路径、模型版本和接口可达性需现场核对；不要在命令或配置里写入密钥。使用环境变量或站内密钥管理器注入 `AGNES_API_KEY`。生成任务会向 Agnes 发送原题与参考答案；盲审会发送原题与候选题；判分会发送候选题、参考答案及学生答案截取。用户已授权这些用途；不发送教师对话。最终配置、模型权重哈希、代码提交和来源文件哈希须留在站内。
+下面是站内示例。路径、模型版本和接口可达性需现场核对；不要在命令或配置里写入密钥。使用环境变量或站内密钥管理器注入 `AGNES_API_KEY`。生成任务会向 Agnes 发送原题与参考答案；盲审会发送原题与候选题；判分会发送候选题、参考答案及学生答案截取。此前对该受限服务器的明确许可是仅发送给 Agnes 用于判分；**实际启用出题或审核前，必须先确认管理方已授权这些额外用途**。最终配置、模型权重哈希、代码提交和来源文件哈希须留在站内。
 
 ```bash
 mkdir -p /work/run
@@ -41,7 +47,7 @@ python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.jso
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve /models/Meta-Llama-3.1-8B-Instruct --served-model-name student-8b --dtype float16 --tensor-parallel-size 1 --max-model-len 8192 --gpu-memory-utilization 0.80 --host 127.0.0.1 --port 8000
 python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.json api
-python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.json student --workers 16
+python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.json student --workers 32
 python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.json status
 python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.json export --out /work/run/export.jsonl
 ```
@@ -50,7 +56,17 @@ python -m stream_train --db /work/run/queue.sqlite --config /work/run/config.jso
 
 ## GPU 选择与验证
 
-建议从 **1 张 A100 80GB、TP=1、一个 8B 学生实例**开始，16 个请求由 vLLM 连续批处理。额外显卡用于另一个单卡实例和独立本地端口，而不是把一个 8B 模型拆成张量并行；实际加到 2、4 张还是维持 1 张应根据队列积压、输出 token/s、显存和 API 限速实测决定。本版本的 student endpoint 是一个配置绑定；多实例负载均衡、单机两张卡协同和多服务故障转移尚未实现，不能直接照此启动多个不同端口消费者接同一个数据库。
+建议从 **1 张 A100 80GB、TP=1、一个 8B 学生实例**开始；学生消费者默认 32 并发，允许 1–64，并由 vLLM 连续批处理。32 只是未实测的起点，不是最快速度的保证；根据站内结果比较 16、32 和 64 的完整作答吞吐、输出 token/s、失败和截断率。额外显卡用于另一个单卡实例和独立本地端口，而不是把一个 8B 模型拆成张量并行；本版本仍只绑定一个学生服务地址，**尚未实现多实例负载均衡**。
+
+学生总上下文 `--max-model-len 8192` 包含输入和生成，固定允许输出 4096 tokens 时，长题目加聊天模板可能超限。正式运行前用相同 tokenizer 和聊天模板在站内检查输入长度分布；不得为提速悄悄缩短 4096 的输出上限。固定 seed 不保证并发变化后输出逐字相同，应记录运行配置并比较结果分布。
+
+可在**空闲的学生服务**上先运行只使用虚构题的初筛，不触碰队列或 Agnes：
+
+```bash
+python -m stream_train.student_benchmark --student-model student-8b --requests 256
+```
+
+诊断依次测试 16/32/64 并发，显示成功数、失败、截断、吞吐、实际平均输出 token 数和延迟；失败后停止后续档位，并须确认服务端请求排空。短题即使将 `--max-tokens` 设为 4096 也可能提前结束，不代表真实长作答吞吐；正式选择仍需在站内单题链路及代表性题长下检查。不要与正式任务同时压测。
 
 设计参考：[vLLM 并行策略](https://docs.vllm.ai/en/v0.33.0/serving/parallelism_scaling/)建议模型能装入单卡时先使用单卡；[vLLM 数据并行部署](https://docs.vllm.ai/en/v0.20.1/serving/data_parallel_deployment/)说明可复制模型实例处理独立请求。具体版本能力和吞吐仍以站内运行实测为准。
 

@@ -6,11 +6,125 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
 from . import pipeline as p
 from .store import Store, encode
+
+
+class AdaptiveAPIWindow:
+    """In-process AIMD request window; account-wide coordination is external."""
+    def __init__(self, *, maximum=5, cooldown_base=1.0, cooldown_cap=60.0):
+        if not 1 <= maximum <= 5 or cooldown_base < 0 or cooldown_cap < cooldown_base:
+            raise ValueError('invalid API window settings')
+        self.maximum = maximum
+        self.limit = 1
+        self.inflight = 0
+        self.failures = 0
+        self.blocked_until = 0.0
+        self.epoch = 0
+        self.auth_failed = False
+        self.protocol_failures = 0
+        self.stop_reason = None
+        self.cooldown_base = cooldown_base
+        self.cooldown_cap = cooldown_cap
+        self.condition = threading.Condition()
+
+    def acquire(self):
+        """Get a permit before claiming a job; None means the circuit stopped."""
+        with self.condition:
+            while True:
+                if self.stop_reason is not None:
+                    return None
+                delay = self.blocked_until - time.monotonic()
+                if delay > 0:
+                    self.condition.wait(timeout=delay)
+                elif self.inflight < self.limit:
+                    self.inflight += 1
+                    return self.epoch
+                else:
+                    self.condition.wait()
+
+    def report(self, lease, outcome):
+        with self.condition:
+            # A fatal circuit is latched. In-flight successes cannot reopen it.
+            if self.stop_reason is not None:
+                self.condition.notify_all()
+                return
+            if outcome == 'auth':
+                self.auth_failed = True
+                self.stop_reason = 'auth'
+                self.epoch += 1
+            elif outcome == 'model':
+                self.stop_reason = 'model'
+                self.epoch += 1
+            elif outcome == 'protocol':
+                self.protocol_failures += 1
+                self.epoch += 1
+                if self.protocol_failures >= 3:
+                    self.stop_reason = 'protocol'
+            elif outcome == 'congestion':
+                self.limit = max(1, self.limit // 2)
+                self.failures += 1
+                # Limit exponent growth even for a prolonged outage.
+                delay = min(self.cooldown_cap,
+                            self.cooldown_base * (2 ** min(self.failures - 1, 16)))
+                self.blocked_until = max(self.blocked_until, time.monotonic() + delay)
+                self.epoch += 1
+            elif outcome == 'success':
+                # Before the circuit trips, any valid response interrupts a
+                # consecutive protocol-error streak, even if it was in flight.
+                self.protocol_failures = 0
+                if (lease == self.epoch and not self.auth_failed and
+                        time.monotonic() >= self.blocked_until):
+                    # An older success must not cancel a newer backoff.
+                    self.limit = min(self.maximum, self.limit + 1)
+                    self.failures = 0
+            self.condition.notify_all()
+
+    def release(self):
+        with self.condition:
+            if self.inflight < 1:
+                raise RuntimeError('API window permit underflow')
+            self.inflight -= 1
+            self.condition.notify_all()
+
+
+def api_outcome(exc):
+    """Classify fixed error categories without logging provider responses."""
+    if not isinstance(exc, p.UnknownOutcome):
+        # Repeated malformed response structures can raise these before a
+        # provider-specific error is constructed. Do not sweep the queue.
+        return 'protocol' if isinstance(exc, (AttributeError, TypeError, KeyError, ValueError)) else 'neutral'
+    reason = str(exc)
+    if reason == 'unexpected_provider_model':
+        return 'model'
+    if reason in ('invalid_json_response', 'response_schema', 'unparseable_content',
+                  'nonobject_response', 'generation_schema', 'review_schema',
+                  'review_enum', 'equivalence_schema', 'grade_schema',
+                  'missing_content', 'incomplete_response', 'empty_candidate'):
+        return 'protocol'
+    status = None
+    for prefix in ('http_', 'http_retries_exhausted_'):
+        if reason.startswith(prefix) and reason[len(prefix):].isdigit():
+            status = int(reason[len(prefix):])
+            break
+    if status in (401, 403):
+        return 'auth'
+    if status in (408, 429) or (status is not None and 500 <= status < 600):
+        return 'congestion'
+    if status is not None:
+        return 'protocol'
+    if reason in ('URLError', 'TimeoutError', 'ConnectionError',
+                  'ConnectionResetError', 'ConnectionAbortedError',
+                  'ConnectionRefusedError', 'RemoteDisconnected',
+                  'OSError', 'SSLError', 'BrokenPipeError', 'InterruptedError',
+                  'IncompleteRead', 'ProtocolError'):
+        return 'congestion'
+    return 'neutral'
 
 
 def config(path):
@@ -72,7 +186,7 @@ def initialize(args,store,cfg):
                       'queued':len(ids-hold),'counts':store.counts()},ensure_ascii=False))
 
 
-def run_one(store,cfg,key,kinds):
+def run_one(store,cfg,key,kinds,observer=None):
     job=store.claim(kinds)
     if job is None:return False
     jid,kind,payload=job
@@ -80,22 +194,49 @@ def run_one(store,cfg,key,kinds):
         if kind=='student':p.student(store,jid,payload,cfg)
         else:getattr(p,kind)(store,jid,payload,cfg,key)
     except Exception as exc:
+        # Inform the shared window before the SQLite write: other workers
+        # must not claim new tasks after an authentication/congestion response.
+        if observer is not None:observer(api_outcome(exc))
         # Keep any uncertain response as unknown. Never log the request, key, or data.
         reason=str(exc) if isinstance(exc,p.UnknownOutcome) and str(exc).replace('_','').isalnum() else None
         receipt=exc.receipt if isinstance(exc,p.UnknownOutcome) else None
         store.finish(jid,{'error_type':type(exc).__name__,'reason':reason,'receipt':receipt},state='unknown')
+    else:
+        # Truncation is graded locally, without an API success to grow the window.
+        local_only = (kind == 'grade' and
+                      payload.get('student', {}).get('finish_reason') == 'length')
+        if observer is not None:observer('neutral' if local_only else 'success')
     return True
 
 
-def loop(store,cfg,key,kinds,workers,once):
+def loop(store,cfg,key,kinds,workers,once,api_window=None):
     def worker():
         while True:
-            found=run_one(store,cfg,key,kinds)
+            if api_window is None:
+                found=run_one(store,cfg,key,kinds)
+            else:
+                lease=api_window.acquire()
+                if lease is None:return
+                try:
+                    found=run_one(store,cfg,key,kinds,
+                                  observer=lambda outcome:api_window.report(lease,outcome))
+                finally:
+                    api_window.release()
             if once:return
             if not found:time.sleep(2)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures=[pool.submit(worker) for _ in range(workers)]
         for f in futures:f.result()
+    if api_window is not None and api_window.stop_reason is not None:
+        messages = {
+            'auth': 'Agnes 认证失败（401/403）',
+            'model': 'Agnes 返回的模型与冻结配置不一致',
+            'protocol': 'Agnes 连续三次响应或协议格式异常',
+        }
+        print(messages[api_window.stop_reason] + '：生产者已停止，未领取作业仍为 pending。',
+              file=sys.stderr)
+        return False
+    return True
 
 
 def export(store,path):
@@ -131,7 +272,7 @@ def main():
     init=sub.add_parser('init');init.add_argument('--sources',required=True);init.add_argument('--hold-source-ids');init.add_argument('--fresh-only',action='store_true')
     for name in ('api','student'):
         run=sub.add_parser(name);run.add_argument('--once',action='store_true')
-        if name=='student':run.add_argument('--workers',type=int,default=16)
+        if name=='student':run.add_argument('--workers',type=int,default=32)
     sub.add_parser('status');out=sub.add_parser('export');out.add_argument('--out',required=True)
     args=a.parse_args();cfg=config(args.config);store=Store(args.db);store.bind('protocol',cfg)
     if args.command=='init':initialize(args,store,cfg);return
@@ -149,6 +290,8 @@ def main():
     with lock.open('a') as f:
         # A distinct server/account consumer must coordinate externally.
         fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        loop(store,cfg,key,['generate','review','equivalence','grade'],5,args.once)
+        ok=loop(store,cfg,key,['generate','review','equivalence','grade'],5,args.once,
+                api_window=AdaptiveAPIWindow())
+        if not ok:raise SystemExit(2)
 
 if __name__=='__main__':main()
