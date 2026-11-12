@@ -157,6 +157,17 @@ def load_source(inv, root, overlay, decisions, stage, key):
         coord = (ident['target'], ident['phase'], ident['index'])
         if ident['source_id'] != source_id or coord not in expected or token in entries:
             raise ValueError('input identity')
+        sample = src / 'samples' / ident['target'] / ident['phase'] / f"{ident['index']:02d}"
+        _, intent = read_json(sample / 'INTENT.json', root)
+        _, receipt = read_json(sample / 'RESPONSE.json', root)
+        if (not isinstance(intent, dict) or
+                set(intent) != {'source_id', 'target', 'phase', 'index', 'request_sha256'} or
+                not isinstance(intent.get('request_sha256'), str) or
+                re.fullmatch(r'[0-9a-f]{64}', intent['request_sha256']) is None or
+                not isinstance(receipt, dict) or receipt.get('identity') != intent or
+                inv.identity(intent) != ident or receipt.get('text') != row.get('student_response') or
+                receipt.get('finish_reason') != row.get('finish_reason')):
+            raise ValueError('sample receipt mismatch')
         entries[token] = row
     if {(r['target'], r['phase'], r['index']) for r in entries.values()} != expected:
         raise ValueError('missing sample')

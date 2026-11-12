@@ -57,7 +57,8 @@ class SummaryTest(unittest.TestCase):
             for phase in ('pre','control','post'):
                 for n in range(16):
                     row = {'source_id':self.sid,'target':t,'phase':phase,'index':n,
-                           'problem':'synthetic question', 'reference_answer':'1', 'student_response':'1'}
+                           'problem':'synthetic question', 'reference_answer':'1', 'student_response':'1',
+                           'finish_reason':'stop'}
                     if t != 'source':
                         row.update(candidate_id='candidate', difficulty='easy', position_by_student_correct=3,
                                    historical_student_correct=10, historical_student_n_scored=16,
@@ -65,6 +66,10 @@ class SummaryTest(unittest.TestCase):
                     rows.append(row)
                     ident = inv.identity(row)
                     token = inv.digest({'identity':ident})
+                    student_binding = {**ident, 'request_sha256': hashlib.sha256(token.encode()).hexdigest()}
+                    sample = folder/'samples'/t/phase/f'{n:02d}'
+                    save(sample/'INTENT.json', student_binding)
+                    save(sample/'RESPONSE.json', {'identity':student_binding, 'text':'1', 'finish_reason':'stop'})
                     status = 'unknown' if t == 'source' and phase == 'pre' and n in (0,1) else 'correct'
                     binding = {'identity':ident, 'request_sha256':inv.digest(inv.payload(row)),
                                'model':inv.MODEL,'grader':'agnes_full_response_v2'}
@@ -162,6 +167,54 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(groups['简单']['判分或输入异常'],1)
         self.assertEqual(groups['简单']['纳入来源'],0)
         self.assertFalse(totals['简单'][('原题','pre')])
+
+    def test_missing_student_receipt_excludes_entire_source(self):
+        receipt = self.root/'EASY'/'sources'/self.key/'samples'/'source'/'pre'/'00'/'RESPONSE.json'
+        receipt.unlink()
+        groups, totals = s.collect(inv, self.root, self.overlay, self.out)
+        self.assertEqual(groups['简单']['判分或输入异常'], 1)
+        self.assertEqual(groups['简单']['纳入来源'], 0)
+        self.assertFalse(totals['简单'][('原题', 'pre')])
+
+    def test_mismatched_student_receipt_fields_exclude_entire_source(self):
+        sample = self.root/'EASY'/'sources'/self.key/'samples'/'source'/'pre'/'00'
+        receipt = sample/'RESPONSE.json'
+        original = receipt.read_bytes()
+        cases = (
+            ('text', 'different'),
+            ('finish_reason', 'length'),
+            ('identity', {'source_id': self.sid, 'target': 'source', 'phase': 'pre',
+                          'index': 0, 'request_sha256': '0' * 64}),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                modified = json.loads(original)
+                modified[field] = value
+                save(receipt, modified)
+                groups, totals = s.collect(inv, self.root, self.overlay, self.out)
+                self.assertEqual(groups['简单']['判分或输入异常'], 1)
+                self.assertEqual(groups['简单']['纳入来源'], 0)
+                self.assertFalse(totals['简单'][('原题', 'pre')])
+                receipt.write_bytes(original)
+
+    def test_missing_intent_and_invalid_hash_exclude_entire_source(self):
+        sample = self.root/'EASY'/'sources'/self.key/'samples'/'source'/'pre'/'00'
+        intent, receipt = sample/'INTENT.json', sample/'RESPONSE.json'
+        intent_bytes, receipt_bytes = intent.read_bytes(), receipt.read_bytes()
+        intent.unlink()
+        groups, totals = s.collect(inv, self.root, self.overlay, self.out)
+        self.assertEqual(groups['简单']['判分或输入异常'], 1)
+        self.assertFalse(totals['简单'][('原题', 'pre')])
+        intent.write_bytes(intent_bytes)
+        invalid = json.loads(intent_bytes)
+        invalid['request_sha256'] = 'invalid'
+        response = json.loads(receipt_bytes)
+        response['identity'] = invalid
+        save(intent, invalid)
+        save(receipt, response)
+        groups, totals = s.collect(inv, self.root, self.overlay, self.out)
+        self.assertEqual(groups['简单']['判分或输入异常'], 1)
+        self.assertFalse(totals['简单'][('原题', 'pre')])
 
     def test_changed_source_binding_skips_entire_source(self):
         p = self.root/'EASY'/'sources'/self.key/'SOURCE.json'
