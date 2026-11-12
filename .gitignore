@@ -10,6 +10,13 @@
 !/training/
 /training/*
 !/training/README.md
+!/stream_train/
+/stream_train/*
+!/stream_train/*.py
+!/tests_stream/
+/tests_stream/*
+!/tests_stream/*.py
+!/STREAMING_TRAIN.md
 # Canonical evaluation tree; root names are tracked compatibility symlinks.
 !/evaluation/
 /evaluation/*
