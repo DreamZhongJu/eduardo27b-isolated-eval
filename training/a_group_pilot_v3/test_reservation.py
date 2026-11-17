@@ -38,7 +38,8 @@ class Tests(unittest.TestCase):
             ids = m.wait_cards(Path(d))
         self.assertEqual(ids, [0, 1, 2, 3])
         self.assertEqual(m.HOLDERS, {})
-        check.assert_called_once_with(ids)
+        self.assertEqual(check.call_count, 5)
+        check.assert_called_with(ids)
         self.assertTrue(any('凑够 4' in s[2] for s in states))
 
     def test_release_only_owned_workers(self):

@@ -105,6 +105,10 @@ def wait_cards(work):
         for i in sorted(first):
             if len(HOLDERS) >= 4: break
             if i not in HOLDERS and i in second and eligible(first[i]) and eligible(second[i]):
+                # Earlier successful reservations may have taken time to load.
+                # Recheck this particular card immediately before claiming it.
+                try: check_cards([i])
+                except RuntimeError: continue
                 if try_reserve(i, work):
                     state(work, 'waiting_gpu', f'已预留显卡 {sorted(HOLDERS)}；凑够 4 张启动')
         if len(HOLDERS) >= 4:
