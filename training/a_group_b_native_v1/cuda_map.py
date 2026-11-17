@@ -1,5 +1,20 @@
 """Map visible CUDA ordinals to driver UUID without creating contexts."""
-import ctypes, json, os, subprocess, sys, uuid
+import ctypes, json, os, re, subprocess, sys, uuid
+
+_UUID_TEXT = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+def parse_gpu_uuid(value):
+    """Parse exactly one complete physical-GPU UUID, with optional GPU- prefix.
+
+    PyTorch renders CUuuid without the NVML GPU- prefix. Compare all 128 bits;
+    truncated UUIDs, other prefixes (including MIG), and non-strings are invalid.
+    """
+    if not isinstance(value, str):
+        raise ValueError('GPU UUID 类型无效')
+    text = value[4:] if value[:4].lower() == 'gpu-' else value
+    if not _UUID_TEXT.fullmatch(text):
+        raise ValueError('GPU UUID 格式无效')
+    return uuid.UUID(text)
 
 class UUID(ctypes.Structure):
     _fields_=[('data',ctypes.c_ubyte*16)]
@@ -23,6 +38,14 @@ def verified(python, expected, base_env, runner=subprocess.run):
     # were respected. Never remove or reinterpret a pre-existing restriction.
     if 'CUDA_VISIBLE_DEVICES' in base_env:
         raise RuntimeError('已设置 CUDA_VISIBLE_DEVICES，无法安全确认卡映射')
+    try:
+        if not isinstance(expected, (list, tuple)) or not expected:
+            raise ValueError('GPU UUID 列表无效')
+        wanted = [parse_gpu_uuid(x) for x in expected]
+        if len(set(wanted)) != len(wanted):
+            raise ValueError('GPU UUID 重复')
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('选中卡的CUDA UUID复核不一致') from exc
     allowed_env=dict(base_env,CUDA_DEVICE_ORDER='PCI_BUS_ID')
     env=dict(allowed_env)
     cmd=[str(python),'-B',__file__,'--show']
@@ -30,13 +53,20 @@ def verified(python, expected, base_env, runner=subprocess.run):
         out=runner(cmd,env=which,capture_output=True,text=True,timeout=30,check=True)
         return json.loads(out.stdout)
     allowed=run(allowed_env)
-    if any(str(x).lower() not in {str(v).lower() for v in allowed.values()} for x in expected):
+    try:
+        available = {parse_gpu_uuid(v) for v in allowed.values()}
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise RuntimeError('CUDA 映射变化') from exc
+    if any(x not in available for x in wanted):
         raise RuntimeError('所选卡不在继承的CUDA可见范围')
     a,b=run(env),run(env)
     if a!=b or not isinstance(a,dict):raise RuntimeError('CUDA 映射变化')
-    inverse={str(v).lower():int(k) for k,v in a.items()}
+    try:
+        inverse={parse_gpu_uuid(v):int(k) for k,v in a.items()}
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('CUDA 映射变化') from exc
     if len(inverse)!=len(a):raise RuntimeError('CUDA 映射非唯一')
-    try:result=[inverse[str(x).lower()] for x in expected]
+    try:result=[inverse[x] for x in wanted]
     except KeyError as e:raise RuntimeError('卡身份不在CUDA可见列表') from e
     if len(set(result))!=len(result):raise RuntimeError('CUDA 卡身份重复')
     # A fresh torch runtime must resolve the intended UUIDs in the precise
@@ -45,7 +75,13 @@ def verified(python, expected, base_env, runner=subprocess.run):
     out=runner([str(python),'-B',__file__,'--selected'],env=selected_env,
                capture_output=True,text=True,timeout=60,check=True)
     selected=json.loads(out.stdout)
-    if [str(x).lower() for x in selected]!=[str(x).lower() for x in expected]:
+    try:
+        if not isinstance(selected, list):
+            raise ValueError('GPU UUID 列表无效')
+        resolved = [parse_gpu_uuid(x) for x in selected]
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('选中卡的CUDA UUID复核不一致') from exc
+    if resolved != wanted:
         raise RuntimeError('选中卡的CUDA UUID复核不一致')
     return result
 

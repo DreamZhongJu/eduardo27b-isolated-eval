@@ -12,6 +12,8 @@ GPU 按原 A 自检脚本 SHA 验证并复用锁和 parent-death；新资源层�
 
 运行后用本目录 `status.py --work <run_dir>` 看脱敏状态表；用 `audit_posthoc.py --work <run_dir>` 汇总。两步的 rollout 与 actor 概率差及相关系数可提示异常，不构成全权重同步证明。作者记录没有原始 finish_reason、未追加尾轮和可靠逐步轨迹身份，因此这些只能报告未覆盖。原样 step 与 testing 计时平级；checkpoint 保存计入 step。
 
-CPU 本地测试：`test_b_stage.py` 9、`test_resources.py` 4、`test_gpu_process_monitor.py` 4、`test_parent_guard.py` 1，均通过；原等待器测试 4 项、事后汇总测试 9 项通过。用户执行的 A 阶段已验证单卡强杀清理与锁，不能替代此 B 控制器在真实容器中的验证。
+CPU 本地测试：`test_b_stage.py` 11、`test_resources.py` 4、`test_gpu_process_monitor.py` 4、`test_parent_guard.py` 1，均通过；原等待器测试 4 项、事后汇总测试 9 项通过。用户执行的 A 阶段已验证单卡强杀清理与锁，不能替代此 B 控制器在真实容器中的验证。
 
 `b25fe23` 版把有效符号链接误判为缺失。当前版本允许指向实际文件的符号链接，并检查 Python 可执行权限；执行时始终使用虚拟环境原路径。失效链接、缺失文件、不可执行解释器依然拒绝；后续代码版本、数据散列和模型结构校验保持不变。
+
+`d2daa4d` 版按字符串比较 GPU UUID，未兼容 NVIDIA 带 `GPU-` 前缀与 PyTorch 不带前缀的两种形式。当前版本对两者严格解析完整 128 位 UUID 后按顺序比较；无效 UUID、MIG、缺失/多余和真实不同 UUID 仍拒绝。容器里的实际 UUID 映射需运行时验证。
