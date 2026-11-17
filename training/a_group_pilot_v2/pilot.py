@@ -177,9 +177,12 @@ def run(ids, steps, work):
       TORCH_HOME=str(work/'cache/torch'), TRITON_CACHE_DIR=str(work/'cache/triton'),
       TORCHINDUCTOR_CACHE_DIR=str(work/'cache/inductor'), CUDA_CACHE_PATH=str(work/'cache/cuda'), WANDB_MODE='disabled')
     try:
-        # Ray's Unix socket paths have a 107-byte limit. Create a short,
-        # task-owned location and keep it for safe inspection and cleanup.
-        ray_tmp = Path(tempfile.mkdtemp(prefix='a4b-ray-', dir='/tmp'))
+        # Ray Unix sockets must fit 107 bytes, including the session suffix.
+        # Keep this short, random, task-owned directory inside the A-group root.
+        ray_tmp = ROOT / ('r' + secrets.token_hex(3))
+        worst = str(ray_tmp) + '/session_2099-12-31_23-59-59_999999_4194304/sockets/plasma_store'
+        require(len(worst.encode()) <= 107, 'Ray 临时目录的 socket 路径过长')
+        ray_tmp.mkdir(mode=0o700, exist_ok=False)
         (work/'ray_tmp_path.txt').write_text(str(ray_tmp) + '\n')
         if ids is None:
             state(work, 'waiting_gpu', '等待至少四张候选空闲卡')

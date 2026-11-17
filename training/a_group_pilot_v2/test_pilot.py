@@ -13,7 +13,7 @@ class FakeProc:
 
 class PilotTests(unittest.TestCase):
     def test_invalid_gpu_and_existing_dir(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(dir='/tmp') as d:
             root = Path(d); (root/'pilots').mkdir()
             with patch.object(p,'ROOT',root):
                 with self.assertRaisesRegex(RuntimeError,'四至六个不同'): p.run([0,0,1,2,3,4],1,root/'pilots'/'new')
@@ -21,7 +21,7 @@ class PilotTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError,'新目录'): p.run([0,1,2,3,4,5],1,root/'pilots'/'old')
 
     def test_training_command_frozen_values(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(dir='/tmp') as d:
             root=Path(d); (root/'pilots').mkdir(); work=root/'pilots'/'smoke'
             cmd=[]; env={}; fake=FakeProc(); services=[]; smokes=[]
             def trainer(args, **kwargs): cmd.extend(args); env.update(kwargs['env']); return fake
@@ -43,7 +43,7 @@ class PilotTests(unittest.TestCase):
 
     def test_automatic_wait_and_card_split(self):
         for count in (4, 5, 6):
-            with self.subTest(count=count), tempfile.TemporaryDirectory() as d:
+            with self.subTest(count=count), tempfile.TemporaryDirectory(dir='/tmp') as d:
                 root=Path(d); (root/'pilots').mkdir(); work=root/'pilots'/'smoke'
                 calls=[]; fake=FakeProc()
                 def service(*args): calls.append(args); return fake
