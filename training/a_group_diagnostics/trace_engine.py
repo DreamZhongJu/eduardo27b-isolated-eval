@@ -24,6 +24,7 @@ FRAME = re.compile(r'File ["\']([^"\']+)["\'], line (\d+), in ([A-Za-z_<>.0-9]+)
 ASSERTION = re.compile(r'(?m)^.{0,350}?\bAssertionError(?:\s*:\s*([^\r\n]*))?\s*$')
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 CATEGORIES = (
+    ('共享显卡内存分析受干扰', r'Error in memory profiling|Memory usage increased after sleeping|memory profiling.*(?:failed|error)'),
     ('线性注意力缓存与批次不匹配', r'num_cache_lines\s*>=\s*batch|cache.lines.*batch'),
     ('注意力缓存规格不匹配', r'AttentionSpec|kv.cache.spec|kv_cache_spec|page.size'),
     ('显存或缓存不足', r'out of memory|insufficient.*memory|not enough memory|free memory.*(?:less|lower)|no available memory'),
