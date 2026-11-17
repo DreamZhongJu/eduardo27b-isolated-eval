@@ -5,6 +5,17 @@ import b_stage as b
 import cuda_map
 
 class Tests(unittest.TestCase):
+ def test_valid_symlinks_and_missing_paths(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d); target=root/'target'; target.write_text('data'); target.chmod(0o700)
+   link=root/'python'; link.symlink_to(target)
+   b.assert_file(link,'Python解释器')
+   link.unlink(); link.symlink_to(root/'missing')
+   with self.assertRaisesRegex(RuntimeError,'Python解释器'):b.assert_file(link,'Python解释器')
+   with self.assertRaisesRegex(RuntimeError,'训练集'):b.assert_file(root/'missing','训练集')
+   target.chmod(0o600)
+   with self.assertRaisesRegex(RuntimeError,'Python解释器'):b.assert_file(target,'Python解释器')
+   self.assertEqual(b.safe_reason(RuntimeError('必要文件缺失：训练集')),'必要文件缺失：训练集')
  def test_native_b_config(self):
   args=b.training_overrides(Path('/tmp/w'),Path('/tmp/r'),'student',Path('/tmp/i'))
   for s in ('data.train_batch_size=2','actor_rollout_ref.actor.ppo_mini_batch_size=2','actor_rollout_ref.rollout.n=4',

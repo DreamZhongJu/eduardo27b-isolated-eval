@@ -33,22 +33,28 @@ SAFE_REASONS=frozenset(('必要文件不存在或为链接','已有CUDA可见性
  '第1步检查点缺失或输出目录已存在','作者 CPU 合并工具失败','合并输出缺少 safetensors','合并索引分片不完整','合并输出不可读取',
  '已设置 CUDA_VISIBLE_DEVICES，无法安全确认卡映射','所选卡不在继承的CUDA可见范围','CUDA 映射变化','CUDA 映射非唯一',
  '卡身份不在CUDA可见列表','CUDA 卡身份重复','选中卡的CUDA UUID复核不一致'))
+FILE_LABELS=frozenset(('Python解释器','作者主配置','学生交互配置','训练集','验证集','数据清单','Tutor配置','学生配置','裁判配置'))
 
 def safe_reason(exc):
     message=str(exc)
-    return message if message in SAFE_REASONS else type(exc).__name__
+    return message if message in SAFE_REASONS or message in {'必要文件缺失：'+x for x in FILE_LABELS} else type(exc).__name__
 
-def assert_file(p):
-    if not p.is_file() or p.is_symlink(): raise RuntimeError('必要文件不存在或为链接')
+def assert_file(p, label):
+    # Virtualenv interpreters and model snapshots may be valid symlinks.
+    # is_file() follows the link while rejecting dangling links/directories.
+    if label not in FILE_LABELS: raise ValueError('文件标签不合法')
+    if not p.is_file() or (label == 'Python解释器' and not os.access(p,os.X_OK)):
+        raise RuntimeError('必要文件缺失：'+label)
 
 def validate():
     if 'CUDA_VISIBLE_DEVICES' in os.environ:
         raise RuntimeError('已有CUDA可见性限制，拒绝猜测物理卡号')
-    for p in (PYTHON, REPO/'eduardo/configs/eduardo_base.yaml',
-              REPO/'eduardo/eduardo_interaction_config.yaml',
-              DATA/'train.parquet',DATA/'val.parquet',DATA/'materialization_manifest.json',
-              TUTOR/'config.json',STUDENT/'config.json',JUDGE/'config.json'):
-        assert_file(p)
+    for label,p in (('Python解释器',PYTHON),('作者主配置',REPO/'eduardo/configs/eduardo_base.yaml'),
+              ('学生交互配置',REPO/'eduardo/eduardo_interaction_config.yaml'),
+              ('训练集',DATA/'train.parquet'),('验证集',DATA/'val.parquet'),
+              ('数据清单',DATA/'materialization_manifest.json'),('Tutor配置',TUTOR/'config.json'),
+              ('学生配置',STUDENT/'config.json'),('裁判配置',JUDGE/'config.json')):
+        assert_file(p,label)
     result=subprocess.run(['git','-C',str(REPO),'rev-parse','HEAD'],capture_output=True,text=True,check=True,timeout=30)
     if result.stdout.strip()!=COMMIT: raise RuntimeError('作者版本不一致')
     result=subprocess.run(['git','-C',str(REPO),'status','--porcelain','--untracked-files=no'],capture_output=True,text=True,check=True,timeout=30)
