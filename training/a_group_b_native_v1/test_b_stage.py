@@ -1,11 +1,38 @@
 import json, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import b_stage as b
 import cuda_map
 
 class Tests(unittest.TestCase):
+ def test_finishing_trainer_with_healthy_services(self):
+  callbacks, scanner = Mock(), Mock()
+  running = {'judge':None, 'student':None, 'trainer':None}
+  callbacks.exit_codes.side_effect = [running, dict(running, trainer=0)]
+  scanner.scan.return_value = False
+  with patch.object(b.time, 'sleep') as sleep:
+   b.wait_for_training(callbacks, scanner)
+  self.assertEqual(callbacks.exit_codes.call_count, 2)
+  self.assertEqual(scanner.scan.call_count, 2)
+  callbacks.student_guard.assert_called_once()
+  sleep.assert_called_once_with(10)
+
+ def test_unexpected_exit_or_final_fallback(self):
+  running = {'judge':None, 'student':None, 'trainer':None}
+  for codes, fallback, reason in [
+      (dict(running, judge=0), False, '裁判服务提前退出'),
+      (dict(running, student=1), False, '学生服务提前退出'),
+      (dict(running, trainer=1), False, '训练进程退出失败'),
+      (dict(running, trainer=0, judge=1), False, '裁判服务提前退出'),
+      (dict(running, trainer=0), True, '检测到 fallback')]:
+   with self.subTest(codes=codes, fallback=fallback):
+    callbacks, scanner = Mock(), Mock()
+    callbacks.exit_codes.return_value = codes
+    scanner.scan.return_value = fallback
+    with self.assertRaisesRegex(RuntimeError, reason):
+     b.wait_for_training(callbacks, scanner)
+
  def test_interaction_works_without_worker_user(self):
   import yaml
   with tempfile.TemporaryDirectory() as d:

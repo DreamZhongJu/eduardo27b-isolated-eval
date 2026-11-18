@@ -30,7 +30,7 @@ SAFE_REASONS=frozenset(('必要文件不存在或为链接','已有CUDA可见性
  '作者受版本控制文件存在修改','训练库版本不符','模型结构不符','模型分片缺失','模型权重缺失','作者数据文件校验不一致',
  '进程清理保护不可用','interaction 配置结构异常','学生交互配置预检失败','Hydra 配置预检失败','Hydra 配置字段核对失败',
  '本次 worker 日志压缩不可检查','本任务日志不可读','学生共享卡显存保护触发或状态未知','导师卡错误','运行名称格式不符',
- 'Ray socket 路径过长','旧任务守护进程尚未退出','本任务服务异常退出','检测到 fallback，B 无效','训练进程退出失败',
+ 'Ray socket 路径过长','旧任务守护进程尚未退出','裁判服务提前退出','学生服务提前退出','检测到 fallback，B 无效','训练进程退出失败',
  '第1步检查点缺失或输出目录已存在','作者 CPU 合并工具失败','合并输出缺少 safetensors','合并索引分片不完整','合并输出不可读取',
  '已设置 CUDA_VISIBLE_DEVICES，无法安全确认卡映射','所选卡不在继承的CUDA可见范围','CUDA 映射变化','CUDA 映射非唯一',
  '卡身份不在CUDA可见列表','CUDA 卡身份重复','选中卡的CUDA UUID复核不一致'))
@@ -268,7 +268,8 @@ class Callbacks:
            RAY_ADDRESS='local',RAY_TMPDIR=str(self.raytmp))
         cmd=[str(PYTHON),str(Path(__file__).with_name('trainer_entry.py')),'--config-path',str(REPO/'eduardo/configs'),'--config-name','eduardo_base']
         return self.spawn('trainer',cmd+training_overrides(self.work,self.raytmp,self.student_name,self.interaction),env)
-    def running(self):return {n:p.poll() is None for n,p in self.process_by_role.items()}
+    def exit_codes(self):
+        return {name: proc.poll() for name, proc in self.process_by_role.items()}
     def stop_started(self):
         for p in reversed(self.children):
             if p.poll() is None:
@@ -281,6 +282,24 @@ class Callbacks:
                 try:os.killpg(p.pid,signal.SIGKILL)
                 except ProcessLookupError:pass
                 p.wait(timeout=10)
+
+
+def wait_for_training(callbacks, scanner):
+    """Check the two serving processes separately from normal trainer completion."""
+    while True:
+        codes = callbacks.exit_codes()
+        if scanner.scan():
+            raise RuntimeError('检测到 fallback，B 无效')
+        if codes['trainer'] not in (None, 0):
+            raise RuntimeError('训练进程退出失败')
+        if codes['judge'] is not None:
+            raise RuntimeError('裁判服务提前退出')
+        if codes['student'] is not None:
+            raise RuntimeError('学生服务提前退出')
+        if codes['trainer'] == 0:
+            return
+        callbacks.student_guard()
+        time.sleep(10)
 
 
 def run(name):
@@ -303,7 +322,10 @@ def run(name):
     callbacks=Callbacks(work,student_name,token,raytmp,interaction,resources.snapshot)
     state={'phase':'准备','reason':'','protected_gpu':None,'events':[],'bindings':{},'role_processes':{}}
     def update(phase,reason=''):
-        state.update(phase=phase,reason=reason,bindings=callbacks.bindings,role_processes=callbacks.running(),protected_gpu=callbacks.protected_gpu,updated_at=time.time())
+        codes = callbacks.exit_codes()
+        state.update(phase=phase,reason=reason,bindings=callbacks.bindings,
+                     role_exit_codes=codes,role_processes={role: rc is None for role, rc in codes.items()},
+                     protected_gpu=callbacks.protected_gpu,updated_at=time.time())
         state['events'].append({'phase':phase,'time':time.time()});atomic(work,state)
     lock=False; sampler=None
     def interrupt(sig,_):raise KeyboardInterrupt
@@ -345,16 +367,9 @@ def run(name):
             return result
         sampler=gpu_process_monitor.Sampler(work/'gpu_samples.jsonl',task_roots,task_cards,interval=10)
         sampler.start();update('凑卡')
-        trainer=resources.acquire_and_handoff(callbacks)
+        resources.acquire_and_handoff(callbacks)
         update('训练中')
-        scanner=LogScanner(work,raytmp)
-        while trainer.poll() is None:
-            callbacks.student_guard()
-            if not all(callbacks.running().get(x,False) for x in ('judge','student','trainer')):raise RuntimeError('本任务服务异常退出')
-            if scanner.scan():raise RuntimeError('检测到 fallback，B 无效')
-            time.sleep(10)
-        if scanner.scan():raise RuntimeError('检测到 fallback，B 无效')
-        if trainer.returncode!=0:raise RuntimeError('训练进程退出失败')
+        wait_for_training(callbacks, LogScanner(work,raytmp))
         # Release GPU services before the CPU-only author checkpoint merge.
         callbacks.stop_started()
         update('CPU合并','执行作者 FSDP 合并工具')

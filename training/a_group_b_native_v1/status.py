@@ -3,6 +3,7 @@ import argparse
 from collections import Counter
 from datetime import datetime
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -103,25 +104,88 @@ def get_checkpoints(root):
     return rows
 
 
-def step_markers(root):
-    p=Path(root)/'trainer.log'
-    if not p.is_file(): return None
+STEP_HEADER = re.compile(r'(?<!\S)step:(\d{1,9})\s+-\s')
+GLOBAL_STEP = re.compile(r'(?:^|\s-\s)training/global_step:(\d{1,9})(?=\s|$)')
+STEP_SECONDS = re.compile(r'(?:^|\s-\s)timing_s/step:(\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)(?=\s|$)')
+FINAL_NONE = re.compile(r"""(?:^|[\s'"])Final validation metrics: None['"]?\s*$""")
+ANSI_COLOR = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def finish_metrics(work):
+    """Read only the numeric veRL console metrics and the B terminal message."""
+    steps = {}
+    final_none = False
     try:
-        pattern=re.compile(r'\bstep[:=]\s*(\d+)\b')
-        with p.open(errors='replace') as f: return sorted({int(m.group(1)) for line in f for m in pattern.finditer(line)})
-    except OSError: return None
+        with (work/'trainer.log').open(errors='replace') as stream:
+            for line in stream:
+                if 'training/global_step:' not in line and 'Final validation metrics:' not in line:
+                    continue
+                line = ANSI_COLOR.sub('', line)
+                final_none |= FINAL_NONE.search(line) is not None
+                header = STEP_HEADER.search(line)
+                step = GLOBAL_STEP.search(line)
+                if header and step and header[1] == step[1]:
+                    seconds = STEP_SECONDS.search(line)
+                    value = float(seconds[1]) if seconds else None
+                    step_id = int(step[1])
+                    if value is not None and math.isfinite(value):
+                        steps[step_id] = value
+                    else:
+                        steps.setdefault(step_id, None)
+    except OSError:
+        return None, None
+    return steps, final_none
 
 
-def report(work):
+def finish_report(work, state, steps, final_none):
+    ckpt = work/'verl_ckpts/b-functional/latest_checkpointed_iteration.txt'
+    try:
+        saved = ckpt.read_text().strip()
+    except (OSError, UnicodeError):
+        saved = ''
+    events = state.get('events') or []
+    merge_started = (work/'cpu_merge.log').is_file() or any(e.get('phase') == 'CPU合并' for e in events)
+    merged = work/'eval_checkpoints/b-functional/step_1'
+    merge_artifact = merged.is_dir() and any(merged.glob('*.safetensors'))
+    print('\nB 收尾核对（退出状态取自控制器最后一次写盘）')
+    table(('项目','记录'), [
+        ('控制器阶段', state.get('phase') or '未知'),
+        ('控制器原因', state.get('reason') or '无记录'),
+        ('训练主循环结束标记（B 跳过验证）',
+         '未知（日志不可读）' if final_none is None else ('已发现' if final_none else '未发现')),
+        ('最近检查点步号文件', saved if re.fullmatch(r'[0-9]{1,9}', saved) else '未知'),
+        ('CPU 合并启动痕迹', '有' if merge_started else '未发现'),
+        ('CPU 合并权重文件', '有（待核验）' if merge_artifact else '未发现'),
+    ])
+    print('\n本轮最后的进程快照')
+    rows = []
+    processes = state.get('role_processes') or {}
+    codes = state.get('role_exit_codes') or {}
+    for role, label in (('judge','裁判'), ('student','学生'), ('trainer','训练器')):
+        alive, code = processes.get(role), codes.get(role)
+        rows.append((label, {True:'仍在运行', False:'已退出'}.get(alive,'未知') if type(alive) is bool else '未知',
+                     code if type(code) is int else '无记录'))
+    table(('角色','写盘时进程','记录的退出码'), rows)
+    print('\nveRL 训练指标')
+    rows = [(key, f'{value:.2f}' if value is not None else '未记录')
+            for key,value in sorted((steps or {}).items())]
+    table(('训练步','本步秒数'), rows or [('—', '日志不可读' if steps is None else '未发现带步号的指标')])
+
+
+def report(work, finish_only=False):
     work=Path(work)
     state=read_obj(work/'orchestration.json')
+    steps, final_none = finish_metrics(work)
+    if finish_only:
+        finish_report(work, state, steps, final_none)
+        return
     res=read_obj(work/'resources.json')
     print('B 阶段只读状态（草案；进程存活和数据完整性未实时确认）')
     table(('项目','状态'),[
         ('阶段',(res.get('phase') if state.get('phase') == '凑卡' else state.get('phase','未开始'))),('原因类别',state.get('reason','—') or '—'),
         ('保护触发显卡',state.get('protected_gpu') if state.get('protected_gpu') is not None else '无记录'),
         ('凑卡轮次',res.get('round','未记录')),('已交接角色',str(state.get('bindings',{}))),
-        ('step 标记',str(step_markers(work)) if step_markers(work) is not None else '未发现日志'),
+        ('veRL 训练步', sorted(steps) if steps is not None else '未发现日志'),
         ('显存峰值','见下表；进程归属无法证明时显示未知')])
     peaks=read_obj(work/'gpu_peaks.json')
     print('\n本任务进程显存峰值（MiB）')
@@ -158,7 +222,11 @@ def report(work):
     table(('项目','数量'),rows)
     print('\n检查点（仅文件与大小，不等于已完成 CPU 合并验证）')
     table(('目录','大小 MiB','验证状态'),get_checkpoints(work) or [('—','—','未发现')])
+    finish_report(work, state, steps, final_none)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser(); p.add_argument('--work',required=True); args=p.parse_args()
-    report(args.work)
+    p=argparse.ArgumentParser()
+    p.add_argument('--work',required=True)
+    p.add_argument('--finish-only', action='store_true', help='只显示已落盘的收尾记录')
+    args=p.parse_args()
+    report(args.work, args.finish_only)
