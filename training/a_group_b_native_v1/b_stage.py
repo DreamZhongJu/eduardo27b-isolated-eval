@@ -20,6 +20,7 @@ STUDENT = Path('/workspace/models/Meta-Llama-3.1-8B-Instruct')
 JUDGE = ROOT/'models/Qwen3.6-27B'
 COMMIT='e8c89b7293e65e632149571b16a1c2d4e33c77fe'
 PORTS={'student':18861,'judge':18862}
+STUDENT_API_BASE=f"http://127.0.0.1:{PORTS['student']}/v1"
 WORKERS=2
 STUDENT_LIMIT=16
 JUDGE_LIMIT=16
@@ -27,7 +28,7 @@ FALLBACK=re.compile(rb'(?:gave up after .*?using fallback|non-retriable .*?using
 # Sources can contain user data. Never display input, exception text or raw logs.
 SAFE_REASONS=frozenset(('必要文件不存在或为链接','已有CUDA可见性限制，拒绝猜测物理卡号','作者版本不一致',
  '作者受版本控制文件存在修改','训练库版本不符','模型结构不符','模型分片缺失','模型权重缺失','作者数据文件校验不一致',
- '进程清理保护不可用','interaction 配置结构异常','Hydra 配置预检失败','Hydra 配置字段核对失败',
+ '进程清理保护不可用','interaction 配置结构异常','学生交互配置预检失败','Hydra 配置预检失败','Hydra 配置字段核对失败',
  '本次 worker 日志压缩不可检查','本任务日志不可读','学生共享卡显存保护触发或状态未知','导师卡错误','运行名称格式不符',
  'Ray socket 路径过长','旧任务守护进程尚未退出','本任务服务异常退出','检测到 fallback，B 无效','训练进程退出失败',
  '第1步检查点缺失或输出目录已存在','作者 CPU 合并工具失败','合并输出缺少 safetensors','合并索引分片不完整','合并输出不可读取',
@@ -134,7 +135,7 @@ def service_command(role,student_name):
        '--enable-chunked-prefill','--enable-prefix-caching']
 
 
-def make_interaction(work):
+def make_interaction(work,student_name):
     import yaml
     source=REPO/'eduardo/eduardo_interaction_config.yaml'
     o=yaml.safe_load(source.read_text(encoding='utf-8'))
@@ -142,6 +143,10 @@ def make_interaction(work):
     if not isinstance(rows,list) or len(rows)!=1 or rows[0].get('name')!='eduardo':
         raise RuntimeError('interaction 配置结构异常')
     rows[0]['config']['student_concurrency']=STUDENT_LIMIT
+    # Resolve only non-secret values in this private copy: workers must use
+    # the same model and loopback endpoint even if USER is not inherited.
+    rows[0]['config']['student_model']=student_name
+    rows[0]['config']['student_api_base']=STUDENT_API_BASE
     target=work/'interaction_b.yaml'
     with target.open('x',encoding='utf-8') as f:yaml.safe_dump(o,f,allow_unicode=True,sort_keys=False)
     return target
@@ -152,8 +157,8 @@ def preflight_config(work,raytmp,student_name,interaction):
     import yaml
     env=dict(os.environ,CUDA_VISIBLE_DEVICES='',CUDA_DEVICE_ORDER='PCI_BUS_ID',
       PYTHONPATH=str(REPO),WORK_DIR=str(work),EDUARDO_RECIPE_DIR=str(REPO/'eduardo'),
-      MODEL_PATH=str(TUTOR),EXPERIMENT='b-functional',USER=os.environ.get('USER','root'),
-      SERVING_API_KEY='preflight-placeholder',STUDENT_API_BASE='http://127.0.0.1:18861/v1',
+      MODEL_PATH=str(TUTOR),EXPERIMENT='b-functional',USER=os.environ.get('USER') or 'root',
+      SERVING_API_KEY='preflight-placeholder',STUDENT_API_BASE=STUDENT_API_BASE,
       JUDGE_API_BASE='http://127.0.0.1:18862/v1',WANDB_MODE='disabled',
       HF_HUB_OFFLINE='1',HF_DATASETS_OFFLINE='1',TRANSFORMERS_OFFLINE='1')
     cmd=[str(PYTHON),str(Path(__file__).with_name('trainer_entry.py')),'--config-path',str(REPO/'eduardo/configs'),
@@ -166,6 +171,18 @@ def preflight_config(work,raytmp,student_name,interaction):
         if (agent,c['reward']['num_workers'],c['reward_model']['num_workers'],r['judge_concurrency'],r['student_concurrency'])!=(2,2,None,16,16):
             raise ValueError('worker config mismatch')
     except (TypeError,KeyError,ValueError) as exc:raise RuntimeError('Hydra 配置字段核对失败') from exc
+    # Hydra --cfg does not load this separate file. Resolve it explicitly in
+    # a worker-like environment with the original two variables absent.
+    worker_env=dict(env)
+    for key in ('USER','STUDENT_API_BASE','SERVING_API_KEY'):
+        worker_env.pop(key,None)
+    check=('import sys; from omegaconf import OmegaConf; '
+           'c=OmegaConf.to_container(OmegaConf.load(sys.argv[1]).interaction[0].config,resolve=True); '
+           'actual=(c["student_model"], c["student_api_base"], c["student_api_key_env"], c["student_concurrency"]); '
+           'sys.exit(actual != (sys.argv[2], sys.argv[3], "SERVING_API_KEY", int(sys.argv[4])))')
+    worker_check=subprocess.run([str(PYTHON),'-B','-c',check,str(interaction),student_name,STUDENT_API_BASE,str(STUDENT_LIMIT)],
+                                env=worker_env,capture_output=True,timeout=60)
+    if worker_check.returncode:raise RuntimeError('学生交互配置预检失败')
 
 
 def atomic(work,state):
@@ -212,6 +229,7 @@ class Callbacks:
         self.snapshot=snapshot;self.children=[];self.process_by_role={};self.bindings={};self.protected_gpu=None
         self.base={k:v for k,v in os.environ.items() if not (k.upper().endswith(('_TOKEN','_API_KEY','_SECRET')) or k.upper() in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY'))}
         self.base.update({'PYTHONDONTWRITEBYTECODE':'1','PYTHONUNBUFFERED':'1','CUDA_DEVICE_ORDER':'PCI_BUS_ID',
+           'USER':os.environ.get('USER') or 'root',
            'VLLM_API_KEY':token,'HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1',
            'HF_HUB_DISABLE_TELEMETRY':'1','VLLM_NO_USAGE_STATS':'1','WANDB_MODE':'disabled','RAY_DEDUP_LOGS':'0',
            'HF_HOME':str(work/'cache/hf'),'TMPDIR':str(work/'tmp'),'XDG_CACHE_HOME':str(work/'cache')})
@@ -246,7 +264,7 @@ class Callbacks:
         env=dict(self.base,CUDA_VISIBLE_DEVICES=','.join(map(str,ordinals)),
            PYTHONPATH=str(REPO),WORK_DIR=str(self.work),EDUARDO_RECIPE_DIR=str(REPO/'eduardo'),
            MODEL_PATH=str(TUTOR),EXPERIMENT='b-functional',SERVING_API_KEY=self.token,
-           STUDENT_API_BASE='http://127.0.0.1:18861/v1',JUDGE_API_BASE='http://127.0.0.1:18862/v1',
+           STUDENT_API_BASE=STUDENT_API_BASE,JUDGE_API_BASE='http://127.0.0.1:18862/v1',
            RAY_ADDRESS='local',RAY_TMPDIR=str(self.raytmp))
         cmd=[str(PYTHON),str(Path(__file__).with_name('trainer_entry.py')),'--config-path',str(REPO/'eduardo/configs'),'--config-name','eduardo_base']
         return self.spawn('trainer',cmd+training_overrides(self.work,self.raytmp,self.student_name,self.interaction),env)
@@ -275,9 +293,11 @@ def run(name):
     raytmp.mkdir(mode=0o700,exist_ok=False)
     if len((str(raytmp)+'/session_2099-12-31_23-59-59_999999_4194304/sockets/plasma_store').encode())>107:raise RuntimeError('Ray socket 路径过长')
     (work/'ray_tmp_path.txt').write_text(str(raytmp)+'\n')
-    interaction=make_interaction(work)
+    student_name='Llama-3.1-8B-Instruct-'+(os.environ.get('USER') or 'root')
+    interaction=make_interaction(work,student_name)
     (work/'deviations.md').write_text('''# B 阶段偏离\n\n- 功能测试：2 步，每步 2 题，每题 4 对话，后测 4 次；mini-batch 2。\n- 学习率 1e-5；末次验证禁用；每步保存检查点。仅 B 生效。\n- 固定 agent worker=2、reward worker=2；judge 每进程 16，student 每组每进程 16；student max-num-seqs 64。实际 PID/并发需从日志核对。\n- 单机 A100；裁判 1 卡、学生 1 卡、Tutor 2 卡。导师 gpu_memory_utilization=0.58。\n- 代码 e8c89b7，veRL 0.7.1，候选 vLLM 0.19.1 与其声明依赖范围不一致。\n- 外部每 10 秒扫描技术 fallback 并停止；不修改原作者重试及 reward。\n- 论文教师生成设置不变；loss 函数与 judge REJECT 规则不变。\n- logprob/probability 差异只能辅助诊断，不证明权重完全同步。\n''',encoding='utf-8')
-    student_name='Llama-3.1-8B-Instruct-'+os.environ.get('USER','root')
+    with (work/'deviations.md').open('a',encoding='utf-8') as f:
+        f.write('- B 的交互配置副本固定已选学生模型名称和本机地址，避免 Ray worker 缺少 USER；模型与地址不变，未写入密钥。\n')
     token=secrets.token_urlsafe(32)
     resources=gpu_resources.GPUResources(work)
     callbacks=Callbacks(work,student_name,token,raytmp,interaction,resources.snapshot)

@@ -1,10 +1,46 @@
 import json, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 import b_stage as b
 import cuda_map
 
 class Tests(unittest.TestCase):
+ def test_interaction_works_without_worker_user(self):
+  import yaml
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d); source=root/'eduardo'; source.mkdir()
+   original={'interaction':[{'name':'eduardo','class_name':'eduardo.eduardo_interaction.EduardoInteraction',
+     'config':{'student_model':'Llama-3.1-8B-Instruct-${oc.env:USER}',
+       'student_api_base':'${oc.env:STUDENT_API_BASE}', 'student_api_key_env':'SERVING_API_KEY',
+       'student_concurrency':256}}]}
+   path=source/'eduardo_interaction_config.yaml'; path.write_text(yaml.safe_dump(original))
+   original_bytes=path.read_bytes(); work=root/'work'; work.mkdir()
+   with patch.object(b,'REPO',root), patch.dict(b.os.environ,{},clear=True):
+    copied=b.make_interaction(work,'Llama-3.1-8B-Instruct-root')
+    cfg=yaml.safe_load(copied.read_text())['interaction'][0]['config']
+    self.assertEqual(cfg['student_model'],'Llama-3.1-8B-Instruct-root')
+    self.assertEqual(cfg['student_api_base'],'http://127.0.0.1:18861/v1')
+    self.assertEqual(cfg['student_api_key_env'],'SERVING_API_KEY')
+    self.assertEqual(cfg['student_concurrency'],16)
+    self.assertNotIn('${oc.env:',copied.read_text())
+    self.assertEqual(b.Callbacks(work,'student','local-token',root/'r',copied,lambda:{}).base['USER'],'root')
+    self.assertEqual(path.read_bytes(),original_bytes)
+ def test_interaction_preflight_isolated_from_secrets(self):
+  import yaml
+  config={'custom_reward_function':{'reward_kwargs':{'judge_concurrency':16,'student_concurrency':16}},
+          'actor_rollout_ref':{'rollout':{'agent':{'num_workers':2}}},
+          'reward':{'num_workers':2},'reward_model':{'num_workers':None}}
+  calls=[]
+  def fake_run(cmd,**kwargs):
+   calls.append((cmd,kwargs))
+   return SimpleNamespace(returncode=0,stdout=yaml.safe_dump(config))
+  with patch.dict(b.os.environ,{'SERVING_API_KEY':'sensitive-placeholder'},clear=True),patch.object(b.subprocess,'run',fake_run):
+   b.preflight_config(Path('/tmp/work'),Path('/tmp/r'),'student',Path('/tmp/interaction'))
+  self.assertEqual(len(calls),2)
+  worker_env=calls[1][1]['env']
+  self.assertFalse(any(k in worker_env for k in ('USER','STUDENT_API_BASE','SERVING_API_KEY')))
+  self.assertNotIn('sensitive-placeholder',str(calls[1][0]))
  def test_valid_symlinks_and_missing_paths(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d); target=root/'target'; target.write_text('data'); target.chmod(0o700)
