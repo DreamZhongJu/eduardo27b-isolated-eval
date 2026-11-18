@@ -24,6 +24,12 @@ EXHAUSTED = re.compile(r'\[(judge|student_interaction|student_final)\].*gave up 
 NONRETRY = re.compile(r'\[(judge|student_interaction|student_final)\].*non-retriable.*using fallback', re.I)
 DEDUP = re.compile(r'\[repeated\s+\d+x\s+across\s+cluster\]', re.I)
 SEMAPHORE = re.compile(r'created concurrency semaphore label=(judge|student) limit=(\d+) pid=(\d+)', re.I)
+TERMINAL_MARKERS = {
+    '请求回退': re.compile(r'(?:gave up after|non-retriable)\b.*?using fallback', re.I),
+    '学生交互硬失败': re.compile(r'EduardoInteraction: student call failed hard', re.I),
+    '裁判解析失败并判拒': re.compile(r'Failed to parse judge response, defaulting to REJECT', re.I),
+}
+RECOVERED = re.compile(r'Judge JSON malformed, recovered decision via regex', re.I)
 
 
 def load_stripper(repo: Path):
@@ -121,14 +127,17 @@ def ray_logs(root: Path, work: Path):
         raise RuntimeError('Ray会话不唯一或缺失')
     logroot = (sessions[0] / 'logs').resolve(strict=True)
     paths, seen, stats, pids = [], set(), Counter(), set()
+    parts = {}
     for p in sorted(logroot.iterdir()):
-        if p.name.startswith('worker-') and re.search(r'\.(?:out|err)\.\d+\.gz$', p.name):
+        if p.name.startswith('worker-') and re.search(r'\.(?:out|err)(?:\.\d+)?\.(?:gz|bz2|xz|zip|zst)$', p.name):
             stats['压缩轮转未扫描'] += 1
         if not WORKER_FILE.fullmatch(p.name): continue
         try:
             if not p.is_file() or p.resolve(strict=True).parent != logroot:
                 stats['异常路径'] += 1
                 continue
+            base, suffix = re.fullmatch(r'(worker-.*\.(?:out|err))(?:\.(\d+))?', p.name).groups()
+            parts.setdefault(base, set()).add(int(suffix or 0))
             st = p.stat(); inode = (st.st_dev, st.st_ino)
             if inode in seen:
                 stats['同inode重复'] += 1
@@ -139,6 +148,9 @@ def ray_logs(root: Path, work: Path):
             paths.append(p)
         except OSError:
             stats['异常路径'] += 1
+    stats['可见轮转缺号'] = sum(max(indices) + 1 - len(indices) for indices in parts.values())
+    streams = {base.rsplit('.', 1)[0] for base in parts}
+    stats['缺少配对输出流'] = sum(f'{stem}.{kind}' not in parts for stem in streams for kind in ('out','err'))
     return paths, stats, len(pids)
 
 
@@ -148,6 +160,10 @@ def tally_logs(paths):
         try:
             with path.open('r', encoding='utf-8', errors='replace') as f:
                 for line in f:
+                    counts['已读行数'] += 1
+                    for label, marker in TERMINAL_MARKERS.items():
+                        if marker.search(line): counts[label] += 1
+                    if RECOVERED.search(line): counts['裁判正则恢复'] += 1
                     for key, pattern in (('重试日志行', RETRY), ('重试耗尽回退日志行', EXHAUSTED), ('不可重试回退日志行', NONRETRY)):
                         hit = pattern.search(line)
                         if hit: counts[(hit.group(1).lower(), key)] += 1
@@ -156,6 +172,17 @@ def tally_logs(paths):
         except OSError:
             counts['读取失败文件数'] += 1
     return counts
+
+
+def terminal_status(results, coverage):
+    """A positive observation is conclusive even if some other logs are unavailable."""
+    if any(c[label] for c in results.values() if c is not None for label in TERMINAL_MARKERS):
+        return 2
+    if coverage is None or any(coverage[k] for k in ('异常路径','压缩轮转未扫描','可见轮转缺号','缺少配对输出流')):
+        return 3
+    if any(c is None or not c['已读行数'] or c['读取失败文件数'] for c in results.values()):
+        return 3
+    return 0
 
 
 def semaphore_bindings(paths):
@@ -176,7 +203,7 @@ def semaphore_bindings(paths):
 def timing_rows(path):
     """Read structured numeric metrics only; retain no source log lines."""
     value = r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)'
-    timing_pat = re.compile(r'timing_s/(step|testing|save_checkpoint)\s*[\"\']?\s*[:=]\s*' + value)
+    timing_pat = re.compile(r'timing_s/(step|testing|save_checkpoint|update_weights)\s*[\"\']?\s*[:=]\s*' + value)
     step_pat = re.compile(r'training/global_step\s*[\"\']?\s*[:=]\s*(\d+)')
     rows = []
     with path.open('r', encoding='utf-8', errors='replace') as f:
@@ -213,9 +240,11 @@ def pct(num, denom):
     return f'{num / denom * 100:.2f}%' if denom else '未知（无有效分母）'
 
 
-def table(title, rows):
-    print('\n' + title + '\n| 项目 | 数量 |\n|------|-----:|')
-    for key, value in rows: print(f'| {key} | {value} |')
+def table(title, rows, headers=('项目', '数量')):
+    print('\n' + title)
+    print('| ' + ' | '.join(headers) + ' |')
+    print('|------|' + '-----:|' * (len(headers) - 1))
+    for row in rows: print('| ' + ' | '.join(map(str, row)) + ' |')
 
 
 def main():
@@ -224,6 +253,8 @@ def main():
     ap.add_argument('--work', type=Path, required=True)
     ap.add_argument('--source', type=Path)
     ap.add_argument('--model', type=Path)
+    ap.add_argument('--check-terminal-failures', action='store_true',
+                    help='按现存日志核验终止错误，发现标记返回 2，日志覆盖不足返回 3')
     args = ap.parse_args()
     root = args.root.resolve(strict=True)
     work = args.work.resolve(strict=True)
@@ -255,6 +286,7 @@ def main():
     print('\n尾轮未追加轨迹数：未覆盖（原始对话无生成/终止回执，不能仅凭最后消息推断）。')
     print('逐步骤统计：未覆盖（对话记录没有可靠训练步号）。')
     groups = {'主训练日志': [work / 'trainer.log'], 'Ray worker日志': []}
+    stats = None
     try:
         groups['Ray worker日志'], stats, pid_count = ray_logs(root, work)
         print('Ray worker 日志文件数：', len(groups['Ray worker日志']), '；文件名识别的不同 PID 数：', pid_count)
@@ -282,6 +314,12 @@ def main():
     for group, c in results.items():
         if c is not None:
             print(f'{group}：读取 {c["成功读取文件数"]} 个；失败 {c["读取失败文件数"]} 个；Ray合并提示 {c["Ray合并提示行"]} 行。')
+    if args.check_terminal_failures:
+        table('终止错误和已恢复格式（每个单元格为已观察日志行数）',
+              [(k, *('未覆盖' if c is None else c[k] for c in results.values()))
+               for k in (*TERMINAL_MARKERS, '裁判正则恢复')], headers=('项目', *results))
+        if stats is not None:
+            print(f'可见轮转缺号 {stats["可见轮转缺号"]}，缺少配对输出流 {stats["缺少配对输出流"]}。')
     try:
         rows = timing_rows(work / 'trainer.log')
         if rows:
@@ -292,6 +330,11 @@ def main():
                   ('训练 step', seconds('step')), ('末尾验证 testing', seconds('testing')),
                   ('保存检查点', seconds('save_checkpoint'))])
             print('说明：作者 step 计时与 testing 计时平级；保存检查点计时属于 step 的一部分。')
+            if args.check_terminal_failures:
+                sync = {row['step_no']: row['update_weights'] for row in rows
+                        if row['step_no'] is not None and 'update_weights' in row}
+                table('各步权重同步调用用时（秒）',
+                      [(step, f'{sync[step]:.3f}') for step in sorted(sync)] or [('—', '未记录')])
         else:
             print('\n训练计时：未找到可解析的 timing_s 指标。')
     except OSError:
@@ -314,6 +357,10 @@ def main():
         print('| 未记录 | 未记录 | 未记录 | 未记录 | 未记录 | 未记录 |')
     print('说明：原始 finish_reason、未落盘教师回合、请求端无日志故障和缺失日志均无法由本统计复原。')
     print('每题重试与失败为日志行数，不能当成去重后的票数；静默异常不能判为零。')
+    if args.check_terminal_failures:
+        code = terminal_status(results, stats)
+        print('日志核对：' + {0:'已扫描日志未发现技术终止标记', 2:'发现技术终止标记', 3:'现存日志覆盖不足'}[code])
+        return code
     return 0
 
 
