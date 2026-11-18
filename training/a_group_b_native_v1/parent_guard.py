@@ -8,6 +8,7 @@ This file is a draft and is not wired to a runnable training entrypoint.
 from __future__ import annotations
 import ctypes
 import errno
+import json
 import os
 from pathlib import Path
 import platform
@@ -123,6 +124,26 @@ def cleanup(guard_pid, grace=5, kill_wait=10):
         raise RuntimeError('无法确认本任务全部后代退出')
 
 
+def receipt(child, path, requested):
+    # Wait for the direct child here: the subreaper's later waitpid(-1)
+    # otherwise consumes its exit status together with adopted grandchildren.
+    child_still_running = child.poll() is None
+    requested = bool(requested and child_still_running)
+    if child_still_running:
+        child.terminate()
+        try:
+            child.wait(timeout=12)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+    target = Path(path)
+    temp = target.with_suffix('.tmp')
+    with temp.open('x', encoding='utf-8') as out:
+        json.dump({'exit_code': child.returncode, 'observed_ns': time.time_ns(),
+                   'requested': requested}, out)
+    os.replace(temp, target)
+
+
 def guard(parent_pid, command):
     if not command: raise ValueError('missing owned child command')
     subreaper()
@@ -134,7 +155,9 @@ def guard(parent_pid, command):
     signal.signal(signal.SIGINT,request_stop)
     # The controller might die at any point; check once more immediately before spawn.
     if os.getppid()!=parent_pid: return 3
-    child=subprocess.Popen(command,env=os.environ.copy(),start_new_session=True)
+    env = os.environ.copy()
+    exit_file = env.pop('EDU_ROLE_EXIT_RECEIPT', None)
+    child=subprocess.Popen(command,env=env,start_new_session=True)
     try:
         while True:
             if stopped[0] or os.getppid()!=parent_pid:
@@ -144,7 +167,11 @@ def guard(parent_pid, command):
                 return rc if rc>=0 else 128-rc
             time.sleep(.1)
     finally:
-        cleanup(os.getpid())
+        try:
+            if exit_file:
+                receipt(child, exit_file, stopped[0] or os.getppid()!=parent_pid)
+        finally:
+            cleanup(os.getpid())
 
 
 def main(argv):

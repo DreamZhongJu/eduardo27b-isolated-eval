@@ -233,6 +233,10 @@ class Callbacks:
            'VLLM_API_KEY':token,'HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1',
            'HF_HUB_DISABLE_TELEMETRY':'1','VLLM_NO_USAGE_STATS':'1','WANDB_MODE':'disabled','RAY_DEDUP_LOGS':'0',
            'HF_HOME':str(work/'cache/hf'),'TMPDIR':str(work/'tmp'),'XDG_CACHE_HOME':str(work/'cache')})
+    experiment='b-functional'
+    trainer_entry=Path(__file__).with_name('trainer_entry.py')
+    overrides=staticmethod(training_overrides)
+
     def spawn(self,name,args,env):
         log=(self.work/(name+'.log')).open('xb')
         try:p=subprocess.Popen([str(PYTHON),str(Path(__file__).with_name('parent_guard.py')),'--parent',str(os.getpid()),'--',*args],
@@ -263,11 +267,11 @@ class Callbacks:
         ordinals=cuda_map.verified(PYTHON,[x.uuid for x in tutors],self.base)
         env=dict(self.base,CUDA_VISIBLE_DEVICES=','.join(map(str,ordinals)),
            PYTHONPATH=str(REPO),WORK_DIR=str(self.work),EDUARDO_RECIPE_DIR=str(REPO/'eduardo'),
-           MODEL_PATH=str(TUTOR),EXPERIMENT='b-functional',SERVING_API_KEY=self.token,
+           MODEL_PATH=str(TUTOR),EXPERIMENT=self.experiment,SERVING_API_KEY=self.token,
            STUDENT_API_BASE=STUDENT_API_BASE,JUDGE_API_BASE='http://127.0.0.1:18862/v1',
            RAY_ADDRESS='local',RAY_TMPDIR=str(self.raytmp))
-        cmd=[str(PYTHON),str(Path(__file__).with_name('trainer_entry.py')),'--config-path',str(REPO/'eduardo/configs'),'--config-name','eduardo_base']
-        return self.spawn('trainer',cmd+training_overrides(self.work,self.raytmp,self.student_name,self.interaction),env)
+        cmd=[str(PYTHON),str(self.trainer_entry),'--config-path',str(REPO/'eduardo/configs'),'--config-name','eduardo_base']
+        return self.spawn('trainer',cmd+self.overrides(self.work,self.raytmp,self.student_name,self.interaction),env)
     def exit_codes(self):
         return {name: proc.poll() for name, proc in self.process_by_role.items()}
     def stop_started(self):
@@ -284,12 +288,12 @@ class Callbacks:
                 p.wait(timeout=10)
 
 
-def wait_for_training(callbacks, scanner):
+def wait_for_training(callbacks, scanner, stage='B'):
     """Check the two serving processes separately from normal trainer completion."""
     while True:
         codes = callbacks.exit_codes()
         if scanner.scan():
-            raise RuntimeError('检测到 fallback，B 无效')
+            raise RuntimeError(f'检测到 fallback，{stage} 无效')
         if codes['trainer'] not in (None, 0):
             raise RuntimeError('训练进程退出失败')
         if codes['judge'] is not None:
@@ -302,7 +306,7 @@ def wait_for_training(callbacks, scanner):
         time.sleep(10)
 
 
-def run(name):
+def run(name, recipe=None):
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,39}',name):raise ValueError('运行名称格式不符')
     validate()
     work=ROOT/'pilots'/name
@@ -314,13 +318,16 @@ def run(name):
     (work/'ray_tmp_path.txt').write_text(str(raytmp)+'\n')
     student_name='Llama-3.1-8B-Instruct-'+(os.environ.get('USER') or 'root')
     interaction=make_interaction(work,student_name)
-    (work/'deviations.md').write_text('''# B 阶段偏离\n\n- 功能测试：2 步，每步 2 题，每题 4 对话，后测 4 次；mini-batch 2。\n- 学习率 1e-5；末次验证禁用；每步保存检查点。仅 B 生效。\n- 固定 agent worker=2、reward worker=2；judge 每进程 16，student 每组每进程 16；student max-num-seqs 64。实际 PID/并发需从日志核对。\n- 单机 A100；裁判 1 卡、学生 1 卡、Tutor 2 卡。导师 gpu_memory_utilization=0.58。\n- 代码 e8c89b7，veRL 0.7.1，候选 vLLM 0.19.1 与其声明依赖范围不一致。\n- 外部每 10 秒扫描技术 fallback 并停止；不修改原作者重试及 reward。\n- 论文教师生成设置不变；loss 函数与 judge REJECT 规则不变。\n- logprob/probability 差异只能辅助诊断，不证明权重完全同步。\n''',encoding='utf-8')
-    with (work/'deviations.md').open('a',encoding='utf-8') as f:
-        f.write('- B 的交互配置副本固定已选学生模型名称和本机地址，避免 Ray worker 缺少 USER；模型与地址不变，未写入密钥。\n')
+    if recipe:
+        (work/'deviations.md').write_bytes(recipe.deviations.read_bytes())
+    else:
+        (work/'deviations.md').write_text('''# B 阶段偏离\n\n- 功能测试：2 步，每步 2 题，每题 4 对话，后测 4 次；mini-batch 2。\n- 学习率 1e-5；末次验证禁用；每步保存检查点。仅 B 生效。\n- 固定 agent worker=2、reward worker=2；judge 每进程 16，student 每组每进程 16；student max-num-seqs 64。实际 PID/并发需从日志核对。\n- 单机 A100；裁判 1 卡、学生 1 卡、Tutor 2 卡。导师 gpu_memory_utilization=0.58。\n- 代码 e8c89b7，veRL 0.7.1，候选 vLLM 0.19.1 与其声明依赖范围不一致。\n- 外部每 10 秒扫描技术 fallback 并停止；不修改原作者重试及 reward。\n- 论文教师生成设置不变；loss 函数与 judge REJECT 规则不变。\n- logprob/probability 差异只能辅助诊断，不证明权重完全同步。\n''',encoding='utf-8')
+        with (work/'deviations.md').open('a',encoding='utf-8') as f:
+            f.write('- B 的交互配置副本固定已选学生模型名称和本机地址，避免 Ray worker 缺少 USER；模型与地址不变，未写入密钥。\n')
     token=secrets.token_urlsafe(32)
     resources=gpu_resources.GPUResources(work)
-    callbacks=Callbacks(work,student_name,token,raytmp,interaction,resources.snapshot)
-    state={'phase':'准备','reason':'','protected_gpu':None,'events':[],'bindings':{},'role_processes':{}}
+    callbacks=(recipe.Callbacks if recipe else Callbacks)(work,student_name,token,raytmp,interaction,resources.snapshot)
+    state={'controller_pid':os.getpid(),'phase':'准备','reason':'','protected_gpu':None,'events':[],'bindings':{},'role_processes':{}}
     def update(phase,reason=''):
         codes = callbacks.exit_codes()
         state.update(phase=phase,reason=reason,bindings=callbacks.bindings,
@@ -331,7 +338,8 @@ def run(name):
     def interrupt(sig,_):raise KeyboardInterrupt
     for sig in (signal.SIGTERM,signal.SIGINT):signal.signal(sig,interrupt)
     try:
-        preflight_config(work,raytmp,student_name,interaction)
+        update('配置预检')
+        (recipe.preflight_config if recipe else preflight_config)(work,raytmp,student_name,interaction)
         resources.acquire_lock();lock=True
         # Lock can be released milliseconds before an old guard finishes.
         # Refuse to proceed while any known A-group guard or endpoint remains;
@@ -369,7 +377,11 @@ def run(name):
         sampler.start();update('凑卡')
         resources.acquire_and_handoff(callbacks)
         update('训练中')
-        wait_for_training(callbacks, LogScanner(work,raytmp))
+        scanner = LogScanner(work,raytmp)
+        wait_for_training(callbacks, scanner, 'C' if recipe else 'B')
+        if recipe:
+            recipe.finish(callbacks, scanner, update)
+            return
         # Release GPU services before the CPU-only author checkpoint merge.
         callbacks.stop_started()
         update('CPU合并','执行作者 FSDP 合并工具')
@@ -401,7 +413,7 @@ def run(name):
         if not keys or not readable or not (merged/'config.json').is_file():raise RuntimeError('合并输出不可读取')
         update('待核验','训练退出且CPU合并可读；仍需核查步骤、指标与失败率')
     except BaseException as e:
-        update('失败',safe_reason(e))
+        update('失败',recipe.reason(e) if recipe else safe_reason(e))
         raise
     finally:
         try:

@@ -172,7 +172,7 @@ def finish_report(work, state, steps, final_none):
     table(('训练步','本步秒数'), rows or [('—', '日志不可读' if steps is None else '未发现带步号的指标')])
 
 
-def report(work, finish_only=False):
+def report(work, finish_only=False, *, stage_label='B', include_finish=True):
     work=Path(work)
     state=read_obj(work/'orchestration.json')
     steps, final_none = finish_metrics(work)
@@ -180,7 +180,7 @@ def report(work, finish_only=False):
         finish_report(work, state, steps, final_none)
         return
     res=read_obj(work/'resources.json')
-    print('B 阶段只读状态（草案；进程存活和数据完整性未实时确认）')
+    print(f'{stage_label} 阶段只读状态（草案；进程存活和数据完整性未实时确认）')
     table(('项目','状态'),[
         ('阶段',(res.get('phase') if state.get('phase') == '凑卡' else state.get('phase','未开始'))),('原因类别',state.get('reason','—') or '—'),
         ('保护触发显卡',state.get('protected_gpu') if state.get('protected_gpu') is not None else '无记录'),
@@ -222,7 +222,8 @@ def report(work, finish_only=False):
     table(('项目','数量'),rows)
     print('\n检查点（仅文件与大小，不等于已完成 CPU 合并验证）')
     table(('目录','大小 MiB','验证状态'),get_checkpoints(work) or [('—','—','未发现')])
-    finish_report(work, state, steps, final_none)
+    if include_finish:
+        finish_report(work, state, steps, final_none)
 
 if __name__=='__main__':
     p=argparse.ArgumentParser()
