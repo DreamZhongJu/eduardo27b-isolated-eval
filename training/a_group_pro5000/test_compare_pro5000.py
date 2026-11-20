@@ -113,6 +113,76 @@ class ComparePro5000Test(unittest.TestCase):
         self.assertAlmostEqual(dist['per_seq_max'][0], 0.05)
         self.assertAlmostEqual(dist['per_seq_max'][1], 1.4)
 
+    def fp32_sample_result(self, *, n_tokens=1000):
+        ref = [-1.0] * n_tokens
+        slow1 = [-1.0 - (0.01 if i < n_tokens - 1 else 0.9) for i in range(n_tokens)]
+        slow2 = list(slow1)
+        fast = [-1.0 - (0.015 if i < n_tokens - 1 else 1.4) for i in range(n_tokens)]
+        runs = [
+            {
+                'mode': 'slow', 'values': slow1, 'loss': 1.01, 'grad_norm': 2.0,
+                'seconds_per_token': 0.02, 'peak_alloc_mib': 40000, 'peak_reserved_mib': 42000,
+                'kernel_call_counts': {'slow_conv': 24, 'slow_chunk': 24, 'slow_norm': 24},
+            },
+            {
+                'mode': 'slow', 'values': slow2, 'loss': 1.01, 'grad_norm': 2.0,
+                'seconds_per_token': 0.02, 'peak_alloc_mib': 40000, 'peak_reserved_mib': 42000,
+                'kernel_call_counts': {'slow_conv': 24, 'slow_chunk': 24, 'slow_norm': 24},
+            },
+            {
+                'mode': 'fast', 'values': fast, 'loss': 1.015, 'grad_norm': 2.04,
+                'seconds_per_token': 0.01, 'peak_alloc_mib': 39000, 'peak_reserved_mib': 41000,
+                'kernel_call_counts': {'fast_conv': 24, 'fast_chunk': 24, 'fast_norm': 24},
+            },
+        ]
+        endurance = {
+            mode: {
+                'elapsed_seconds': dur + 1.0, 'cycles': 10, 'seconds_per_token': 0.01,
+                'peak_alloc_mib': 40000, 'peak_reserved_mib': 42000,
+                'round_trend': c.round_trend([{'round_seconds': 2.0, 'ms_per_token': 10.0, 'loadavg_1': 1.0}]),
+            }
+            for mode, dur in c.SOAK_SECONDS.items()
+        }
+        return {
+            'fast_kernel_verified': True,
+            'sequence_lengths': [1000, 3500, 8000, 1100, 3600, 8200],
+            'teacher_tokens': [100, 150, 250, 100, 150, 250],
+            'fp32_ref': {'mode': 'fp32_ref', 'values': ref, 'loss': 1.0},
+            'runs': runs,
+            'endurance': endurance,
+            'endurance_skipped': False,
+        }
+
+    def test_fp32_reference_passes_and_sets_note(self):
+        res = self.fp32_sample_result()
+        self.assertTrue(c.score_result(res, max_mem_mib=73415))
+        self.assertEqual(res['criterion_used'], 'fp32_reference')
+        self.assertEqual(res['acceptance_note'], '按 FP32 参考判据通过')
+        self.assertNotIn('values', res['fp32_ref'])
+
+    def test_fp32_reference_rejects_p99_and_max_and_grad_violations(self):
+        bad_p99 = self.fp32_sample_result()
+        for i in range(20):
+            bad_p99['runs'][2]['values'][i] = -1.5  # pushes p99 > 2x slow_p99 (0.01)
+        bad_p99['endurance'] = {}
+        bad_p99['endurance_skipped'] = True
+        self.assertFalse(c.score_result(bad_p99, max_mem_mib=73415))
+        self.assertFalse(bad_p99['fp32_details']['cond_a_p99_p999'])
+
+        bad_max = self.fp32_sample_result()
+        bad_max['runs'][2]['values'][-1] = -2.9  # 1.9 > max(1.0, 2*0.9=1.8)
+        bad_max['endurance'] = {}
+        bad_max['endurance_skipped'] = True
+        self.assertFalse(c.score_result(bad_max, max_mem_mib=73415))
+        self.assertFalse(bad_max['fp32_details']['cond_b_max'])
+
+        bad_grad = self.fp32_sample_result()
+        bad_grad['runs'][2]['grad_norm'] = 2.15  # 7.5% > 5%
+        bad_grad['endurance'] = {}
+        bad_grad['endurance_skipped'] = True
+        self.assertFalse(c.score_result(bad_grad, max_mem_mib=73415))
+        self.assertFalse(bad_grad['fp32_details']['cond_d_rel_means'])
+
 
 if __name__ == '__main__':
     unittest.main()

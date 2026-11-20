@@ -19,11 +19,12 @@ import time
 
 MIB = 1024 ** 2
 GIB = 1024 ** 3
-PROTOCOL = 'qwen35_pro5000_one_card_v1'
+PROTOCOL = 'qwen35_pro5000_one_card_fp32_ref_v2'
 HARD_SECONDS = 7200
 SOAK_SECONDS = {'slow': 40 * 60, 'fast': 20 * 60}
 LIMIT = 10240
 SEED = 42
+SEED_EXTRA = 1234
 KEYS = ('logprob', 'loss', 'grad_norm')
 MODE_PACKAGES = {
     'transformers': '5.7.0',
@@ -190,27 +191,31 @@ def build_mixed_batch(train_parquet: Path, tokenizer):
 
     table = pq.read_table(train_parquet, columns=['prompt'])
     prompts = table['prompt'].to_pylist()
-    if len(prompts) < 3:
-        raise CompareFailure('公开训练集行数不足 3 条')
-    chosen = np.random.default_rng(SEED).choice(len(prompts), size=3, replace=False)
+    if len(prompts) < 6:
+        raise CompareFailure('公开训练集行数不足 6 条')
+    chosen_a = [int(i) for i in np.random.default_rng(SEED).choice(len(prompts), size=3, replace=False)]
+    remaining = [i for i in range(len(prompts)) if i not in set(chosen_a)]
+    chosen_b = [int(remaining[i]) for i in np.random.default_rng(SEED_EXTRA).choice(len(remaining), size=3, replace=False)]
 
     specs = [('short', 2, 5), ('medium', 5, 7), ('long', 9, 9)]
     sequences = []
-    for variant, ((label, turns, scale), idx) in enumerate(zip(specs, chosen)):
-        seq = None
-        for sc in range(scale, 0, -1):
-            for t in range(turns, 0, -1):
-                msgs = _build_synthetic_messages(prompts[int(idx)], t, variant, sc)
-                cand = reconstruct(msgs, tokenizer, label)
-                if cand is not None:
-                    seq = cand
+    for batch_idx, chosen in enumerate((chosen_a, chosen_b)):
+        for variant, ((label, turns, scale), idx) in enumerate(zip(specs, chosen)):
+            seq = None
+            for sc in range(scale, 0, -1):
+                for t in range(turns, 0, -1):
+                    msgs = _build_synthetic_messages(prompts[idx], t, variant + batch_idx * 3, sc)
+                    cand = reconstruct(msgs, tokenizer, f'{label}_{batch_idx + 1}')
+                    if cand is not None:
+                        seq = cand
+                        break
+                if seq is not None:
                     break
-            if seq is not None:
-                break
-        if seq is None:
-            raise CompareFailure(f'无法构造 {label} 对话测试样本')
-        sequences.append(seq)
-    if len(sequences[-1].ids) - len(sequences[0].ids) < 512:
+            if seq is None:
+                raise CompareFailure(f'无法构造 {label}_{batch_idx + 1} 对话测试样本')
+            sequences.append(seq)
+    lengths = [len(s.ids) for s in sequences]
+    if max(lengths) - min(lengths) < 512:
         raise CompareFailure('长短混合批次长度差不足 512 token')
     return sequences
 
@@ -276,6 +281,49 @@ class Kernels:
         return set(self.counts) == chosen and all(
             self.counts[name] >= len(self.layers) * trajectories for name in chosen
         )
+
+
+def fp32_reference_values(torch, model, kernels, batch, check):
+    """Run slow-path forward in true FP32 (autocast off, TF32 off) as numerical reference."""
+    kernels.use('slow')
+    kernels.counts.clear()
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    samples = []
+    loss_num = 0.0
+    tokens = sum(len(positions) for _, positions in batch)
+    seconds = 0.0
+    with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
+        for ids, positions in batch:
+            check()
+            started = time.monotonic()
+            output = model.model.language_model(input_ids=ids, use_cache=False, return_dict=True)
+            targets = ids[0, positions]
+            effective = output.last_hidden_state[0, positions - 1].float()
+            chunks = []
+            for x, y in zip(effective.split(256), targets.split(256)):
+                logits = model.lm_head(x)
+                chunks.append(-torch.nn.functional.cross_entropy(logits, y, reduction='none'))
+            values = torch.cat(chunks)
+            if not bool(torch.isfinite(values).all().item()):
+                raise CompareFailure('FP32 参考出现非有限值')
+            loss_num += float((-values.sum()).item())
+            samples.extend(values.cpu().tolist())
+            torch.cuda.synchronize()
+            seconds += time.monotonic() - started
+            del output, targets, effective, chunks, values
+    if not kernels.verified('slow', len(batch)):
+        raise CompareFailure('FP32 参考未使用预期慢路径')
+    return {
+        'mode': 'fp32_ref',
+        'values': samples,
+        'loss': loss_num / tokens,
+        'seconds_per_token': seconds / tokens,
+        'peak_alloc_mib': torch.cuda.max_memory_allocated() / MIB,
+        'peak_reserved_mib': torch.cuda.max_memory_reserved() / MIB,
+    }
 
 
 def one_batch(torch, model, kernels, batch, mode, check, *, keep_values):
@@ -392,6 +440,92 @@ def evaluate_equivalence(rows, distances, fast_kernel_verified):
     return (within or sec14), criterion, rel
 
 
+def quantile_linear(sorted_vals, q: float) -> float:
+    n = len(sorted_vals)
+    pos = q * (n - 1)
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def _error_stats(values, ref):
+    errs = sorted(abs(a - b) for a, b in zip(values, ref))
+    return {
+        'count': len(errs),
+        'p50': quantile_linear(errs, 0.50),
+        'p95': quantile_linear(errs, 0.95),
+        'p99': quantile_linear(errs, 0.99),
+        'p999': quantile_linear(errs, 0.999),
+        'max': errs[-1],
+    }
+
+
+def evaluate_fp32_reference(fp32_ref, rows, fast_kernel_verified):
+    """Evaluate Stage-1 review FP32-reference criteria (a)-(d)."""
+    ref = fp32_ref['values']
+    base, repeat, fast = rows
+    if not ref or len(base['values']) != len(ref) or len(fast['values']) != len(ref):
+        raise CompareFailure('FP32 参考与 BF16 对齐长度不一致')
+    slow_stats = _error_stats(base['values'], ref)
+    fast_stats = _error_stats(fast['values'], ref)
+
+    slow_mean = math.fsum(base['values']) / len(base['values'])
+    fast_mean = math.fsum(fast['values']) / len(fast['values'])
+    rel = {
+        'loss_rel_diff': abs(fast['loss'] - base['loss']) / max(abs(base['loss']), 1e-12),
+        'logprob_mean_rel_diff': abs(fast_mean - slow_mean) / max(abs(slow_mean), 1e-12),
+        'grad_norm_rel_diff': abs(fast['grad_norm'] - base['grad_norm']) / max(abs(base['grad_norm']), 1e-12),
+        'logprob_token_max_abs_diff': max(abs(a - b) for a, b in zip(base['values'], fast['values'])),
+    }
+
+    fast_counts = fast.get('kernel_call_counts', {})
+    slow_counts_ok = all(
+        r.get('kernel_call_counts', {}).get('fast_conv', 0) == 0
+        and r.get('kernel_call_counts', {}).get('fast_chunk', 0) == 0
+        for r in (base, repeat)
+    )
+    fast_counts_ok = (fast_counts.get('fast_conv', 0) > 0
+                      and fast_counts.get('fast_chunk', 0) > 0
+                      and fast_counts.get('fast_norm', 0) > 0)
+    all_finite = (
+        all(math.isfinite(x) for x in ref)
+        and math.isfinite(fp32_ref['loss'])
+        and all(
+            all(math.isfinite(x) for x in r['values'])
+            and math.isfinite(r['loss']) and math.isfinite(r['grad_norm'])
+            for r in rows
+        )
+    )
+    cond_a = (
+        fast_stats['p99'] <= 2.0 * slow_stats['p99']
+        and fast_stats['p999'] <= 2.0 * slow_stats['p999']
+    )
+    max_limit = max(1.0, 2.0 * slow_stats['max'])
+    cond_b = fast_stats['max'] <= max_limit
+    cond_c = bool(fast_kernel_verified) and slow_counts_ok and fast_counts_ok and all_finite
+    cond_d = (
+        rel['loss_rel_diff'] <= 1e-2
+        and rel['logprob_mean_rel_diff'] <= 1e-2
+        and rel['grad_norm_rel_diff'] <= 5e-2
+    )
+    passed = cond_a and cond_b and cond_c and cond_d
+    details = {
+        'slow_vs_fp32': slow_stats,
+        'fast_vs_fp32': fast_stats,
+        'p99_ratio': fast_stats['p99'] / slow_stats['p99'] if slow_stats['p99'] > 0 else float('inf'),
+        'p999_ratio': fast_stats['p999'] / slow_stats['p999'] if slow_stats['p999'] > 0 else float('inf'),
+        'max_limit_nat': max_limit,
+        'cond_a_p99_p999': cond_a,
+        'cond_b_max': cond_b,
+        'cond_c_finite_and_kernels': cond_c,
+        'cond_d_rel_means': cond_d,
+    }
+    return passed, rel, details
+
+
 def round_trend(cycles):
     count = len(cycles)
     if not count:
@@ -446,8 +580,16 @@ def score_result(result, *, soak_seconds=SOAK_SECONDS, max_mem_mib=80000):
     if len(rows) != 3 or [r.get('mode') for r in rows] != ['slow', 'slow', 'fast']:
         raise CompareFailure('内核试验顺序或测量次数异常')
     expected_tokens = sum(result['teacher_tokens'])
-    if len(result['sequence_lengths']) != 3 or expected_tokens < 1:
+    fp32_ref = result.get('fp32_ref')
+    expected_seqs = 6 if fp32_ref is not None else 3
+    if len(result['sequence_lengths']) != expected_seqs or expected_tokens < 1:
         raise CompareFailure('长短混合批次测量不完整')
+    if fp32_ref is not None:
+        if (len(fp32_ref.get('values', ())) != expected_tokens
+                or any(type(x) not in (int, float) or not math.isfinite(x) for x in fp32_ref['values'])
+                or type(fp32_ref.get('loss')) not in (int, float) or not math.isfinite(fp32_ref['loss'])
+                or fp32_ref['loss'] <= 0):
+            raise CompareFailure('FP32 参考数值异常')
     for r in rows:
         if (len(r.get('values', ())) != expected_tokens
                 or any(type(x) not in (int, float) or not math.isfinite(x) for x in r['values'])
@@ -458,7 +600,16 @@ def score_result(result, *, soak_seconds=SOAK_SECONDS, max_mem_mib=80000):
             if type(r.get(alias)) not in (int, float) or not 0 < r[alias] < max_mem_mib:
                 raise CompareFailure('显存峰值数值异常')
     distances = comparisons(rows)
-    equivalent, criterion, rel = evaluate_equivalence(rows, distances, result['fast_kernel_verified'])
+    if fp32_ref is not None:
+        equivalent, rel, fp32_details = evaluate_fp32_reference(fp32_ref, rows, result['fast_kernel_verified'])
+        criterion = 'fp32_reference' if equivalent else 'failed'
+        result['fp32_details'] = fp32_details
+        ref_vals = fp32_ref.pop('values')
+        fp32_ref['logprob_mean'] = math.fsum(ref_vals) / len(ref_vals)
+        if equivalent:
+            result['acceptance_note'] = '按 FP32 参考判据通过'
+    else:
+        equivalent, criterion, rel = evaluate_equivalence(rows, distances, result['fast_kernel_verified'])
     soak = result['endurance']
     stopped_early = result.get('endurance_skipped') is True
     if stopped_early:
@@ -489,17 +640,28 @@ def score_result(result, *, soak_seconds=SOAK_SECONDS, max_mem_mib=80000):
 
 
 def display(result, passed):
-    print('对照结果', '通过' if passed else '不等价', '判据:', result.get('criterion_used'))
+    note = f" ({result['acceptance_note']})" if result.get('acceptance_note') else ''
+    print('对照结果', '通过' if passed else '不等价', '判据:', str(result.get('criterion_used')) + note)
     print('实测有效长度', *result['sequence_lengths'], '目标教师 token', *result['teacher_tokens'])
     print('| 指标 | 慢路径重复绝对差 | 快慢绝对差 |')
     print('|---|---:|---:|')
     for key, row in result['comparisons'].items():
         print(f"| {key} | {row['slow_repeat_abs_diff']:.9g} | {row['fast_slow_abs_diff']:.9g} |")
     rel = result.get('relative_diffs', {})
-    print(f"补充判据指标: loss_rel={rel.get('loss_rel_diff', 0):.6g}  "
+    print(f"均值与梯度相对差: loss_rel={rel.get('loss_rel_diff', 0):.6g}  "
           f"logprob_mean_rel={rel.get('logprob_mean_rel_diff', 0):.6g}  "
           f"grad_norm_rel={rel.get('grad_norm_rel_diff', 0):.6g}  "
-          f"logprob_token_max_abs={rel.get('logprob_token_max_abs_diff', 0):.6g}")
+          f"fast_vs_slow_max_abs={rel.get('logprob_token_max_abs_diff', 0):.6g}")
+    if result.get('fp32_details'):
+        fd = result['fp32_details']
+        s, f = fd['slow_vs_fp32'], fd['fast_vs_fp32']
+        print('| 对比 FP32 参考 | p50 | p95 | p99 | p99.9 | max |')
+        print('|---|---:|---:|---:|---:|---:|')
+        print(f"| slow BF16 vs FP32 | {s['p50']:.6g} | {s['p95']:.6g} | {s['p99']:.6g} | {s['p999']:.6g} | {s['max']:.6g} |")
+        print(f"| fast BF16 vs FP32 | {f['p50']:.6g} | {f['p95']:.6g} | {f['p99']:.6g} | {f['p999']:.6g} | {f['max']:.6g} |")
+        print(f"FP32 判据检查: p99_ratio={fd['p99_ratio']:.3f}x p99.9_ratio={fd['p999_ratio']:.3f}x "
+              f"max_limit={fd['max_limit_nat']:.4g} | a={fd['cond_a_p99_p999']} b={fd['cond_b_max']} "
+              f"c={fd['cond_c_finite_and_kernels']} d={fd['cond_d_rel_means']}")
     print('| 阶段 | 平均 logprob | NLL | 梯度范数 | 秒/有效 token | 显存峰值 MiB（alloc / reserved） |')
     print('|---|---:|---:|---:|---:|---:|')
     for idx, row in enumerate(result['runs'], 1):
@@ -628,6 +790,13 @@ def run_worker(model_dir: Path, train_parquet: Path, index: int, uuid: str,
             'ablation': ablation,
         }
 
+    print('[compare] running true FP32 reference forward (autocast off, TF32 off)...', flush=True)
+    torch.cuda.empty_cache()
+    fp32_ref = fp32_reference_values(torch, model, kernels, batch, check)
+    print(f'[compare] fp32_ref: loss={fp32_ref["loss"]:.6f} s/tok={fp32_ref["seconds_per_token"]:.6f} '
+          f'mem={fp32_ref["peak_alloc_mib"]:.0f}/{fp32_ref["peak_reserved_mib"]:.0f} MiB', flush=True)
+    torch.cuda.empty_cache()
+
     runs = []
     for mode, trials in (('slow', 2), ('fast', 1)):
         print(f'[compare] warmup mode={mode}', flush=True)
@@ -639,8 +808,10 @@ def run_worker(model_dir: Path, train_parquet: Path, index: int, uuid: str,
                   f's/tok={row["seconds_per_token"]:.6f} counts={row["kernel_call_counts"]}', flush=True)
             runs.append(row)
 
-    distances = comparisons(runs)
-    equivalent, _, _ = evaluate_equivalence(runs, distances, True)
+    equivalent, _, fp32_details = evaluate_fp32_reference(fp32_ref, runs, True)
+    print(f'[compare] FP32-ref check: passed={equivalent} a={fp32_details["cond_a_p99_p999"]} '
+          f'b={fp32_details["cond_b_max"]} c={fp32_details["cond_c_finite_and_kernels"]} '
+          f'd={fp32_details["cond_d_rel_means"]}', flush=True)
     stability = {}
     if equivalent:
         for mode in ('slow', 'fast'):
@@ -653,6 +824,7 @@ def run_worker(model_dir: Path, train_parquet: Path, index: int, uuid: str,
         'external_apps_seen': external_apps_seen,
         'sequence_lengths': [len(r.ids) for r in selected],
         'teacher_tokens': [sum(r.mask) for r in selected],
+        'fp32_ref': fp32_ref,
         'runs': runs,
         'endurance': stability,
         'endurance_skipped': not equivalent,
