@@ -389,6 +389,20 @@ def worker_vllm(model_path: str, tp: int, gpu_util: float, max_model_len: int) -
     }
 
 
+def summarize_subworker_error(combined: str) -> str:
+    lines = [ln for ln in combined.splitlines() if ln.strip()]
+    # Prefer the earliest root-cause EngineCore/Traceback block rather than outer wrapper tail.
+    hits = [i for i, ln in enumerate(lines)
+            if ('ERROR' in ln or 'OutOfMemoryError' in ln or 'Traceback (most recent call last)' in ln)
+            and 'EngineCore' in combined]
+    if hits:
+        start = max(0, hits[0] - 2)
+        snippet = lines[start:start + 50]
+    else:
+        snippet = lines[-60:]
+    return '\n'.join(snippet)
+
+
 def run_subworker(base: Path, visible_gpus: str, args_list: list[str], capture_logs: bool = False) -> tuple[dict, str]:
     with tempfile.NamedTemporaryFile(dir=base / 'tmp', suffix='.json', delete=False) as tf:
         out_path = Path(tf.name)
@@ -400,8 +414,7 @@ def run_subworker(base: Path, visible_gpus: str, args_list: list[str], capture_l
         )
         combined = (proc.stdout or '') + '\n' + (proc.stderr or '')
         if proc.returncode != 0:
-            tail = '\n'.join(combined.splitlines()[-80:])
-            raise RuntimeError(f'子进程失败 rc={proc.returncode}: {tail}')
+            raise RuntimeError(f'子进程失败 rc={proc.returncode}: {summarize_subworker_error(combined)}')
         data = json.loads(out_path.read_text(encoding='utf-8'))
         return data, (combined if capture_logs else '')
     finally:
@@ -410,12 +423,14 @@ def run_subworker(base: Path, visible_gpus: str, args_list: list[str], capture_l
 
 
 def find_local_model(models_root: Path, preferred: Path, keywords: tuple[str, ...]) -> Path:
-    if (preferred / 'config.json').is_file():
+    if (preferred / 'config.json').is_file() and any(preferred.glob('*.safetensors')):
         return preferred
     if not models_root.is_dir():
         return preferred
     candidates = []
     for cfg in sorted(models_root.rglob('config.json')):
+        if not any(cfg.parent.glob('*.safetensors')):
+            continue
         rel = str(cfg.parent.relative_to(models_root)).lower()
         if any(kw.lower() in rel for kw in keywords):
             candidates.append(cfg.parent)
@@ -480,14 +495,22 @@ def run_all(base: Path, tutor_model: Path, skip_vllm: bool = False) -> dict:
             idxs = [g['index'] for g in chosen]
             devs = ','.join(str(i) for i in idxs)
             print(f'[stage1] 3. vLLM {label} on GPUs {idxs} (util={util}, maxlen={maxlen})...', flush=True)
-            res, logs = run_subworker(
-                base, devs,
-                ['--worker-vllm', str(mpath), str(tp), str(util), str(maxlen)],
-                capture_logs=True,
-            )
-            res.update({'case': label, 'gpu_indices': idxs, 'same_numa': same_numa})
-            res.update(parse_vllm_kv_from_logs(logs))
-            vllm_cases.append(res)
+            try:
+                res, logs = run_subworker(
+                    base, devs,
+                    ['--worker-vllm', str(mpath), str(tp), str(util), str(maxlen)],
+                    capture_logs=True,
+                )
+                res.update({'case': label, 'gpu_indices': idxs, 'same_numa': same_numa})
+                res.update(parse_vllm_kv_from_logs(logs))
+                vllm_cases.append(res)
+            except Exception as exc:
+                vllm_cases.append({
+                    'case': label,
+                    'gpu_indices': idxs,
+                    'same_numa': same_numa,
+                    'error': str(exc),
+                })
 
     device_mib = float(g1[0]['total_mib'])
     memory_est = summarize_pro5000(device_mib)
@@ -553,6 +576,9 @@ def format_report(summary: dict) -> str:
     for vc in summary['smoke_vllm']:
         if 'skipped' in vc:
             lines.append(f"  {vc['case']}: SKIPPED ({vc['skipped']})")
+            continue
+        if 'error' in vc:
+            lines.append(f"  {vc['case']} (gpus={vc.get('gpu_indices')}): FAILED\n    {vc['error']}")
             continue
         lines.append(
             f"  {vc['case']} (gpus={vc['gpu_indices']}, tp={vc['tp']}, util={vc['gpu_util']}, "

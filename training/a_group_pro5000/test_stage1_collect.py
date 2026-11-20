@@ -52,6 +52,7 @@ class Stage1CollectTest(unittest.TestCase):
             m27 = root / 'Qwen3.6-27B'
             m27.mkdir()
             (m27 / 'config.json').write_text('{}')
+            (m27 / 'model.safetensors').write_text('')
             found = stage1_collect.find_local_model(
                 root, root / 'Qwen' / 'Qwen3.6-27B', ('qwen3.6-27b', '27b')
             )
