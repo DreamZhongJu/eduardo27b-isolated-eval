@@ -218,6 +218,24 @@ def bound_trainer(native):
             free = shutil.disk_usage(self.formal_work).free
             needed = self.formal_ckpt_bytes_hint + MIN_EXTRA_FREE_BYTES
             if free < needed:
+                gen_spans = self.formal_phase_windows.get('gen', [])
+                write_json(self.formal_work / f'save_blocked_step_{self.global_steps}.json', {
+                    'step': self.global_steps,
+                    'disk_free_gb': round(free / 1e9, 2),
+                    'needed_gb': round(needed / 1e9, 2),
+                    'vote_log_counts': getattr(self, 'formal_vote', {}),
+                    'phase_windows': self.formal_phase_windows,
+                    'queues': queue_metrics.summarize(
+                        self.formal_work / 'queue-metrics', self.formal_queue_start, self.formal_queue_end
+                    ),
+                    'student_proxy': summarize_proxy_window(
+                        self.formal_work / 'proxy-student.jsonl', gen_spans, self.formal_num_student_replicas
+                    ),
+                    'judge_proxy': summarize_proxy_window(self.formal_work / 'proxy-judge.jsonl', gen_spans, 1),
+                    'telemetry': summarize_telemetry(
+                        self.formal_work / 'tutor-telemetry.jsonl', self.formal_phase_windows, self.formal_all_gpus
+                    ),
+                })
                 raise RuntimeError(f'存盘前 /data 剩余 {free / 1e9:.2f} GB < 一份检查点+20G ({needed / 1e9:.2f} GB)')
             result = super()._save_checkpoint()
             self.formal_saved = self.global_steps

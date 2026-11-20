@@ -28,6 +28,10 @@ from telemetry import Sampler
 EDUARDO_REMOTE = 'https://gh-proxy.com/https://github.com/eth-lre/EduardoRL.git'
 AUTHOR_COMMIT = pcfg.AUTHOR_COMMIT
 DISK_FLOOR_BYTES = 45 * 10**9
+PARQUET_SHA256 = {
+    'train.parquet': 'f31edcf7bd845515b753acdf3fe15de820c9d7cefd579c626688ccb3068aeede',
+    'val.parquet': '56c89d329818482bd5e314ea1908c44fb277d3a7207f72cbd352d9b465841d4b',
+}
 
 
 def default_base() -> Path:
@@ -67,28 +71,38 @@ def base_subprocess_env(base: Path) -> dict[str, str]:
         VLLM_CACHE_ROOT=str(base / 'cache' / 'vllm'),
         XDG_CACHE_HOME=str(base / 'cache' / 'xdg'),
     )
+    env_bin = str(Path(sys.executable).resolve().parent)
+    env['PATH'] = env_bin + os.pathsep + env.get('PATH', '')
     if ld_parts:
         env['LD_LIBRARY_PATH'] = os.pathsep.join(ld_parts)
     return env
 
 
 def ensure_eduardo_repo(base: Path) -> Path:
+    import hashlib
+
     repo = base / 'source' / 'EduardoRL'
     repo.parent.mkdir(parents=True, exist_ok=True)
+    git_bin = str(Path(sys.executable).resolve().parent / 'git')
+    if not Path(git_bin).is_file():
+        git_bin = 'git'
+    git_env = base_subprocess_env(base)
     if not (repo / '.git').exists():
         print(f'[setup] cloning EduardoRL@{AUTHOR_COMMIT[:8]} via gh-proxy...', flush=True)
-        subprocess.run(['git', 'clone', '--quiet', EDUARDO_REMOTE, str(repo)], check=True, timeout=300)
-    rev = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True, timeout=30).strip()
+        subprocess.run([git_bin, 'clone', '--quiet', EDUARDO_REMOTE, str(repo)], env=git_env, check=True, timeout=300)
+    rev = subprocess.check_output([git_bin, '-C', str(repo), 'rev-parse', 'HEAD'], env=git_env, text=True, timeout=30).strip()
     if rev != AUTHOR_COMMIT:
-        subprocess.run(['git', '-C', str(repo), 'fetch', '--quiet', 'origin', AUTHOR_COMMIT], check=True, timeout=180)
-        subprocess.run(['git', '-C', str(repo), 'checkout', '--quiet', '--detach', AUTHOR_COMMIT], check=True, timeout=60)
-    status = subprocess.check_output(['git', '-C', str(repo), 'status', '--porcelain', '--untracked-files=no'], text=True, timeout=30)
+        subprocess.run([git_bin, '-C', str(repo), 'fetch', '--quiet', 'origin', AUTHOR_COMMIT], env=git_env, check=True, timeout=180)
+        subprocess.run([git_bin, '-C', str(repo), 'checkout', '--quiet', '--detach', AUTHOR_COMMIT], env=git_env, check=True, timeout=60)
+    status = subprocess.check_output([git_bin, '-C', str(repo), 'status', '--porcelain', '--untracked-files=no'], env=git_env, text=True, timeout=30)
     if status.strip():
         raise RuntimeError('EduardoRL 源码存在未跟踪或本地修改')
     return repo
 
 
 def verify_stage1_prereqs(base: Path, tutor_model: Path):
+    import hashlib
+
     receipt = base / 'envs' / 'pro5000-fast' / 'kernel_equivalence.json'
     if not receipt.is_file():
         raise RuntimeError('缺少阶段 1 快内核等价回执 kernel_equivalence.json')
@@ -97,9 +111,16 @@ def verify_stage1_prereqs(base: Path, tutor_model: Path):
         raise RuntimeError('阶段 1 等价回执未通过')
     if not (tutor_model / 'config.json').is_file():
         raise RuntimeError(f'缺少 Tutor 模型 {tutor_model}')
-    for f in ('train.parquet', 'val.parquet', 'materialization_manifest.json'):
-        if not (base / 'data' / 'author_prepared' / f).is_file():
-            raise RuntimeError(f'缺少数据集文件 {f}')
+    for fname, expected_sha in PARQUET_SHA256.items():
+        fpath = base / 'data' / 'author_prepared' / fname
+        if not fpath.is_file():
+            raise RuntimeError(f'缺少数据集文件 {fname}')
+        h = hashlib.sha256()
+        with fpath.open('rb') as stream:
+            for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+                h.update(block)
+        if h.hexdigest() != expected_sha:
+            raise RuntimeError(f'数据集校验不一致 {fname}')
 
 
 def pick_free_ports(preferred: list[int]) -> list[int]:
@@ -469,8 +490,8 @@ def main() -> int:
         sampler = Sampler(work / 'tutor-telemetry.jsonl', tuple(all_gpus), task_roots, interval=10)
         sampler.start()
 
-        def trainer_env(raytmp: Path, start_step: int, total_steps: int, save_freq: int) -> dict[str, str]:
-            return {
+        def trainer_env(raytmp: Path, start_step: int, total_steps: int, save_freq: int, ckpt_hint: int | None = None) -> dict[str, str]:
+            out = {
                 'CUDA_VISIBLE_DEVICES': ','.join(map(str, tutor_gpus)),
                 'PYTHONPATH': f'{HERE}:{repo}',
                 'PRO5000_BASE': str(base),
@@ -493,6 +514,9 @@ def main() -> int:
                 'STUDENT_API_BASE': student_api_base,
                 'JUDGE_API_BASE': judge_api_base,
             }
+            if ckpt_hint is not None:
+                out['PRO5000_CKPT_HINT_BYTES'] = str(ckpt_hint)
+            return out
 
         # 6. Phase A: steps 1-2 + save step 2 [model, extra]
         print('[phase A] starting steps 1-2 (will save step-2 model+extra checkpoint and stop)...', flush=True)
@@ -545,7 +569,7 @@ def main() -> int:
         log_b = (work / 'trainer_phaseB.log').open('xb')
         try:
             proc_b = subprocess.Popen(
-                cmd_b, env=dict(env_base, **trainer_env(raytmp_b, 2, 3, 25)),
+                cmd_b, env=dict(env_base, **trainer_env(raytmp_b, 2, 3, 25, ckpt_hint=step2_ckpt_bytes)),
                 cwd=work, stdin=subprocess.DEVNULL, stdout=log_b, stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
