@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -189,13 +190,26 @@ def wait_for_http_health(url: str, proc: subprocess.Popen, label: str, timeout_s
     raise RuntimeError(f'{label} 服务健康检查超时 ({timeout_s}s)')
 
 
-def make_ray_tmp(base: Path) -> Path:
-    raytmp = base / ('r' + secrets.token_hex(3))
-    raytmp.mkdir(mode=0o700, exist_ok=False)
-    sample = str(raytmp) + '/session_2099-12-31_23-59-59_999999_4194304/sockets/plasma_store'
-    if len(sample.encode('utf-8')) > 107:
-        raise RuntimeError(f'Ray socket 路径过长 ({len(sample)} bytes)')
-    return raytmp
+_RAY_SOCK_SUFFIX = '/session_2099-12-31_23-59-59_999999_4194304/sockets/plasma_store'
+
+
+def make_ray_tmp(base: Path, max_socket_bytes: int = 107) -> Path:
+    # Prefer /data (under ~/bzhang/) while strictly respecting AF_UNIX's 107-byte limit.
+    tag = 'r' + secrets.token_hex(2)
+    seen: set[Path] = set()
+    candidates = [
+        p
+        for p in [base, *base.parents, Path('/tmp'), Path(tempfile.gettempdir())]
+        if str(p) != '/' and not (p in seen or seen.add(p))
+    ]
+    for parent in candidates:
+        if not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK):
+            continue
+        raytmp = parent / tag
+        if len((str(raytmp) + _RAY_SOCK_SUFFIX).encode('utf-8')) <= max_socket_bytes:
+            raytmp.mkdir(mode=0o700, exist_ok=False)
+            return raytmp
+    raise RuntimeError(f'无可用的 Ray 临时目录 (均超出 {max_socket_bytes} bytes UNIX socket 限制): base={base}')
 
 
 def terminate_procs(procs: list[tuple[str, subprocess.Popen]]):

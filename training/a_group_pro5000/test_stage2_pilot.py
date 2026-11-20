@@ -11,6 +11,7 @@ sys.path.insert(0, str(HERE))
 import pro5000_config as pcfg
 from pro5000_trainer_entry import verify_model_extra_checkpoint
 from serving_proxy import ProxyGroup, merge_busy_seconds, summarize_proxy_window
+from stage2_pilot import make_ray_tmp
 
 
 class Stage2PilotTest(unittest.TestCase):
@@ -132,6 +133,33 @@ class Stage2PilotTest(unittest.TestCase):
                     cfg, base=base, work=work, ckpt_dir=ckpt, student_name='s',
                     interaction=inter, total_steps=2, save_freq=2, test_freq=25,
                 )
+
+    def test_make_ray_tmp_fits_unix_socket_limit(self):
+        sock_suffix = '/session_2099-12-31_23-59-59_999999_4194304/sockets/plasma_store'
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            long_base = parent / 'a_group_pro5000_very_long_subdir_name_here'
+            long_base.mkdir()
+            # Simulate Pro 5000 where base.parent fits the socket budget while base itself does not.
+            parent_budget = len((str(parent / 'r0000') + sock_suffix).encode('utf-8'))
+            rt = make_ray_tmp(long_base, max_socket_bytes=parent_budget)
+            try:
+                self.assertEqual(rt.parent, parent)
+                self.assertLessEqual(len((str(rt) + sock_suffix).encode('utf-8')), parent_budget)
+            finally:
+                rt.rmdir()
+
+            # Verify default 107-byte budget raises cleanly only if no writable ancestor/tmp fits,
+            # and otherwise succeeds within 107 bytes.
+            try:
+                rt_real = make_ray_tmp(long_base)
+            except RuntimeError as exc:
+                self.assertIn('107 bytes', str(exc))
+            else:
+                try:
+                    self.assertLessEqual(len((str(rt_real) + sock_suffix).encode('utf-8')), 107)
+                finally:
+                    rt_real.rmdir()
 
 
 if __name__ == '__main__':
