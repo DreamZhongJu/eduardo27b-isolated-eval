@@ -255,14 +255,24 @@ class Kernels:
         return measured
 
     def use(self, mode):
+        use_conv = mode in ('fast', 'fast_conv')
+        use_chunk = mode in ('fast', 'fast_chunk')
+        use_norm = mode in ('fast', 'fast_norm')
         for layer, fast_conv, fast_chunk, fast_norm, slow_norm in self.orig:
-            layer.causal_conv1d_fn = self.wrap(fast_conv, 'fast_conv') if mode == 'fast' else None
-            layer.chunk_gated_delta_rule = (self.wrap(fast_chunk, 'fast_chunk') if mode == 'fast'
+            layer.causal_conv1d_fn = self.wrap(fast_conv, 'fast_conv') if use_conv else None
+            layer.chunk_gated_delta_rule = (self.wrap(fast_chunk, 'fast_chunk') if use_chunk
                                             else self.wrap(self.slow_chunk, 'slow_chunk'))
-            layer.norm = fast_norm if mode == 'fast' else slow_norm
+            layer.norm = fast_norm if use_norm else slow_norm
 
     def verified(self, mode, trajectories):
-        chosen = {f'{mode}_{suffix}' for suffix in ('conv', 'chunk', 'norm')}
+        if mode in ('slow', 'fast'):
+            chosen = {f'{mode}_{suffix}' for suffix in ('conv', 'chunk', 'norm')}
+        else:
+            chosen = {
+                'fast_conv' if mode == 'fast_conv' else 'slow_conv',
+                'fast_chunk' if mode == 'fast_chunk' else 'slow_chunk',
+                'fast_norm' if mode == 'fast_norm' else 'slow_norm',
+            }
         return set(self.counts) == chosen and all(
             self.counts[name] >= len(self.layers) * trajectories for name in chosen
         )
@@ -514,8 +524,33 @@ def display(result, passed):
                   f"{tr['last_to_first_ms_per_token']:.3f} | {a['loadavg_1']:.2f} / {b['loadavg_1']:.2f} |")
 
 
+def summarize_diff_distribution(slow_vals, other_vals, teacher_tokens):
+    diffs = sorted(abs(a - b) for a, b in zip(slow_vals, other_vals))
+    n = len(diffs)
+    def q(p):
+        idx = min(n - 1, max(0, int(p * (n - 1))))
+        return diffs[idx]
+    per_seq = []
+    offset = 0
+    for cnt in teacher_tokens:
+        seg = [abs(a - b) for a, b in zip(slow_vals[offset:offset + cnt], other_vals[offset:offset + cnt])]
+        per_seq.append(max(seg) if seg else 0.0)
+        offset += cnt
+    return {
+        'count': n,
+        'p50': q(0.50),
+        'p95': q(0.95),
+        'p99': q(0.99),
+        'p999': q(0.999),
+        'max': diffs[-1],
+        'gt_0_5': sum(d > 0.5 for d in diffs),
+        'gt_1_0': sum(d > 1.0 for d in diffs),
+        'per_seq_max': per_seq,
+    }
+
+
 def run_worker(model_dir: Path, train_parquet: Path, index: int, uuid: str,
-               deadline: float, report_dir: Path, soak_seconds: dict):
+               deadline: float, report_dir: Path, soak_seconds: dict, *, ablate: bool = False):
     from importlib import metadata
     with open(os.devnull, 'w') as sink, redirect_stdout(sink), redirect_stderr(sink):
         import torch
@@ -568,6 +603,31 @@ def run_worker(model_dir: Path, train_parquet: Path, index: int, uuid: str,
         batch.append((ids, positions))
 
     kernels = Kernels(model, native)
+    if ablate:
+        one_batch(torch, model, kernels, batch, 'slow', check, keep_values=False)
+        base = one_batch(torch, model, kernels, batch, 'slow', check, keep_values=True)
+        teacher_tokens = [sum(r.mask) for r in selected]
+        ablation = []
+        for mode in ('fast_norm', 'fast_conv', 'fast_chunk', 'fast'):
+            torch.cuda.empty_cache()
+            one_batch(torch, model, kernels, batch, mode, check, keep_values=False)
+            cur = one_batch(torch, model, kernels, batch, mode, check, keep_values=True)
+            dist = summarize_diff_distribution(base['values'], cur['values'], teacher_tokens)
+            ablation.append({
+                'mode': mode,
+                'loss_rel': abs(cur['loss'] - base['loss']) / max(abs(base['loss']), 1e-12),
+                'grad_norm_rel': abs(cur['grad_norm'] - base['grad_norm']) / max(abs(base['grad_norm']), 1e-12),
+                'seconds_per_token': cur['seconds_per_token'],
+                'dist': dist,
+                'counts': cur['kernel_call_counts'],
+            })
+        return {
+            'ablate': True,
+            'sequence_lengths': [len(r.ids) for r in selected],
+            'teacher_tokens': teacher_tokens,
+            'ablation': ablation,
+        }
+
     runs = []
     for mode, trials in (('slow', 2), ('fast', 1)):
         print(f'[compare] warmup mode={mode}', flush=True)
@@ -606,6 +666,7 @@ def main():
     parser.add_argument('--gpu', type=int)
     parser.add_argument('--slow-seconds', type=int, default=SOAK_SECONDS['slow'])
     parser.add_argument('--fast-seconds', type=int, default=SOAK_SECONDS['fast'])
+    parser.add_argument('--ablate', action='store_true')
     parser.add_argument('--worker', nargs=6, help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
@@ -615,7 +676,7 @@ def main():
         idx, uuid, deadline_s, report_dir_s, model_dir_s, train_s = args.worker
         out_json = Path(report_dir_s) / 'raw_worker_result.json'
         res = run_worker(Path(model_dir_s), Path(train_s), int(idx), uuid,
-                         float(deadline_s), Path(report_dir_s), soak_seconds)
+                         float(deadline_s), Path(report_dir_s), soak_seconds, ablate=args.ablate)
         out_json.write_text(json.dumps(res, allow_nan=False))
         return 0
 
@@ -656,6 +717,7 @@ def main():
     cmd = [
         sys.executable, '-B', str(Path(__file__).resolve()),
         '--slow-seconds', str(args.slow_seconds), '--fast-seconds', str(args.fast_seconds),
+        *(['--ablate'] if args.ablate else []),
         '--worker', str(gpu['index']), gpu['uuid'], str(deadline),
         str(report_dir), str(args.model_dir), str(train_parquet),
     ]
@@ -672,6 +734,21 @@ def main():
         return rc
 
     result = json.loads((report_dir / 'raw_worker_result.json').read_text())
+    if args.ablate:
+        (report_dir / 'ablation-summary.json').write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+        )
+        print('=== 内核逐项消融与逐 token 误差分位 ===')
+        print('序列长度', *result['sequence_lengths'], '教师 token', *result['teacher_tokens'])
+        print('| 模式 | loss_rel | grad_norm_rel | p50 | p95 | p99 | p99.9 | max | >0.5 | >1.0 | 分段max(short/med/long) |')
+        print('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|')
+        for row in result['ablation']:
+            d = row['dist']
+            pseq = '/'.join(f'{x:.4g}' for x in d['per_seq_max'])
+            print(f"| {row['mode']} | {row['loss_rel']:.5g} | {row['grad_norm_rel']:.5g} | "
+                  f"{d['p50']:.4g} | {d['p95']:.4g} | {d['p99']:.4g} | {d['p999']:.4g} | "
+                  f"{d['max']:.4g} | {d['gt_0_5']} | {d['gt_1_0']} | {pseq} |")
+        return 0
     passed = score_result(result, soak_seconds=soak_seconds, max_mem_mib=gpu['total_mib'])
     result.update(protocol=PROTOCOL, environment=str(env_prefix), gpu_index=gpu['index'], accepted=passed)
     summary_path = report_dir / 'comparison-summary.json'

@@ -409,6 +409,19 @@ def run_subworker(base: Path, visible_gpus: str, args_list: list[str], capture_l
             out_path.unlink()
 
 
+def find_local_model(models_root: Path, preferred: Path, keywords: tuple[str, ...]) -> Path:
+    if (preferred / 'config.json').is_file():
+        return preferred
+    if not models_root.is_dir():
+        return preferred
+    candidates = []
+    for cfg in sorted(models_root.rglob('config.json')):
+        rel = str(cfg.parent.relative_to(models_root)).lower()
+        if any(kw.lower() in rel for kw in keywords):
+            candidates.append(cfg.parent)
+    return candidates[0] if candidates else preferred
+
+
 def run_all(base: Path, tutor_model: Path, skip_vllm: bool = False) -> dict:
     first = snapshot_gpus()
     time.sleep(2)
@@ -439,8 +452,17 @@ def run_all(base: Path, tutor_model: Path, skip_vllm: bool = False) -> dict:
     # 3. vLLM smoke & 27B KV concurrency
     vllm_cases = []
     if not skip_vllm:
-        student_dir = base / 'models' / 'LLM-Research' / 'Meta-Llama-3.1-8B-Instruct'
-        judge_dir = base / 'models' / 'Qwen' / 'Qwen3.6-27B'
+        models_root = base / 'models'
+        student_dir = find_local_model(
+            models_root,
+            models_root / 'LLM-Research' / 'Meta-Llama-3.1-8B-Instruct',
+            ('llama-3.1-8b', 'llama3.1-8b', '8b-instruct'),
+        )
+        judge_dir = find_local_model(
+            models_root,
+            models_root / 'Qwen' / 'Qwen3.6-27B',
+            ('qwen3.6-27b', 'qwen3_6-27b', '27b'),
+        )
         plan = [
             ('tutor_4b_tp1_058', tutor_model, 1, 0.58, 10240),
             ('student_8b_tp1_090', student_dir, 1, 0.90, 32768),

@@ -1,5 +1,6 @@
 """Unit tests for memory_pro5000 and stage1_collect (CPU-only)."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -44,6 +45,17 @@ class Stage1CollectTest(unittest.TestCase):
         self.assertEqual(parsed['log_kv_tokens'], 46752)
         self.assertAlmostEqual(parsed['log_kv_gib'], 11.42)
         self.assertAlmostEqual(parsed['log_max_concurrency'], 1.43)
+
+    def test_find_local_model_discovers_flat_modelscope_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            m27 = root / 'Qwen3.6-27B'
+            m27.mkdir()
+            (m27 / 'config.json').write_text('{}')
+            found = stage1_collect.find_local_model(
+                root, root / 'Qwen' / 'Qwen3.6-27B', ('qwen3.6-27b', '27b')
+            )
+            self.assertEqual(found, m27)
 
 
 if __name__ == '__main__':

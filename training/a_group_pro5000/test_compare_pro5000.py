@@ -100,6 +100,19 @@ class ComparePro5000Test(unittest.TestCase):
         no_fast['endurance_skipped'] = True
         self.assertFalse(c.score_result(no_fast, max_mem_mib=73415))
 
+    def test_summarize_diff_distribution(self):
+        dist = c.summarize_diff_distribution(
+            [-1.0, -2.0, -3.0, -4.0],
+            [-1.01, -2.05, -3.6, -5.4],
+            [2, 2],
+        )
+        self.assertEqual(dist['count'], 4)
+        self.assertEqual(dist['gt_0_5'], 2)
+        self.assertEqual(dist['gt_1_0'], 1)
+        self.assertAlmostEqual(dist['max'], 1.4)
+        self.assertAlmostEqual(dist['per_seq_max'][0], 0.05)
+        self.assertAlmostEqual(dist['per_seq_max'][1], 1.4)
+
 
 if __name__ == '__main__':
     unittest.main()
