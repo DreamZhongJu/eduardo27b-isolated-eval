@@ -7,6 +7,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$BASE/runs" "$BASE/tmp"
 export PATH="$BASE/envs/pro5000-fast/bin:$PATH"
+export LD_LIBRARY_PATH="$BASE/envs/pro5000-fast/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TMPDIR="$BASE/tmp"
 export PYTHONDONTWRITEBYTECODE=1
 

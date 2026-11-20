@@ -69,6 +69,10 @@ def sanitized_env(base: Path, visible_gpus: str) -> dict[str, str]:
         k: v for k, v in os.environ.items()
         if not k.upper().endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD'))
     }
+    env_lib = Path(sys.prefix) / 'lib'
+    ld_parts = [str(env_lib)] if env_lib.is_dir() else []
+    if env.get('LD_LIBRARY_PATH'):
+        ld_parts.append(env['LD_LIBRARY_PATH'])
     env.update(
         CUDA_VISIBLE_DEVICES=visible_gpus,
         CUDA_DEVICE_ORDER='PCI_BUS_ID',
@@ -85,6 +89,8 @@ def sanitized_env(base: Path, visible_gpus: str) -> dict[str, str]:
         VLLM_CACHE_ROOT=str(base / 'cache' / 'vllm'),
         XDG_CACHE_HOME=str(base / 'cache' / 'xdg'),
     )
+    if ld_parts:
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(ld_parts)
     return env
 
 

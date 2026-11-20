@@ -640,6 +640,10 @@ def main():
     deadline = time.monotonic() + HARD_SECONDS
     env = {k: v for k, v in os.environ.items()
            if not k.upper().endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD'))}
+    env_lib = Path(sys.prefix) / 'lib'
+    ld_parts = [str(env_lib)] if env_lib.is_dir() else []
+    if env.get('LD_LIBRARY_PATH'):
+        ld_parts.append(env['LD_LIBRARY_PATH'])
     env.update(
         CUDA_VISIBLE_DEVICES=gpu['uuid'], CUDA_DEVICE_ORDER='PCI_BUS_ID',
         HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
@@ -647,6 +651,8 @@ def main():
         TMPDIR=str(base / 'tmp'), TRITON_CACHE_DIR=str(base / 'cache' / 'triton'),
         XDG_CACHE_HOME=str(base / 'cache' / 'xdg'),
     )
+    if ld_parts:
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(ld_parts)
     cmd = [
         sys.executable, '-B', str(Path(__file__).resolve()),
         '--slow-seconds', str(args.slow_seconds), '--fast-seconds', str(args.fast_seconds),
