@@ -10,6 +10,11 @@
 !/training/
 /training/*
 !/training/README.md
+!/training/a_group_pro5000/
+/training/a_group_pro5000/*
+!/training/a_group_pro5000/*.py
+!/training/a_group_pro5000/*.sh
+!/training/a_group_pro5000/*.md
 # Canonical evaluation tree; root names are tracked compatibility symlinks.
 !/evaluation/
 /evaluation/*
