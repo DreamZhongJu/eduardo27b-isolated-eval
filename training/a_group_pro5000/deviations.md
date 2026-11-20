@@ -5,4 +5,5 @@
 3. **运行时环境与选卡参数**：子进程需将独立环境 `lib/` 置顶到 `LD_LIBRARY_PATH`（确保 `libicui18n.so.79` 加载 conda 的 `CXXABI_1.3.15` `libstdc++.so.6`），且 `vllm 0.19.1` 需在 `CUDA_DEVICE_ORDER=PCI_BUS_ID` 下使用整数卡号（不能使用 `GPU-<uuid>`）。
 4. **单卡对照样本与判据**：按 T-017 使用基座 `Qwen3.5-4B` 与作者公开训练集分两组随机种子构造 6 条长中短多轮对话代替 C 阶段检查点与站内轨迹；按阶段 1 审核采用无 autocast/关 TF32 的真 FP32 前向作为参考，核验快路径 BF16 相对 FP32 的 `p99`/`p99.9`（≤ 慢路径 2 倍）、最大值（≤ `max(1.0, 2×慢路径最大值)`）、有限值与均量相对差（a–d）。
 5. **裁判 `Qwen3.6-27B` 改为 `TP=2`（与作者一致）**：实测 `73,415 MiB` 单卡在作者 `launch_judge_server.sh` 默认 `max_model_len=32768, max_num_seqs=256` 下无法完成初始化；`TP=2`（`0.90`）实测可提供 `33.72 GiB`/卡 KV 与 `29.35x` 并发，与作者本身采用 2 卡一组部署裁判的并行结构一致。
-6. **检查点与磁盘策略（计划）**：为适配 `/data` 有限空间（当前余 `61G`），检查点仅保存 `[model, extra]`（不含优化器，回齐作者默认 `load_contents=[model,extra]`）并只保留最新 1 份，日志只留指标不落盘 rollout 明细；系统盘 `/` 仅余 `7.8G`，所有缓存与临时目录强制落到 `~/bzhang/a_group_pro5000/`。
+6. **检查点与磁盘策略**：为适配 `/data` 有限空间，检查点仅保存 `[model, extra]`（不含优化器，回齐作者默认 `load_contents=[model,extra]`）并在阶段 3 只保留最新 1 份，日志只留指标不落盘 rollout 明细（`EDUARDO_CONV_DIR=/dev/null`）；系统盘 `/` 仅余 `7.8G`，所有缓存与临时目录强制落到 `~/bzhang/a_group_pro5000/`。
+7. **学生 2 个副本，只影响速度**：在 8 卡布局下于 GPU 4 与 GPU 6 各起一个 `Meta-Llama-3.1-8B-Instruct` 单卡副本，通过本机 `serving_proxy.py` 按最少在途请求分担学生对话与后测请求；学生模型、采样参数与提示词完全不变（配置客户端并发上限为 `student_concurrency=32` / worker、`judge_concurrency=16` / worker，总在途均低于作者 `user.yaml` 的 256/128）。

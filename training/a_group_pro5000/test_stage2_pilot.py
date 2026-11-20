@@ -1,0 +1,138 @@
+"""Unit tests for Stage 2 serving proxy, config pinning, checkpoint audit, and report math."""
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import pro5000_config as pcfg
+from pro5000_trainer_entry import verify_model_extra_checkpoint
+from serving_proxy import ProxyGroup, merge_busy_seconds, summarize_proxy_window
+
+
+class Stage2PilotTest(unittest.TestCase):
+    def test_merge_busy_seconds_and_proxy_window(self):
+        self.assertAlmostEqual(merge_busy_seconds([(1.0, 3.0), (2.0, 5.0), (6.0, 7.5)]), 5.5)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'proxy.jsonl'
+            rows = [
+                [10.0, 12.0, 0, 200, 1, 100, 500],
+                [11.0, 14.0, 1, 200, 1, 200, 800],
+                [15.0, 16.0, 0, 502, 1, None, 500],
+                [30.0, 31.0, 0, 200, 1, 50, 500],  # outside span
+            ]
+            p.write_text('\n'.join(json.dumps(r) for r in rows) + '\n', encoding='utf-8')
+            out = summarize_proxy_window(p, [(10.0, 20.0)], 2)
+            self.assertEqual(out['total_chat_requests'], 3)
+            self.assertEqual(out['non_2xx'], 1)
+            self.assertAlmostEqual(out['combined_busy_wall_s'], 5.0)
+            self.assertAlmostEqual(out['avg_completion_tokens'], 150.0)
+            self.assertAlmostEqual(out['avg_interaction_tokens'], 100.0)
+            self.assertAlmostEqual(out['avg_final_tokens'], 200.0)
+            self.assertEqual(out['backends']['0']['requests'], 2)
+            self.assertEqual(out['backends']['1']['requests'], 1)
+
+    def test_least_inflight_pick_backend(self):
+        with tempfile.TemporaryDirectory() as td:
+            pg = ProxyGroup(['http://127.0.0.1:1', 'http://127.0.0.1:2'], Path(td) / 'p.jsonl')
+            try:
+                self.assertEqual(pg.pick_backend(), 0)
+                pg.inflight[0] = 3
+                pg.inflight[1] = 1
+                self.assertEqual(pg.pick_backend(), 1)
+            finally:
+                pg.log_file.close()
+
+    def test_verify_model_extra_checkpoint_rejects_optimizer(self):
+        with tempfile.TemporaryDirectory() as td:
+            step = Path(td) / 'global_step_2'
+            actor = step / 'actor'
+            (actor / 'huggingface').mkdir(parents=True)
+            (actor / 'huggingface' / 'config.json').write_text('{}')
+            (actor / 'fsdp_config.json').write_text('{"world_size": 4}')
+            (step / 'data.pt').write_bytes(b'x')
+            for r in range(4):
+                (actor / f'model_world_size_4_rank_{r}.pt').write_bytes(b'm')
+                (actor / f'extra_state_world_size_4_rank_{r}.pt').write_bytes(b'e')
+            info = verify_model_extra_checkpoint(step, world_size=4)
+            self.assertEqual(info['optim_files'], 0)
+
+            (actor / 'optim_world_size_4_rank_0.pt').write_bytes(b'o')
+            with self.assertRaises(RuntimeError):
+                verify_model_extra_checkpoint(step, world_size=4)
+
+    def test_config_pin_accepts_expected_and_rejects_lr_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            work = base / 'work'
+            ckpt = work / 'checkpoints'
+            inter = work / 'interaction.yaml'
+            cfg = {
+                'trainer': {
+                    'total_training_steps': 2, 'save_freq': 2, 'test_freq': 25,
+                    'val_before_train': False, 'val_only': False, 'logger': ['console'],
+                    'nnodes': 1, 'n_gpus_per_node': 4, 'max_actor_ckpt_to_keep': None,
+                    'del_local_ckpt_after_load': False, 'default_local_dir': str(ckpt),
+                    'resume_mode': 'disable', 'resume_from_path': None,
+                },
+                'data': {
+                    'train_batch_size': 16,
+                    'train_files': str(base / 'data/author_prepared/train.parquet'),
+                    'val_files': str(base / 'data/author_prepared/val.parquet'),
+                    'shuffle': True, 'max_prompt_length': 2048, 'max_response_length': 8192,
+                },
+                'actor_rollout_ref': {
+                    'actor': {
+                        'ppo_mini_batch_size': 8, 'ppo_epochs': 1,
+                        'ppo_micro_batch_size_per_gpu': 1, 'use_dynamic_bsz': False,
+                        'loss_agg_mode': 'token-mean', 'use_kl_loss': False,
+                        'optim': {'lr': 1e-6}, 'policy_loss': {'loss_mode': 'dppo_tv'},
+                        'fsdp_config': {'fsdp_size': 4, 'param_offload': False, 'optimizer_offload': True},
+                        'checkpoint': {'save_contents': ['model', 'extra'], 'load_contents': ['model', 'extra']},
+                    },
+                    'rollout': {
+                        'n': 16, 'temperature': 1.15, 'gpu_memory_utilization': 0.58,
+                        'free_cache_engine': True, 'tensor_model_parallel_size': 1,
+                        'calculate_log_probs': True, 'max_model_len': 10240,
+                        'multi_turn': {'enable': True, 'interaction_config_path': str(inter)},
+                        'agent': {'num_workers': 2},
+                    },
+                },
+                'reward': {'num_workers': 2},
+                'reward_model': {'num_workers': None},
+                'custom_reward_function': {
+                    'reward_kwargs': {
+                        'num_student_attempts': 16, 'max_thinking_tokens_per_turn': 512,
+                        'max_tokens_per_turn': 150, 'judge_votes': 3, 'judge_hard_gate': True,
+                        'omit_teacher_turns': True, 'test_on_transfer': True, 'enable_thinking': True,
+                        'judge_concurrency': 16, 'student_concurrency': 32, 'student_temperature': 0.6,
+                        'judge_temperature': 0.6, 'eval_judge_model': '', 'judge_model': 'judge-local',
+                        'student_model': 's',
+                    }
+                },
+                'ray_kwargs': {
+                    'ray_init': {
+                        'runtime_env': {
+                            'worker_process_setup_hook': 'queue_metrics.install',
+                            'env_vars': {'EDU_QUEUE_METRICS_DIR': str(work / 'queue-metrics')},
+                        }
+                    }
+                },
+            }
+            pcfg.pin_composed(
+                cfg, base=base, work=work, ckpt_dir=ckpt, student_name='s',
+                interaction=inter, total_steps=2, save_freq=2, test_freq=25,
+            )
+            cfg['actor_rollout_ref']['actor']['optim']['lr'] = 1e-5
+            with self.assertRaises(ValueError):
+                pcfg.pin_composed(
+                    cfg, base=base, work=work, ckpt_dir=ckpt, student_name='s',
+                    interaction=inter, total_steps=2, save_freq=2, test_freq=25,
+                )
+
+
+if __name__ == '__main__':
+    unittest.main()
