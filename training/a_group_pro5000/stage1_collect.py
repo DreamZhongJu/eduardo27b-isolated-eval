@@ -400,7 +400,7 @@ def run_subworker(base: Path, visible_gpus: str, args_list: list[str], capture_l
         )
         combined = (proc.stdout or '') + '\n' + (proc.stderr or '')
         if proc.returncode != 0:
-            tail = '\n'.join(combined.splitlines()[-25:])
+            tail = '\n'.join(combined.splitlines()[-80:])
             raise RuntimeError(f'子进程失败 rc={proc.returncode}: {tail}')
         data = json.loads(out_path.read_text(encoding='utf-8'))
         return data, (combined if capture_logs else '')
@@ -421,16 +421,16 @@ def run_all(base: Path, tutor_model: Path, skip_vllm: bool = False) -> dict:
     # 1. Flash-attn vs SDPA (1 idle GPU)
     g1, _ = select_idle_group(idle, 1)
     print(f'[stage1] 1. flash-attn vs SDPA on GPU {g1[0]["index"]}...', flush=True)
-    fa_res, _ = run_subworker(base, g1[0]['uuid'], ['--worker-fa'])
+    fa_res, _ = run_subworker(base, str(g1[0]['index']), ['--worker-fa'])
 
     # 2. 4-GPU NCCL all-reduce (prefer same NUMA group)
     nccl_res = None
     if len(idle) >= 4:
         g4, same_numa = select_idle_group(idle, 4)
-        uuids4 = ','.join(g['uuid'] for g in g4)
         idxs4 = [g['index'] for g in g4]
+        devs4 = ','.join(str(i) for i in idxs4)
         print(f'[stage1] 2. NCCL 4-GPU all-reduce on GPUs {idxs4} (same_numa={same_numa})...', flush=True)
-        nccl_res, _ = run_subworker(base, uuids4, ['--worker-nccl', '4'])
+        nccl_res, _ = run_subworker(base, devs4, ['--worker-nccl', '4'])
         nccl_res['gpu_indices'] = idxs4
         nccl_res['same_numa'] = same_numa
     else:
@@ -455,11 +455,11 @@ def run_all(base: Path, tutor_model: Path, skip_vllm: bool = False) -> dict:
                 vllm_cases.append({'case': label, 'skipped': f'missing {mpath}'})
                 continue
             chosen, same_numa = select_idle_group(idle, tp)
-            uuids = ','.join(g['uuid'] for g in chosen)
             idxs = [g['index'] for g in chosen]
+            devs = ','.join(str(i) for i in idxs)
             print(f'[stage1] 3. vLLM {label} on GPUs {idxs} (util={util}, maxlen={maxlen})...', flush=True)
             res, logs = run_subworker(
-                base, uuids,
+                base, devs,
                 ['--worker-vllm', str(mpath), str(tp), str(util), str(maxlen)],
                 capture_logs=True,
             )
@@ -576,8 +576,8 @@ def main() -> int:
         return 0
 
     base = args.base.resolve()
-    (base / 'runs').mkdir(parents=True, exist_ok=True)
-    (base / 'tmp').mkdir(parents=True, exist_ok=True)
+    for sub in ('runs', 'tmp', 'cache/triton', 'cache/inductor', 'cache/vllm', 'cache/xdg'):
+        (base / sub).mkdir(parents=True, exist_ok=True)
     summary = run_all(base, args.tutor_model, skip_vllm=args.skip_vllm)
     report = format_report(summary)
 
