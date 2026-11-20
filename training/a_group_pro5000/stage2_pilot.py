@@ -212,6 +212,54 @@ def make_ray_tmp(base: Path, max_socket_bytes: int = 107) -> Path:
     raise RuntimeError(f'无可用的 Ray 临时目录 (均超出 {max_socket_bytes} bytes UNIX socket 限制): base={base}')
 
 
+def build_trainer_env(
+    *,
+    base: Path,
+    work: Path,
+    ckpt_dir: Path,
+    raytmp: Path,
+    tutor_gpus: list[int],
+    all_gpus: list[int],
+    student_gpus: list[int],
+    layout: dict,
+    repo: Path,
+    tutor_model: Path,
+    student_api_base: str,
+    judge_api_base: str,
+    start_step: int,
+    total_steps: int,
+    save_freq: int,
+    ckpt_hint: int | None = None,
+) -> dict[str, str]:
+    """Build environment variables required by pro5000_trainer_entry.py (both preflight and run)."""
+    out = {
+        'CUDA_VISIBLE_DEVICES': ','.join(map(str, tutor_gpus)),
+        'PYTHONPATH': f'{HERE}:{repo}',
+        'PRO5000_BASE': str(base),
+        'WORK_DIR': str(work),
+        'PRO5000_CKPT_DIR': str(ckpt_dir),
+        'RAY_TMPDIR': str(raytmp),
+        'PRO5000_START_STEP': str(start_step),
+        'PRO5000_TOTAL_STEPS': str(total_steps),
+        'PRO5000_SAVE_FREQ': str(save_freq),
+        'PRO5000_TEST_FREQ': '25',
+        'PRO5000_TUTOR_GPUS': str(len(tutor_gpus)),
+        'PRO5000_ALL_GPUS': ','.join(map(str, all_gpus)),
+        'PRO5000_STUDENT_REPLICAS': str(len(student_gpus)),
+        'PRO5000_OFFLOAD': 'true',
+        'PRO5000_STUDENT_CONC': str(layout['student_concurrency']),
+        'PRO5000_JUDGE_CONC': str(layout['judge_concurrency']),
+        'EDUARDO_RECIPE_DIR': str(repo / 'eduardo'),
+        'MODEL_PATH': str(tutor_model),
+        'EXPERIMENT': 'pro5000-stage2',
+        'STUDENT_API_BASE': student_api_base,
+        'JUDGE_API_BASE': judge_api_base,
+    }
+    if ckpt_hint is not None:
+        out['PRO5000_CKPT_HINT_BYTES'] = str(ckpt_hint)
+    return out
+
+
 def terminate_procs(procs: list[tuple[str, subprocess.Popen]]):
     for _, proc in reversed(procs):
         if proc.poll() is None:
@@ -408,22 +456,37 @@ def main() -> int:
     env_base['SERVING_API_KEY'] = token
     env_base['EDUARDO_CONV_DIR'] = '/dev/null'  # Do not write rollout transcripts to disk.
 
+    def trainer_env(raytmp: Path, start_step: int, total_steps: int, save_freq: int, ckpt_hint: int | None = None) -> dict[str, str]:
+        return build_trainer_env(
+            base=base, work=work, ckpt_dir=ckpt_dir, raytmp=raytmp,
+            tutor_gpus=tutor_gpus, all_gpus=all_gpus, student_gpus=student_gpus,
+            layout=layout, repo=repo, tutor_model=args.tutor_model,
+            student_api_base=student_api_base, judge_api_base=judge_api_base,
+            start_step=start_step, total_steps=total_steps, save_freq=save_freq,
+            ckpt_hint=ckpt_hint,
+        )
+
     # Hydra CPU preflight for Phase A (steps 1-2)
     raytmp_a = make_ray_tmp(base)
-    overrides_a = pcfg.build_overrides(
-        base=base, work=work, ckpt_dir=ckpt_dir, raytmp=raytmp_a,
-        student_name=student_name, interaction=interaction,
-        total_steps=2, save_freq=2, test_freq=25,
-        tutor_gpus=len(tutor_gpus), optimizer_offload=True,
-        student_concurrency=layout['student_concurrency'],
-        judge_concurrency=layout['judge_concurrency'],
-    )
-    trainer_entry = HERE / 'pro5000_trainer_entry.py'
-    pcfg.run_preflight(
-        python_exe=py_exe, trainer_entry=trainer_entry, repo=repo, work=work,
-        tutor_model=args.tutor_model, student_api_base=student_api_base,
-        judge_api_base=judge_api_base, overrides=overrides_a, check_env=env_base,
-    )
+    try:
+        overrides_a = pcfg.build_overrides(
+            base=base, work=work, ckpt_dir=ckpt_dir, raytmp=raytmp_a,
+            student_name=student_name, interaction=interaction,
+            total_steps=2, save_freq=2, test_freq=25,
+            tutor_gpus=len(tutor_gpus), optimizer_offload=True,
+            student_concurrency=layout['student_concurrency'],
+            judge_concurrency=layout['judge_concurrency'],
+        )
+        trainer_entry = HERE / 'pro5000_trainer_entry.py'
+        pcfg.run_preflight(
+            python_exe=py_exe, trainer_entry=trainer_entry, repo=repo, work=work,
+            tutor_model=args.tutor_model, student_api_base=student_api_base,
+            judge_api_base=judge_api_base, overrides=overrides_a,
+            check_env=dict(env_base, **trainer_env(raytmp_a, 0, 2, 2)),
+        )
+    except Exception:
+        shutil.rmtree(raytmp_a, ignore_errors=True)
+        raise
     print('[preflight] Hydra 冻结配方预检通过', flush=True)
 
     managed_procs: list[tuple[str, subprocess.Popen]] = []
@@ -504,34 +567,6 @@ def main() -> int:
         sampler = Sampler(work / 'tutor-telemetry.jsonl', tuple(all_gpus), task_roots, interval=10)
         sampler.start()
 
-        def trainer_env(raytmp: Path, start_step: int, total_steps: int, save_freq: int, ckpt_hint: int | None = None) -> dict[str, str]:
-            out = {
-                'CUDA_VISIBLE_DEVICES': ','.join(map(str, tutor_gpus)),
-                'PYTHONPATH': f'{HERE}:{repo}',
-                'PRO5000_BASE': str(base),
-                'WORK_DIR': str(work),
-                'PRO5000_CKPT_DIR': str(ckpt_dir),
-                'RAY_TMPDIR': str(raytmp),
-                'PRO5000_START_STEP': str(start_step),
-                'PRO5000_TOTAL_STEPS': str(total_steps),
-                'PRO5000_SAVE_FREQ': str(save_freq),
-                'PRO5000_TEST_FREQ': '25',
-                'PRO5000_TUTOR_GPUS': str(len(tutor_gpus)),
-                'PRO5000_ALL_GPUS': ','.join(map(str, all_gpus)),
-                'PRO5000_STUDENT_REPLICAS': str(len(student_gpus)),
-                'PRO5000_OFFLOAD': 'true',
-                'PRO5000_STUDENT_CONC': str(layout['student_concurrency']),
-                'PRO5000_JUDGE_CONC': str(layout['judge_concurrency']),
-                'EDUARDO_RECIPE_DIR': str(repo / 'eduardo'),
-                'MODEL_PATH': str(args.tutor_model),
-                'EXPERIMENT': 'pro5000-stage2',
-                'STUDENT_API_BASE': student_api_base,
-                'JUDGE_API_BASE': judge_api_base,
-            }
-            if ckpt_hint is not None:
-                out['PRO5000_CKPT_HINT_BYTES'] = str(ckpt_hint)
-            return out
-
         # 6. Phase A: steps 1-2 + save step 2 [model, extra]
         print('[phase A] starting steps 1-2 (will save step-2 model+extra checkpoint and stop)...', flush=True)
         cmd_a = [
@@ -561,36 +596,40 @@ def main() -> int:
         # 7. Phase B: resume from global_step_2 -> step 3
         print('[phase B] starting fresh trainer to resume from global_step_2 -> step 3...', flush=True)
         raytmp_b = make_ray_tmp(base)
-        overrides_b = pcfg.build_overrides(
-            base=base, work=work, ckpt_dir=ckpt_dir, raytmp=raytmp_b,
-            student_name=student_name, interaction=interaction,
-            total_steps=3, save_freq=25, test_freq=25,
-            tutor_gpus=len(tutor_gpus), optimizer_offload=True,
-            student_concurrency=layout['student_concurrency'],
-            judge_concurrency=layout['judge_concurrency'],
-            resume_step=2,
-        )
-        pcfg.run_preflight(
-            python_exe=py_exe, trainer_entry=trainer_entry, repo=repo, work=work,
-            tutor_model=args.tutor_model, student_api_base=student_api_base,
-            judge_api_base=judge_api_base, overrides=overrides_b, check_env=env_base,
-        )
-        cmd_b = [
-            str(py_exe), '-B', str(trainer_entry),
-            '--config-path', str(repo / 'eduardo' / 'configs'), '--config-name', 'eduardo_base',
-            *overrides_b,
-        ]
-        log_b = (work / 'trainer_phaseB.log').open('xb')
         try:
-            proc_b = subprocess.Popen(
-                cmd_b, env=dict(env_base, **trainer_env(raytmp_b, 2, 3, 25, ckpt_hint=step2_ckpt_bytes)),
-                cwd=work, stdin=subprocess.DEVNULL, stdout=log_b, stderr=subprocess.STDOUT,
-                start_new_session=True,
+            overrides_b = pcfg.build_overrides(
+                base=base, work=work, ckpt_dir=ckpt_dir, raytmp=raytmp_b,
+                student_name=student_name, interaction=interaction,
+                total_steps=3, save_freq=25, test_freq=25,
+                tutor_gpus=len(tutor_gpus), optimizer_offload=True,
+                student_concurrency=layout['student_concurrency'],
+                judge_concurrency=layout['judge_concurrency'],
+                resume_step=2,
             )
+            env_b = trainer_env(raytmp_b, 2, 3, 25, ckpt_hint=step2_ckpt_bytes)
+            pcfg.run_preflight(
+                python_exe=py_exe, trainer_entry=trainer_entry, repo=repo, work=work,
+                tutor_model=args.tutor_model, student_api_base=student_api_base,
+                judge_api_base=judge_api_base, overrides=overrides_b,
+                check_env=dict(env_base, **env_b),
+            )
+            cmd_b = [
+                str(py_exe), '-B', str(trainer_entry),
+                '--config-path', str(repo / 'eduardo' / 'configs'), '--config-name', 'eduardo_base',
+                *overrides_b,
+            ]
+            log_b = (work / 'trainer_phaseB.log').open('xb')
+            try:
+                proc_b = subprocess.Popen(
+                    cmd_b, env=dict(env_base, **env_b),
+                    cwd=work, stdin=subprocess.DEVNULL, stdout=log_b, stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            finally:
+                log_b.close()
+            rc_b = proc_b.wait()
         finally:
-            log_b.close()
-        rc_b = proc_b.wait()
-        shutil.rmtree(raytmp_b, ignore_errors=True)
+            shutil.rmtree(raytmp_b, ignore_errors=True)
         if rc_b != 0:
             raise RuntimeError(f'阶段 2 第 3 步续训退出异常 rc={rc_b}')
 

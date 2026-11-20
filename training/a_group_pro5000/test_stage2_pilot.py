@@ -11,7 +11,7 @@ sys.path.insert(0, str(HERE))
 import pro5000_config as pcfg
 from pro5000_trainer_entry import verify_model_extra_checkpoint
 from serving_proxy import ProxyGroup, merge_busy_seconds, summarize_proxy_window
-from stage2_pilot import make_ray_tmp
+from stage2_pilot import build_trainer_env, make_ray_tmp
 
 
 class Stage2PilotTest(unittest.TestCase):
@@ -160,6 +160,22 @@ class Stage2PilotTest(unittest.TestCase):
                     self.assertLessEqual(len((str(rt_real) + sock_suffix).encode('utf-8')), 107)
                 finally:
                     rt_real.rmdir()
+
+    def test_build_trainer_env_has_preflight_keys(self):
+        env = build_trainer_env(
+            base=Path('/b'), work=Path('/b/w'), ckpt_dir=Path('/b/c'), raytmp=Path('/tmp/r1234'),
+            tutor_gpus=[0, 1, 2, 3], all_gpus=[0, 1, 2, 3, 4, 5, 6, 7], student_gpus=[4, 6],
+            layout={'student_concurrency': 32, 'judge_concurrency': 16},
+            repo=Path('/b/repo'), tutor_model=Path('/m/t'),
+            student_api_base='http://127.0.0.1:18861/v1', judge_api_base='http://127.0.0.1:18862/v1',
+            start_step=0, total_steps=2, save_freq=2,
+        )
+        for key in (
+            'PRO5000_BASE', 'WORK_DIR', 'PRO5000_CKPT_DIR', 'RAY_TMPDIR',
+            'PRO5000_START_STEP', 'PRO5000_TOTAL_STEPS', 'PRO5000_SAVE_FREQ', 'PRO5000_TEST_FREQ',
+        ):
+            self.assertIn(key, env)
+        self.assertEqual(env['PRO5000_TOTAL_STEPS'], '2')
 
 
 if __name__ == '__main__':
