@@ -201,17 +201,37 @@ for fname, (algo, exp) in TUTOR_LOCK.items():
     print(f"tutor/{fname}: {status} sha256={s256}")
 print(f"tutor_checked={len(TUTOR_LOCK)} mismatches={tutor_bad}")
 
-print("=== 7. Student Llama-3.1-8B-Instruct Check ===")
+print("=== 7. Student Llama-3.1-8B-Instruct Check (HF 0e9e39f2) ===")
+STUDENT_LOCK = {
+    "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+    "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
+    "tokenizer_config.json": "177c7b61e616fecb84c17ce0591acb92c6c4d60e9ac5ababfb940ff23bbcd424",
+    "model-00001-of-00004.safetensors": "2b1879f356aed350030bb40eb45ad362c89d9891096f79a3ab323d3ba5607668",
+    "model-00002-of-00004.safetensors": "09d433f650646834a83c580877bd60c6d1f88f7755305c12576b5c7058f9af15",
+    "model-00003-of-00004.safetensors": "fc1cdddd6bfa91128d6e94ee73d0ce62bfcdb7af29e978ddcab30c66ae9ea7fa",
+    "model-00004-of-00004.safetensors": "92ecfe1a2414458b4821ac8c13cf8cb70aed66b5eea8dc5ad9eeb4ff309d6d7b",
+}
 cfg = json.loads((student_dir / "config.json").read_text())
 print(f"student_config: model_type={cfg.get('model_type')} hidden={cfg.get('hidden_size')} layers={cfg.get('num_hidden_layers')}")
 idx = json.loads((student_dir / "model.safetensors.index.json").read_text())
 shards = sorted(set(idx.get("weight_map", {}).values()))
+student_bad = 0
 for name in ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json"] + shards:
     p = student_dir / name
     if not p.is_file():
         print(f"student/{name}: MISSING")
+        student_bad += 1
+        continue
+    got = sha256_file(p)
+    exp = STUDENT_LOCK.get(name)
+    if exp is None:
+        print(f"student/{name}: PRESENT size={p.stat().st_size} sha256={got}")
     else:
-        print(f"student/{name}: size={p.stat().st_size} sha256={sha256_file(p)}")
+        status = "OK" if got == exp else "MISMATCH"
+        if status != "OK":
+            student_bad += 1
+        print(f"student/{name}: {status} size={p.stat().st_size} sha256={got}")
+print(f"student_checked={len(STUDENT_LOCK)} mismatches={student_bad}")
 
 print("=== 8. Dataset Check ===")
 for rel, exp in (

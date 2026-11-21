@@ -29,13 +29,17 @@ if [ "${1:-}" = "--status" ]; then
     echo "runner_pid=MISSING"
   fi
   if [ -f "${OUT_DIR}/eval_run.log" ]; then
-    python3 -B - "${OUT_DIR}/eval_run.log" <<'PY'
-import re, sys
+    HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    python3 -B - "${HERE_DIR}" "${OUT_DIR}/eval_run.log" <<'PY'
+import sys
 from pathlib import Path
-text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-rounds = re.findall(r"^.*\[INFO\].*(Round \d+: .*|Scoring \d+ conversations.*|Rollout of .*|Scoring took .*|Results written to:.*)$", text, re.M)
-print(f"status_lines_matched={len(rounds)}")
-for line in rounds[-10:]:
+sys.path.insert(0, sys.argv[1])
+from summarize_author494 import extract_safe_eval_log_lines
+
+text = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
+matched = extract_safe_eval_log_lines(text, include_rounds=True)
+print(f"status_lines_matched={len(matched)}")
+for line in matched[-10:]:
     print(" ", line)
 PY
   else
@@ -408,24 +412,25 @@ set -e
 END_TS=$(date +%s)
 echo "[author494] eval finished rc=${EVAL_RC} elapsed=$((END_TS - START_TS))s"
 
-# Print ONLY aggregate summary lines from eval_run.log (never raw conversations/problems).
+HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Print ONLY aggregate summary lines from eval_run.log (never raw conversations/problems/WARNING/ERROR).
 if [ -f "${OUTPUT_DIR}/eval_run.log" ]; then
-  "${PYTHON_BIN}" -B - "${OUTPUT_DIR}/eval_run.log" <<'PY'
-import re, sys
+  "${PYTHON_BIN}" -B - "${HERE_DIR}" "${OUTPUT_DIR}/eval_run.log" <<'PY'
+import sys
 from pathlib import Path
-text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
-m = re.search(r"={72}\n.*?={72}", text, re.S)
-if m:
-    print(m.group(0))
-for line in text.splitlines():
-    if any(k in line for k in ("Thinking mode ", "Rollout of ", "Scoring ", "Results written to:", "blanked_teacher_turn_rate")):
-        print(line)
+sys.path.insert(0, sys.argv[1])
+from summarize_author494 import format_eval_log_excerpt
+
+text = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
+excerpt = format_eval_log_excerpt(text)
+if excerpt:
+    print(excerpt)
 PY
 fi
 
 RESULT_JSON=$(ls -t "${OUTPUT_DIR}"/transfer_eval_*.json 2>/dev/null | head -n 1 || true)
 if [ -n "${RESULT_JSON}" ]; then
-  HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   "${PYTHON_BIN}" -B "${HERE_DIR}/summarize_author494.py" "${RESULT_JSON}"
 fi
 

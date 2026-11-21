@@ -39,7 +39,7 @@ bash /workspace/author494_eval_code/evaluation/author494/preflight_author494.sh
   --api-key-env AGNES_API_KEY
 ```
 
-### 3. 准备 494 题 `test.parquet` 并冒烟（前 20 题，替换 `<TUTOR_GPU>` 和 `<S1,S2,S3>` 为预检确认的 4 张空闲整卡）
+### 3. 准备 494 题 `test.parquet` 并冒烟（前 20 题，替换 `<TUTOR_GPU>` 和 `<S1,S2,S3>` 为预检确认的 4 张空闲整卡；需与第 1–2 步在同一终端中保持 `AGNES_API_KEY` 已导出）
 
 ```bash
 nohup bash /workspace/author494_eval_code/evaluation/author494/run_base_author494.sh \

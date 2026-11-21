@@ -124,6 +124,42 @@ _PARSE_FAIL_REASON = "Parse failure"
 _REGEX_RECOVERED_REASON = "<unparsed JSON>"
 _EPS = 1e-12
 
+_SAFE_INFO_LOG_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: "
+    r"(?:Thinking mode (?:AUTO|FORCED):|Rollout of |Scoring (?:\d+|took ))"
+)
+_SAFE_ROUND_INFO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: Round \d+: "
+)
+_RESULTS_WRITTEN_RE = re.compile(r"^Results written to: ")
+_AUTHOR_SUMMARY_BLOCK_RE = re.compile(r"^={72}\nModel:\s+.*?^={72}$", re.M | re.S)
+
+
+def extract_safe_eval_log_lines(text: str, *, include_rounds: bool = False) -> list[str]:
+    """Return only allowlisted eduardo.transfer_eval INFO lines and Results written line.
+
+    WARNING and ERROR lines (which may contain raw judge/model text) are never returned.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        if _SAFE_INFO_LOG_RE.match(line) or _RESULTS_WRITTEN_RE.match(line):
+            out.append(line)
+        elif include_rounds and _SAFE_ROUND_INFO_RE.match(line):
+            out.append(line)
+    return out
+
+
+def format_eval_log_excerpt(text: str) -> str:
+    """Format the author print_summary block plus safe allowlisted status lines."""
+    parts: list[str] = []
+    match = _AUTHOR_SUMMARY_BLOCK_RE.search(text)
+    if match:
+        parts.append(match.group(0))
+    safe_lines = extract_safe_eval_log_lines(text)
+    if safe_lines:
+        parts.extend(safe_lines)
+    return "\n".join(parts)
+
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))

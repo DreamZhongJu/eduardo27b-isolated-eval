@@ -267,6 +267,49 @@ class TestSummarizeAuthor494(unittest.TestCase):
         bad, _ = ping._strict_judge_json_ok('{"reasoning": "missing decision"}')
         self.assertFalse(bad)
 
+    def test_extract_safe_eval_log_lines_excludes_warning_and_error(self):
+        fake_log = "\n".join([
+            "2026-11-21 21:00:01,100 [INFO] eduardo.transfer_eval: Loaded 20 rows from /tmp/test.parquet (20 carry a transfer variant)",
+            "2026-11-21 21:00:02,200 [INFO] eduardo.transfer_eval: Thinking mode AUTO: chat template has NO <think> prefill -> assume_thinking=False",
+            "2026-11-21 21:00:03,300 [INFO] eduardo.transfer_eval: Thinking mode FORCED: assume_thinking=True (--assume-thinking yes)",
+            "2026-11-21 21:00:04,350 [INFO] eduardo.transfer_eval: Round 1: teacher turn for 20 conversations",
+            "2026-11-21 21:05:00,400 [INFO] eduardo.transfer_eval: Rollout of 20 conversations took 298.0s",
+            "2026-11-21 21:05:01,500 [INFO] eduardo.transfer_eval: Scoring 20 conversations: 16 student final attempts x 2",
+            "2026-11-21 21:06:00,600 [WARNING] eduardo.metrics.judge_quality: Failed to parse judge response, defaulting to REJECT: Scoring RAW_JUDGE_RESPONSE_SHOULD_NOT_APPEAR",
+            "2026-11-21 21:06:01,700 [WARNING] eduardo.transfer_eval: Scoring RAW_TRANSFER_WARNING_SHOULD_NOT_APPEAR",
+            "2026-11-21 21:06:02,800 [ERROR] eduardo.transfer_eval: 70% of teacher turns strip to NOTHING Thinking mode AUTO: RAW_ERROR_SHOULD_NOT_APPEAR",
+            "2026-11-21 21:10:00,900 [INFO] eduardo.transfer_eval: Scoring took 300.0s",
+            "=" * 72,
+            "Model:                        /workspace/models/Qwen3.5-4B",
+            "DELTA_TRANSFER:             +0.1000 +/- 0.0200",
+            "=" * 72,
+            "Results written to: /tmp/out/transfer_eval_test.json",
+        ])
+        safe_lines = s.extract_safe_eval_log_lines(fake_log)
+        safe_status_lines = s.extract_safe_eval_log_lines(fake_log, include_rounds=True)
+        excerpt = s.format_eval_log_excerpt(fake_log)
+        for forbidden in (
+            "RAW_JUDGE_RESPONSE_SHOULD_NOT_APPEAR",
+            "RAW_TRANSFER_WARNING_SHOULD_NOT_APPEAR",
+            "RAW_ERROR_SHOULD_NOT_APPEAR",
+            "[WARNING]",
+            "[ERROR]",
+            "Loaded 20 rows",
+        ):
+            self.assertNotIn(forbidden, "\n".join(safe_lines))
+            self.assertNotIn(forbidden, "\n".join(safe_status_lines))
+            self.assertNotIn(forbidden, excerpt)
+        self.assertEqual(len(safe_lines), 6)
+        self.assertEqual(len(safe_status_lines), 7)
+        self.assertNotIn("Round 1:", excerpt)
+        self.assertIn("Thinking mode AUTO:", excerpt)
+        self.assertIn("Thinking mode FORCED:", excerpt)
+        self.assertIn("Rollout of 20 conversations took 298.0s", excerpt)
+        self.assertIn("Scoring 20 conversations:", excerpt)
+        self.assertIn("Scoring took 300.0s", excerpt)
+        self.assertIn("Results written to: /tmp/out/transfer_eval_test.json", excerpt)
+        self.assertIn("DELTA_TRANSFER:             +0.1000 +/- 0.0200", excerpt)
+
 
 if __name__ == "__main__":
     unittest.main()
