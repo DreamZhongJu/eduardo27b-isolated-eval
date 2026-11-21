@@ -11,7 +11,7 @@ sys.path.insert(0, str(HERE))
 import pro5000_config as pcfg
 from pro5000_trainer_entry import bound_trainer, verify_model_extra_checkpoint
 from serving_proxy import ProxyGroup, merge_busy_seconds, summarize_proxy_window
-from stage2_pilot import build_trainer_env, make_ray_tmp
+from stage2_pilot import build_trainer_env, make_ray_tmp, verify_model_dir
 
 
 class Stage2PilotTest(unittest.TestCase):
@@ -221,6 +221,31 @@ class Stage2PilotTest(unittest.TestCase):
         self.assertEqual(t.formal_queue_end, end_ns)
         self.assertLessEqual(t.formal_queue_start, t.formal_queue_end)
         self.assertEqual(t.formal_phase_windows['gen'], [(10.0, 20.0)])
+
+    def test_verify_model_dir_symlink_and_missing_shard(self):
+        with tempfile.TemporaryDirectory() as td:
+            shm = Path(td) / 'shm' / 'Qwen3.6-27B'
+            shm.mkdir(parents=True)
+            (shm / 'config.json').write_text('{"model_type":"qwen3"}')
+            (shm / 'model-00001-of-00002.safetensors').write_bytes(b'shard1')
+            (shm / 'model-00002-of-00002.safetensors').write_bytes(b'shard2')
+            (shm / 'model.safetensors.index.json').write_text(
+                json.dumps({'weight_map': {'a': 'model-00001-of-00002.safetensors', 'b': 'model-00002-of-00002.safetensors'}})
+            )
+            link = Path(td) / 'models' / 'Qwen3.6-27B'
+            link.parent.mkdir(parents=True)
+            link.symlink_to(shm)
+
+            self.assertEqual(verify_model_dir('Judge', link), link)
+
+            (shm / 'model-00002-of-00002.safetensors').unlink()
+            with self.assertRaises(RuntimeError):
+                verify_model_dir('Judge', link)
+
+            import shutil as _shutil
+            _shutil.rmtree(shm)
+            with self.assertRaises(RuntimeError):
+                verify_model_dir('Judge', link)
 
 
 if __name__ == '__main__':

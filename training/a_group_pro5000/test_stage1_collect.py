@@ -58,6 +58,25 @@ class Stage1CollectTest(unittest.TestCase):
             )
             self.assertEqual(found, m27)
 
+    def test_find_local_model_follows_symlinks(self):
+        with tempfile.TemporaryDirectory() as td:
+            shm = Path(td) / 'shm'
+            target = shm / 'Qwen3.6-27B'
+            target.mkdir(parents=True)
+            (target / 'config.json').write_text('{}')
+            (target / 'model-00001-of-00001.safetensors').write_text('x')
+
+            models = Path(td) / 'models'
+            nested = models / 'Qwen'
+            nested.mkdir(parents=True)
+            link = nested / 'Qwen3.6-27B'
+            link.symlink_to(target)
+
+            found = stage1_collect.find_local_model(
+                models, models / 'Qwen3.6-27B', ('qwen3.6-27b', '27b')
+            )
+            self.assertEqual(found, link)
+
 
 if __name__ == '__main__':
     unittest.main()

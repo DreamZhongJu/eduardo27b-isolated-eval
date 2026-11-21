@@ -428,12 +428,27 @@ def find_local_model(models_root: Path, preferred: Path, keywords: tuple[str, ..
     if not models_root.is_dir():
         return preferred
     candidates = []
-    for cfg in sorted(models_root.rglob('config.json')):
-        if not any(cfg.parent.glob('*.safetensors')):
+    seen_dirs: set[tuple[int, int]] = set()
+    for root, dirs, files in os.walk(models_root, followlinks=True):
+        try:
+            st = os.stat(root)
+        except OSError:
+            dirs[:] = []
             continue
-        rel = str(cfg.parent.relative_to(models_root)).lower()
+        key = (st.st_dev, st.st_ino)
+        if key in seen_dirs:
+            dirs[:] = []
+            continue
+        seen_dirs.add(key)
+        dirs.sort()
+        if 'config.json' not in files:
+            continue
+        folder = Path(root)
+        if not any(f.endswith('.safetensors') and (folder / f).is_file() for f in files):
+            continue
+        rel = str(folder.relative_to(models_root)).lower()
         if any(kw.lower() in rel for kw in keywords):
-            candidates.append(cfg.parent)
+            candidates.append(folder)
     return candidates[0] if candidates else preferred
 
 

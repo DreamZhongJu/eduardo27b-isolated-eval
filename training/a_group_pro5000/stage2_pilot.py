@@ -101,6 +101,34 @@ def ensure_eduardo_repo(base: Path) -> Path:
     return repo
 
 
+def verify_model_dir(label: str, model_dir: Path) -> Path:
+    """Verify model dir (including symlink targets and sharded safetensors) exists and is non-empty."""
+    if model_dir.is_symlink() and not model_dir.exists():
+        raise RuntimeError(f'{label} 模型软链接失效（目标不存在，可能节点重启过 /dev/shm）: {model_dir}')
+    if not model_dir.is_dir():
+        raise RuntimeError(f'缺少 {label} 模型目录: {model_dir}')
+    resolved = model_dir.resolve(strict=True)
+    cfg = resolved / 'config.json'
+    if not cfg.is_file() or cfg.stat().st_size <= 0:
+        raise RuntimeError(f'{label} 模型缺少或空 config.json: {model_dir}')
+    for root, dirs, files in os.walk(resolved):
+        for name in (*dirs, *files):
+            p = Path(root) / name
+            if p.is_symlink() and not p.exists():
+                raise RuntimeError(f'{label} 模型包含失效软链接: {p}')
+    shards = [p for p in resolved.glob('*.safetensors') if p.is_file() and p.stat().st_size > 0]
+    if not shards:
+        raise RuntimeError(f'{label} 模型缺少有效 *.safetensors 权重文件: {model_dir}')
+    idx_file = resolved / 'model.safetensors.index.json'
+    if idx_file.is_file():
+        weight_map = json.loads(idx_file.read_text(encoding='utf-8')).get('weight_map', {})
+        for shard_name in sorted(set(weight_map.values())):
+            sp = resolved / shard_name
+            if not sp.is_file() or sp.stat().st_size <= 0:
+                raise RuntimeError(f'{label} 模型分片缺失或无效: {sp}')
+    return model_dir
+
+
 def verify_stage1_prereqs(base: Path, tutor_model: Path):
     import hashlib
 
@@ -110,8 +138,7 @@ def verify_stage1_prereqs(base: Path, tutor_model: Path):
     data = json.loads(receipt.read_text(encoding='utf-8'))
     if not data.get('accepted') or data.get('fast_kernel_verified') is not True:
         raise RuntimeError('阶段 1 等价回执未通过')
-    if not (tutor_model / 'config.json').is_file():
-        raise RuntimeError(f'缺少 Tutor 模型 {tutor_model}')
+    verify_model_dir('Tutor', tutor_model)
     for fname, expected_sha in PARQUET_SHA256.items():
         fpath = base / 'data' / 'author_prepared' / fname
         if not fpath.is_file():
@@ -446,10 +473,19 @@ def main() -> int:
     ckpt_dir.mkdir(mode=0o700, exist_ok=True)
 
     models_root = base / 'models'
-    student_model = find_local_model(
-        models_root, models_root / 'Meta-Llama-3.1-8B-Instruct', ('llama-3.1-8b', '8b-instruct')
+    if models_root.is_dir():
+        for entry in sorted(models_root.iterdir()):
+            if entry.is_symlink() and not entry.exists():
+                raise RuntimeError(f'models 目录下存在失效软链接（可能节点重启过 /dev/shm）: {entry}')
+    student_model = verify_model_dir(
+        'Student',
+        find_local_model(models_root, models_root / 'Meta-Llama-3.1-8B-Instruct', ('llama-3.1-8b', '8b-instruct')),
     )
-    judge_model = find_local_model(models_root, models_root / 'Qwen3.6-27B', ('qwen3.6-27b', '27b'))
+    judge_model = verify_model_dir(
+        'Judge',
+        find_local_model(models_root, models_root / 'Qwen3.6-27B', ('qwen3.6-27b', '27b')),
+    )
+    print(f'[preflight] 模型就绪: student={student_model} -> {student_model.resolve()} ; judge={judge_model} -> {judge_model.resolve()}', flush=True)
 
     ports = pick_free_ports([18861, 18862, 18871, 18872, 18873])
     s_lb_port, j_proxy_port, s0_port, s1_port, j_port = ports
