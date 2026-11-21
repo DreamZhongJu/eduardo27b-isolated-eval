@@ -190,11 +190,12 @@ def bound_trainer(native):
             return result
 
         def _get_gen_batch(self, batch):
-            self.formal_validation = False
-            self.formal_queue_start = time.monotonic_ns()
-            self.formal_step_wall = time.time()
-            self.formal_phase_windows = {phase: [] for phase in PHASES}
-            self.formal_vote_snap = self.formal_monitor.begin()
+            # _validate() also builds gen batches via _get_gen_batch; never clobber training step state during validation.
+            if not self.formal_validation:
+                self.formal_queue_start = time.monotonic_ns()
+                self.formal_step_wall = time.time()
+                self.formal_phase_windows = {phase: [] for phase in PHASES}
+                self.formal_vote_snap = self.formal_monitor.begin()
             return super()._get_gen_batch(batch)
 
         def _update_actor(self, batch):

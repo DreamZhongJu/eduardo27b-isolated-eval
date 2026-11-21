@@ -260,6 +260,16 @@ def build_trainer_env(
     return out
 
 
+def terminate_pg(pgid: int):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        if sig == signal.SIGTERM:
+            time.sleep(2)
+
+
 def terminate_procs(procs: list[tuple[str, subprocess.Popen]]):
     for _, proc in reversed(procs):
         if proc.poll() is None:
@@ -575,6 +585,7 @@ def main() -> int:
             *overrides_a,
         ]
         log_a = (work / 'trainer_phaseA.log').open('xb')
+        proc_a = None
         try:
             proc_a = subprocess.Popen(
                 cmd_a, env=dict(env_base, **trainer_env(raytmp_a, 0, 2, 2)),
@@ -583,8 +594,11 @@ def main() -> int:
             )
         finally:
             log_a.close()
-        rc_a = proc_a.wait()
-        shutil.rmtree(raytmp_a, ignore_errors=True)
+        try:
+            rc_a = proc_a.wait()
+        finally:
+            terminate_pg(proc_a.pid)
+            shutil.rmtree(raytmp_a, ignore_errors=True)
         if rc_a != 0:
             raise RuntimeError(f'阶段 2 前两步训练退出异常 rc={rc_a}')
 
@@ -619,6 +633,7 @@ def main() -> int:
                 *overrides_b,
             ]
             log_b = (work / 'trainer_phaseB.log').open('xb')
+            proc_b = None
             try:
                 proc_b = subprocess.Popen(
                     cmd_b, env=dict(env_base, **env_b),
@@ -629,6 +644,8 @@ def main() -> int:
                 log_b.close()
             rc_b = proc_b.wait()
         finally:
+            if 'proc_b' in locals() and proc_b is not None:
+                terminate_pg(proc_b.pid)
             shutil.rmtree(raytmp_b, ignore_errors=True)
         if rc_b != 0:
             raise RuntimeError(f'阶段 2 第 3 步续训退出异常 rc={rc_b}')

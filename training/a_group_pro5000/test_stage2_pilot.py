@@ -9,7 +9,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import pro5000_config as pcfg
-from pro5000_trainer_entry import verify_model_extra_checkpoint
+from pro5000_trainer_entry import bound_trainer, verify_model_extra_checkpoint
 from serving_proxy import ProxyGroup, merge_busy_seconds, summarize_proxy_window
 from stage2_pilot import build_trainer_env, make_ray_tmp
 
@@ -176,6 +176,51 @@ class Stage2PilotTest(unittest.TestCase):
         ):
             self.assertIn(key, env)
         self.assertEqual(env['PRO5000_TOTAL_STEPS'], '2')
+
+    def test_validate_does_not_clobber_step_queue_window(self):
+        class FakeMonitor:
+            def begin(self):
+                return 'snap'
+
+            def end(self, snap, enforce=True):
+                return {'requests': 1, 'parse': 0, 'recovery': 0}
+
+        class FakeLoader:
+            def state_dict(self):
+                return {'_num_yielded': 2}
+
+        class DummyBase:
+            def _get_gen_batch(self, batch):
+                return batch
+
+            def _update_actor(self, batch):
+                return 'updated'
+
+            def _validate(self, merged=False):
+                self._get_gen_batch('val_batch')
+                self.saw_validation_flag = self.formal_validation
+                return {'val': 1}
+
+        Trainer = bound_trainer(DummyBase)
+        t = Trainer()
+        t.global_steps = 2
+        t.train_dataloader = FakeLoader()
+        t.formal_monitor = FakeMonitor()
+        t.formal_validation = False
+
+        t._get_gen_batch('train_batch')
+        start_ns = t.formal_queue_start
+        t.formal_phase_windows['gen'].append((10.0, 20.0))
+        t._update_actor('train_batch')
+        end_ns = t.formal_queue_end
+
+        t._validate()
+        self.assertTrue(t.saw_validation_flag)
+        self.assertFalse(t.formal_validation)
+        self.assertEqual(t.formal_queue_start, start_ns)
+        self.assertEqual(t.formal_queue_end, end_ns)
+        self.assertLessEqual(t.formal_queue_start, t.formal_queue_end)
+        self.assertEqual(t.formal_phase_windows['gen'], [(10.0, 20.0)])
 
 
 if __name__ == '__main__':
