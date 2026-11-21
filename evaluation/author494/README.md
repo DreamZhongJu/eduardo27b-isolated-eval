@@ -6,7 +6,8 @@
 
 - `preflight_author494.sh`：只读预检（不占卡、不调 Agnes），检查卡和进程归属、端口、磁盘、作者上游 `e8c89b7` 文件 SHA-256、包版本、Qwen3.5-4B 与 Llama-3.1-8B-Instruct 的 SHA-256、官方数据集 SHA-256 与环境变量状态。
 - `agnes_ping_author494.py`：用 1 条完全合成的假对话走作者 `make_judge_client` 路径调 1 次 Agnes，只打印 HTTP 状态、返回模型名和是否解析成作者要求的 JSON。
-- `run_base_author494.sh`：先离线通过未改动的 `eduardo.process_dataset` 物化并校验 494 行 `test.parquet`；检查选定的 4 张空闲整卡，启动 3 卡 DP=3 学生 `vllm serve`（参数按 `launch_student_server.sh`），每 60 秒记录 4 张卡的进程归属，在 1 张卡上跑作者 `eval/run_env_test_eval.py`，结束时仅清理本任务启动的进程。支持 `--status <output_dir>` 只读看进度。
+- `wait_gpus_author494.py`：只读 4 卡等卡器（等待期间不占显存、不动他人进程），每 60 秒轮询 `nvidia-smi`，连续两次间隔 5 秒确认 4 张空闲整卡（`>= 78000 MiB`、`util=0`、0 进程）且端口空闲后返回。
+- `run_base_author494.sh`：先离线通过未改动的 `eduardo.process_dataset` 物化并校验 494 行 `test.parquet`；支持 `--auto-wait` 自动等满 4 张空闲整卡或手动传 `--tutor-gpu`/`--student-gpus`；启动 3 卡 DP=3 学生 `vllm serve`（参数按 `launch_student_server.sh`），每 60 秒记录 4 张卡的进程归属，在 1 张卡上跑作者 `eval/run_env_test_eval.py`，结束时仅清理本任务启动的进程。支持 `--status <output_dir>` 只读看等待/运行进度。
 - `summarize_author494.py`：严格校验结果 JSON 结构，复算作者汇总指标并核对一致；分开统计 Agnes 重试耗尽技术失败票与解析失败票，若技术失败票 > 1% 则将泄题率/教学门槛/Ped./Fact. 标为“不可用”；按题做 10,000 次 bootstrap（种子 42）；按事先定好的 3 档规则给出对照结论；不打印任何题号、题面、答案、对话或裁判理由。
 - `test_summarize_author494.py`：标准库 `unittest` 测试（纯假数据）。
 

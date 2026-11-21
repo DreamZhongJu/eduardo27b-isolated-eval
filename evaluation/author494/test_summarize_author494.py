@@ -17,6 +17,7 @@ if str(HERE) not in sys.path:
 
 import summarize_author494 as s  # noqa: E402
 import agnes_ping_author494 as ping  # noqa: E402
+import wait_gpus_author494 as wg  # noqa: E402
 
 
 def _find_author_repo() -> Path:
@@ -309,6 +310,54 @@ class TestSummarizeAuthor494(unittest.TestCase):
         self.assertIn("Scoring took 300.0s", excerpt)
         self.assertIn("Results written to: /tmp/out/transfer_eval_test.json", excerpt)
         self.assertIn("DELTA_TRANSFER:             +0.1000 +/- 0.0200", excerpt)
+
+    def test_wait_for_four_gpus_rejects_busy_and_confirms_two_snapshots(self):
+        busy_csv = "\n".join([
+            "0, GPU-0, 35000, 81920, 70",
+            "1, GPU-1, 80000, 81920, 0",
+            "2, GPU-2, 80000, 81920, 0",
+            "3, GPU-3, 80000, 81920, 0",
+            "4, GPU-4, 80000, 81920, 15",  # util != 0 -> not eligible
+        ])
+        flaky_csv = "\n".join([
+            "0, GPU-0, 80000, 81920, 0",
+            "1, GPU-1, 80000, 81920, 0",
+            "2, GPU-2, 80000, 81920, 0",
+            "3, GPU-3, 80000, 81920, 0",
+            "4, GPU-4, 80000, 81920, 0",
+        ])
+        # Second snapshot loses GPU-0 and GPU-1 to apps, so only 3 confirmed -> must keep waiting.
+        apps_snap2 = "GPU-0, 12345, 5000\nGPU-1, 12346, 5000\n"
+        ready_csv = "\n".join([
+            "0, GPU-0, 35000, 81920, 50",
+            "1, GPU-1, 80000, 81920, 0",
+            "2, GPU-2, 80000, 81920, 0",
+            "3, GPU-3, 80000, 81920, 0",
+            "4, GPU-4, 80000, 81920, 0",
+        ])
+        snaps = iter([
+            wg.parse_gpu_csv(busy_csv, ""),
+            wg.parse_gpu_csv(flaky_csv, ""),
+            wg.parse_gpu_csv(flaky_csv, apps_snap2),
+            wg.parse_gpu_csv(ready_csv, ""),
+            wg.parse_gpu_csv(ready_csv, ""),
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            st_file = Path(tmpdir) / "wait_status.json"
+            lg_file = Path(tmpdir) / "wait.log"
+            tutor, students = wg.wait_for_four_gpus(
+                status_path=st_file,
+                log_path=lg_file,
+                port=18961,
+                snapshot_fn=lambda: next(snaps),
+                port_fn=lambda _p: True,
+                sleep_fn=lambda _s: None,
+            )
+            self.assertEqual(tutor, 1)
+            self.assertEqual(students, [2, 3, 4])
+            status_doc = json.loads(st_file.read_text(encoding="utf-8"))
+            self.assertEqual(status_doc["state"], "ACQUIRED")
+            self.assertEqual(status_doc["polls"], 3)
 
 
 if __name__ == "__main__":

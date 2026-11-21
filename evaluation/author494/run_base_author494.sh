@@ -6,9 +6,10 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  run_base_author494.sh --tutor-gpu <id> --student-gpus <id1,id2,id3> \
+  run_base_author494.sh (--tutor-gpu <id> --student-gpus <id1,id2,id3> | --auto-wait) \
     --output-dir <new_dir> [--num-problems 20|-1] [--student-port 18961] \
-    [--tag base_qwen35_4b_author494] [--agnes-api-base https://api.agnes-ai.cn/v1] \
+    [--poll-seconds 60] [--tag base_qwen35_4b_author494] \
+    [--agnes-api-base https://api.agnes-ai.cn/v1] \
     [--agnes-model agnes-3.0-flash] [--agnes-key-env AGNES_API_KEY] \
     [--test-parquet <path>] [--prepare-only]
 
@@ -27,6 +28,14 @@ if [ "${1:-}" = "--status" ]; then
     fi
   else
     echo "runner_pid=MISSING"
+  fi
+  if [ -f "${OUT_DIR}/wait_status.json" ]; then
+    python3 -B - "${OUT_DIR}/wait_status.json" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"wait_state={d.get('state')} polls={d.get('polls')} eligible={d.get('eligible_gpus', d.get('selected_gpus'))} updated_at={d.get('updated_at')}")
+PY
   fi
   if [ -f "${OUT_DIR}/eval_run.log" ]; then
     HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,6 +72,8 @@ TEST_PARQUET="${ROOT}/data/author494_eval/test.parquet"
 
 TUTOR_GPU=""
 STUDENT_GPUS=""
+AUTO_WAIT="0"
+POLL_SECONDS="60"
 OUTPUT_DIR=""
 NUM_PROBLEMS="-1"
 STUDENT_PORT="18961"
@@ -76,6 +87,8 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --tutor-gpu) TUTOR_GPU="$2"; shift 2 ;;
     --student-gpus) STUDENT_GPUS="$2"; shift 2 ;;
+    --auto-wait) AUTO_WAIT="1"; shift ;;
+    --poll-seconds) POLL_SECONDS="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --num-problems) NUM_PROBLEMS="$2"; shift 2 ;;
     --student-port) STUDENT_PORT="$2"; shift 2 ;;
@@ -145,9 +158,18 @@ if [ "${PREPARE_ONLY}" = "1" ]; then
   exit 0
 fi
 
-if [ -z "${TUTOR_GPU}" ] || [ -z "${STUDENT_GPUS}" ] || [ -z "${OUTPUT_DIR}" ]; then
-  echo "ERROR: --tutor-gpu, --student-gpus, and --output-dir are required" >&2
+if [ -z "${OUTPUT_DIR}" ]; then
+  echo "ERROR: --output-dir is required" >&2
   usage
+  exit 2
+fi
+if [ "${AUTO_WAIT}" = "0" ] && { [ -z "${TUTOR_GPU}" ] || [ -z "${STUDENT_GPUS}" ]; }; then
+  echo "ERROR: provide --auto-wait OR both --tutor-gpu and --student-gpus" >&2
+  usage
+  exit 2
+fi
+if [ "${AUTO_WAIT}" = "1" ] && { [ -n "${TUTOR_GPU}" ] || [ -n "${STUDENT_GPUS}" ]; }; then
+  echo "ERROR: --auto-wait cannot be combined with --tutor-gpu/--student-gpus" >&2
   exit 2
 fi
 if [ -n "${GEMINI_API_KEY:-}" ]; then
@@ -165,8 +187,24 @@ fi
 mkdir -p "${OUTPUT_DIR}"
 echo "$$" > "${OUTPUT_DIR}/runner.pid"
 
-# Validate 4 distinct free GPUs (>= 78000 MiB free, 0 compute apps) and free port.
-"${PYTHON_BIN}" -B - "${TUTOR_GPU}" "${STUDENT_GPUS}" "${STUDENT_PORT}" "${OUTPUT_DIR}/gpu_preflight.log" <<'PY'
+HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+while true; do
+  if [ "${AUTO_WAIT}" = "1" ]; then
+    echo "[author494] Waiting for 4 idle GPUs (>=78000 MiB free, util=0, 0 compute apps)..."
+    READ_GPUS="$("${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" \
+      --status-file "${OUTPUT_DIR}/wait_status.json" \
+      --log-file "${OUTPUT_DIR}/wait.log" \
+      --port "${STUDENT_PORT}" \
+      --min-free-mib 78000 \
+      --poll-seconds "${POLL_SECONDS}")"
+    TUTOR_GPU="${READ_GPUS%% *}"
+    STUDENT_GPUS="${READ_GPUS#* }"
+  fi
+
+  # Validate 4 distinct free GPUs (>= 78000 MiB free, 0 compute apps) and free port.
+  set +e
+  "${PYTHON_BIN}" -B - "${TUTOR_GPU}" "${STUDENT_GPUS}" "${STUDENT_PORT}" "${OUTPUT_DIR}/gpu_preflight.log" <<'PY'
 import socket, subprocess, sys
 from pathlib import Path
 
@@ -222,6 +260,18 @@ for idx in selected:
         raise SystemExit(f"ERROR: GPU {idx} has active compute processes: {busy[idx]}")
 print(f"[author494] preflight GPUs OK: tutor={tutor_gpu} student={student_gpus} port={port}")
 PY
+  PRE_RC=$?
+  set -e
+  if [ "${PRE_RC}" = "0" ]; then
+    break
+  fi
+  if [ "${AUTO_WAIT}" = "1" ]; then
+    echo "[author494] GPU check raced right before launch; returning to wait loop..."
+    sleep "${POLL_SECONDS}"
+    continue
+  fi
+  exit "${PRE_RC}"
+done
 
 # Ephemeral loopback serving token (never logged or printed).
 SERVING_API_KEY="$("${PYTHON_BIN}" -c 'import secrets; print(secrets.token_urlsafe(32))')"
