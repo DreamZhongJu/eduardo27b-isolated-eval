@@ -175,13 +175,14 @@ def affinity_count():
 class Sampler:
     """Write a new numeric JSONL file. Does not allocate GPUs or read task payloads."""
 
-    def __init__(self, path, tutor_gpus, task_roots, interval=10):
+    def __init__(self, path, tutor_gpus, task_roots, interval=10, append=False):
         if not numeric(interval) or interval <= 0:
             raise ValueError('采样间隔不合法')
         self.path = Path(path)
         self.gpus = tutor_gpus
         self.roots = task_roots
         self.interval = interval
+        self.append = append
         self.stop_event = threading.Event()
         self.thread = None
         self.failed = False
@@ -190,7 +191,7 @@ class Sampler:
     def start(self):
         if self.thread is not None:
             raise RuntimeError('采样器已启动')
-        destination = self.path.open('x', encoding='utf-8')
+        destination = self.path.open('a' if self.append else 'x', encoding='utf-8')
         self.thread = threading.Thread(target=self._run, args=(destination,), daemon=True)
         try:
             self.thread.start()

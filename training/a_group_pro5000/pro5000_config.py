@@ -27,6 +27,7 @@ def build_overrides(
     optimizer_offload: bool = True,
     student_concurrency: int = 32,
     judge_concurrency: int = 16,
+    max_actor_ckpt_to_keep: int | None = None,
     resume_step: int | None = None,
 ) -> list[str]:
     data_dir = base / 'data' / 'author_prepared'
@@ -66,7 +67,7 @@ def build_overrides(
         f'trainer.save_freq={save_freq}',
         f'trainer.test_freq={test_freq}',
         'trainer.val_before_train=false',
-        'trainer.max_actor_ckpt_to_keep=null',
+        f'trainer.max_actor_ckpt_to_keep={"null" if max_actor_ckpt_to_keep is None else max_actor_ckpt_to_keep}',
         'trainer.del_local_ckpt_after_load=false',
         f'trainer.default_local_dir={ckpt_dir}',
         'trainer.logger=[console]',
@@ -114,6 +115,7 @@ def pin_composed(
     optimizer_offload: bool = True,
     student_concurrency: int = 32,
     judge_concurrency: int = 16,
+    max_actor_ckpt_to_keep: int | None = None,
     resume_step: int | None = None,
 ):
     trainer = config['trainer']
@@ -132,7 +134,7 @@ def pin_composed(
         'logger': ['console'],
         'nnodes': 1,
         'n_gpus_per_node': tutor_gpus,
-        'max_actor_ckpt_to_keep': None,
+        'max_actor_ckpt_to_keep': max_actor_ckpt_to_keep,
         'del_local_ckpt_after_load': False,
         'default_local_dir': str(ckpt_dir),
         'resume_mode': 'disable' if resume_step is None else 'resume_path',
@@ -228,7 +230,7 @@ def run_preflight(
         WORK_DIR=str(work),
         EDUARDO_RECIPE_DIR=str(repo / 'eduardo'),
         MODEL_PATH=str(tutor_model),
-        EXPERIMENT='pro5000-stage2',
+        EXPERIMENT=check_env.get('EXPERIMENT', 'pro5000-stage2'),
         SERVING_API_KEY='preflight-placeholder',
         STUDENT_API_BASE=student_api_base,
         JUDGE_API_BASE=judge_api_base,
