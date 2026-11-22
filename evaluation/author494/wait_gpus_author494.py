@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only 4-GPU idle waiter for A100 author-494 evaluation.
+"""Read-only 4-GPU idle waiter and Tutor-GPU handoff holder for A100 author-494 eval.
 
 Polls nvidia-smi without touching any GPU memory or other users' processes.
 Requires 4 GPUs each with >= min_free_mib free, util == 0, and 0 compute apps
@@ -9,7 +9,10 @@ across two snapshots separated by confirm_seconds.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -77,7 +80,7 @@ def select_confirmed_four(
     eligible: list[int] = []
     for idx in sorted(by_idx2):
         g1 = by_idx1.get(idx)
-        g2 = by_idx2[idx]
+        g2 = by_idx2.get(idx)
         if g1 is None or g1["uuid"] != g2["uuid"]:
             continue
         if is_gpu_eligible(g1, min_free_mib) and is_gpu_eligible(g2, min_free_mib):
@@ -85,6 +88,28 @@ def select_confirmed_four(
     if len(eligible) < 4:
         return None
     return eligible[:4]
+
+
+def find_replacement_tutor(
+    snap1: list[dict[str, Any]],
+    snap2: list[dict[str, Any]],
+    *,
+    exclude: set[int],
+    min_free_mib: int = 78000,
+) -> int | None:
+    """Return one idle GPU index not in exclude that is eligible in both snapshots."""
+    by_idx1 = {g["index"]: g for g in snap1}
+    by_idx2 = {g["index"]: g for g in snap2}
+    for idx in sorted(by_idx2):
+        if idx in exclude:
+            continue
+        g1 = by_idx1.get(idx)
+        g2 = by_idx2.get(idx)
+        if g1 is None or g1["uuid"] != g2["uuid"]:
+            continue
+        if is_gpu_eligible(g1, min_free_mib) and is_gpu_eligible(g2, min_free_mib):
+            return idx
+    return None
 
 
 def snapshot_nvidia_smi() -> list[dict[str, Any]]:
@@ -194,15 +219,72 @@ def wait_for_four_gpus(
         sleep_fn(poll_seconds)
 
 
+def _set_pdeathsig() -> None:
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def hold_tutor_gpu(min_free_mib: int = 78000) -> int:
+    """Hold the visible CUDA device 0 during student startup to prevent GPU race."""
+    _set_pdeathsig()
+    import torch
+
+    torch.cuda.init()
+    free, _total = torch.cuda.mem_get_info(0)
+    mib = 1024 * 1024
+    if free < min_free_mib * mib:
+        print(f"HOLD_FAILED free_mib={free // mib}", flush=True)
+        return 2
+    amount = min(free - 2048 * mib, 72 * 1024 * mib)
+    _buf = torch.empty(amount, dtype=torch.uint8, device="cuda:0")
+    torch.cuda.synchronize()
+    print(f"RESERVED mib={int(torch.cuda.memory_allocated(0)) // mib}", flush=True)
+
+    stop = False
+
+    def _on_sig(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, _on_sig)
+    signal.signal(signal.SIGINT, _on_sig)
+    while not stop:
+        time.sleep(0.5)
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Wait for 4 idle A100 GPUs (read-only).")
-    ap.add_argument("--status-file", required=True, type=Path)
-    ap.add_argument("--log-file", required=True, type=Path)
+    ap = argparse.ArgumentParser(description="Wait for 4 idle A100 GPUs (read-only) or hold Tutor GPU.")
+    ap.add_argument("--hold", action="store_true", help="Hold CUDA_VISIBLE_DEVICES=0 until SIGTERM")
+    ap.add_argument("--find-replacement", action="store_true", help="Find one idle GPU not in --exclude")
+    ap.add_argument("--exclude", default="", help="Comma-separated GPU indices to exclude")
+    ap.add_argument("--status-file", type=Path, default=None)
+    ap.add_argument("--log-file", type=Path, default=None)
     ap.add_argument("--port", type=int, default=18961)
     ap.add_argument("--min-free-mib", type=int, default=78000)
     ap.add_argument("--poll-seconds", type=int, default=60)
     ap.add_argument("--confirm-seconds", type=int, default=5)
     args = ap.parse_args()
+
+    if args.hold:
+        return hold_tutor_gpu(min_free_mib=args.min_free_mib)
+
+    if args.find_replacement:
+        exclude = {int(x) for x in args.exclude.split(",") if x.strip()}
+        snap1 = snapshot_nvidia_smi()
+        time.sleep(args.confirm_seconds)
+        snap2 = snapshot_nvidia_smi()
+        rep = find_replacement_tutor(snap1, snap2, exclude=exclude, min_free_mib=args.min_free_mib)
+        if rep is None:
+            return 1
+        print(rep)
+        return 0
+
+    if args.status_file is None or args.log_file is None:
+        ap.error("--status-file and --log-file are required when waiting")
 
     tutor_gpu, student_gpus = wait_for_four_gpus(
         status_path=args.status_file,

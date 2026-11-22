@@ -161,6 +161,30 @@ def format_eval_log_excerpt(text: str) -> str:
     return "\n".join(parts)
 
 
+_TRACEBACK_FRAME_RE = re.compile(r'^\s+File ".*", line \d+, in ')
+_EXC_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|SystemExit)\b")
+
+
+def extract_safe_failure_summary(text: str, *, max_frames: int = 20) -> str:
+    """Extract sanitized traceback frames and exception class on non-zero exit.
+
+    Never emits WARNING lines, prompt text, or structured/long quoted payloads.
+    """
+    frames: list[str] = []
+    excs: list[str] = []
+    for line in text.splitlines():
+        if "[WARNING]" in line:
+            continue
+        if _TRACEBACK_FRAME_RE.match(line):
+            frames.append(line.strip())
+        elif _EXC_LINE_RE.match(line):
+            safe = re.sub(r"\{.*\}|\[.*\]", "<STRUCT>", line)
+            safe = re.sub(r"(['\"])(?:\\.|(?!\1).){25,}\1", "<TEXT>", safe)
+            excs.append(safe[:160])
+    out = frames[-max_frames:] + excs[-5:]
+    return "\n".join(out)
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 

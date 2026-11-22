@@ -55,8 +55,8 @@ PY
     echo "eval_run.log: not found"
   fi
   if [ -f "${OUT_DIR}/gpu_watch.log" ]; then
-    ALERTS=$(grep -c "FOREIGN_PID_ALERT" "${OUT_DIR}/gpu_watch.log" || true)
-    echo "gpu_watch_foreign_alerts=${ALERTS}"
+    ALERTS=$(grep -c "NEW_HOST_PID_ALERT" "${OUT_DIR}/gpu_watch.log" || true)
+    echo "gpu_watch_new_host_pid_alerts=${ALERTS}"
   fi
   exit 0
 fi
@@ -279,13 +279,15 @@ export SERVING_API_KEY
 STUDENT_SERVED_NAME="Llama-3.1-8B-Instruct-${USER}-author494"
 
 STUDENT_PID=""
+HOLDER_PID=""
 MONITOR_PID=""
 
-cleanup() {
+stop_student_and_holder() {
   set +e
-  if [ -n "${MONITOR_PID}" ] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
-    kill "${MONITOR_PID}" 2>/dev/null || true
-    wait "${MONITOR_PID}" 2>/dev/null || true
+  if [ -n "${HOLDER_PID}" ]; then
+    kill -TERM "${HOLDER_PID}" 2>/dev/null || true
+    wait "${HOLDER_PID}" 2>/dev/null || true
+    HOLDER_PID=""
   fi
   if [ -n "${STUDENT_PID}" ]; then
     # Terminate only descendants of our launched student server, never others.
@@ -327,31 +329,81 @@ for pid in reversed(pids):
         pass
 PY
     wait "${STUDENT_PID}" 2>/dev/null || true
+    STUDENT_PID=""
   fi
+}
+
+cleanup() {
+  set +e
+  if [ -n "${MONITOR_PID}" ] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
+    kill "${MONITOR_PID}" 2>/dev/null || true
+    wait "${MONITOR_PID}" 2>/dev/null || true
+  fi
+  stop_student_and_holder
 }
 trap cleanup EXIT INT TERM
 
-# Launch 3-GPU data-parallel student server matching launch_student_server.sh.
-CUDA_VISIBLE_DEVICES="${STUDENT_GPUS}" VLLM_API_KEY="${SERVING_API_KEY}" \
-  "${VLLM_BIN}" serve "${STUDENT_MODEL}" \
-  --host 127.0.0.1 \
-  --port "${STUDENT_PORT}" \
-  --served-model-name "${STUDENT_SERVED_NAME}" \
-  --api-key "${SERVING_API_KEY}" \
-  --max-model-len 32768 \
-  --dtype bfloat16 \
-  --gpu-memory-utilization 0.9 \
-  --data-parallel-size 3 \
-  --tensor-parallel-size 1 \
-  --max-num-seqs 256 \
-  --enable-chunked-prefill \
-  --enable-prefix-caching \
-  > "${OUTPUT_DIR}/student_server.log" 2>&1 &
-STUDENT_PID=$!
-echo "${STUDENT_PID}" > "${OUTPUT_DIR}/student.pid"
+while true; do
+  # Hold TUTOR_GPU during the 3-5 min student vLLM startup so no other waiter grabs it.
+  CUDA_VISIBLE_DEVICES="${TUTOR_GPU}" "${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" \
+    --hold --min-free-mib 78000 > "${OUTPUT_DIR}/tutor_hold.log" 2>&1 &
+  HOLDER_PID=$!
 
-# Wait for student server health check (up to 600s).
-"${PYTHON_BIN}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'
+  # Verify holder successfully reserved TUTOR_GPU before launching student server.
+  if ! "${PYTHON_BIN}" -B - "${HOLDER_PID}" "${OUTPUT_DIR}/tutor_hold.log" <<'PY'; then
+import os, sys, time
+from pathlib import Path
+pid, log_p = int(sys.argv[1]), Path(sys.argv[2])
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    if log_p.is_file() and "RESERVED" in log_p.read_text(errors="replace"):
+        sys.exit(0)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        sys.exit(1)
+    time.sleep(0.5)
+sys.exit(1)
+PY
+    stop_student_and_holder
+    if [ "${AUTO_WAIT}" = "1" ]; then
+      echo "[author494] Tutor GPU ${TUTOR_GPU} could not be held; returning to wait loop..."
+      sleep "${POLL_SECONDS}"
+      READ_GPUS="$("${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" \
+        --status-file "${OUTPUT_DIR}/wait_status.json" \
+        --log-file "${OUTPUT_DIR}/wait.log" \
+        --port "${STUDENT_PORT}" \
+        --min-free-mib 78000 \
+        --poll-seconds "${POLL_SECONDS}")"
+      TUTOR_GPU="${READ_GPUS%% *}"
+      STUDENT_GPUS="${READ_GPUS#* }"
+      continue
+    fi
+    echo "ERROR: failed to reserve Tutor GPU ${TUTOR_GPU}" >&2
+    exit 1
+  fi
+
+  # Launch 3-GPU data-parallel student server matching launch_student_server.sh.
+  CUDA_VISIBLE_DEVICES="${STUDENT_GPUS}" VLLM_API_KEY="${SERVING_API_KEY}" \
+    "${VLLM_BIN}" serve "${STUDENT_MODEL}" \
+    --host 127.0.0.1 \
+    --port "${STUDENT_PORT}" \
+    --served-model-name "${STUDENT_SERVED_NAME}" \
+    --api-key "${SERVING_API_KEY}" \
+    --max-model-len 32768 \
+    --dtype bfloat16 \
+    --gpu-memory-utilization 0.9 \
+    --data-parallel-size 3 \
+    --tensor-parallel-size 1 \
+    --max-num-seqs 256 \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    > "${OUTPUT_DIR}/student_server.log" 2>&1 &
+  STUDENT_PID=$!
+  echo "${STUDENT_PID}" > "${OUTPUT_DIR}/student.pid"
+
+  # Wait for student server health check (up to 600s).
+  if ! "${PYTHON_BIN}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'; then
 import os, sys, time, urllib.request
 
 pid = int(sys.argv[1])
@@ -373,33 +425,87 @@ while time.monotonic() < deadline:
     time.sleep(5)
 raise SystemExit("ERROR: student server health check timed out after 600s")
 PY
+    stop_student_and_holder
+    if [ "${AUTO_WAIT}" = "1" ]; then
+      echo "[author494] Student server failed startup (possible GPU race); returning to wait loop..."
+      sleep "${POLL_SECONDS}"
+      READ_GPUS="$("${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" \
+        --status-file "${OUTPUT_DIR}/wait_status.json" \
+        --log-file "${OUTPUT_DIR}/wait.log" \
+        --port "${STUDENT_PORT}" \
+        --min-free-mib 78000 \
+        --poll-seconds "${POLL_SECONDS}")"
+      TUTOR_GPU="${READ_GPUS%% *}"
+      STUDENT_GPUS="${READ_GPUS#* }"
+      continue
+    fi
+    exit 1
+  fi
+
+  # Release Tutor GPU holder immediately before starting eval.run_env_test_eval.
+  kill -TERM "${HOLDER_PID}" 2>/dev/null || true
+  wait "${HOLDER_PID}" 2>/dev/null || true
+  HOLDER_PID=""
+
+  # Confirm TUTOR_GPU is clean (>=78000 MiB free, 0 compute apps); wait up to 15s for driver release.
+  if ! "${PYTHON_BIN}" -B - "${TUTOR_GPU}" <<'PY'; then
+import subprocess, sys, time
+target = int(sys.argv[1])
+for _ in range(15):
+    gpu_csv = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=index,uuid,memory.free", "--format=csv,noheader,nounits"],
+        text=True,
+    )
+    uuid_map = {}
+    free_mib = 0
+    for line in gpu_csv.strip().splitlines():
+        idx_s, uuid, free_s = [x.strip() for x in line.split(",")]
+        uuid_map[uuid] = int(idx_s)
+        if int(idx_s) == target:
+            free_mib = int(free_s)
+    apps_csv = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+        text=True,
+    ).strip()
+    has_app = any(uuid_map.get(line.split(",")[0].strip()) == target for line in apps_csv.splitlines() if line.strip())
+    if free_mib >= 78000 and not has_app:
+        sys.exit(0)
+    time.sleep(1)
+sys.exit(1)
+PY
+    REP_GPU="$("${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" --find-replacement --exclude "${STUDENT_GPUS}" --min-free-mib 78000 || true)"
+    if [ -n "${REP_GPU}" ]; then
+      echo "[author494] Tutor GPU ${TUTOR_GPU} became busy during handoff; switching to idle GPU ${REP_GPU}"
+      TUTOR_GPU="${REP_GPU}"
+    elif [ "${AUTO_WAIT}" = "1" ]; then
+      echo "[author494] Tutor GPU ${TUTOR_GPU} became busy and no replacement GPU available; returning to wait loop..."
+      stop_student_and_holder
+      sleep "${POLL_SECONDS}"
+      READ_GPUS="$("${PYTHON_BIN}" -B "${HERE_DIR}/wait_gpus_author494.py" \
+        --status-file "${OUTPUT_DIR}/wait_status.json" \
+        --log-file "${OUTPUT_DIR}/wait.log" \
+        --port "${STUDENT_PORT}" \
+        --min-free-mib 78000 \
+        --poll-seconds "${POLL_SECONDS}")"
+      TUTOR_GPU="${READ_GPUS%% *}"
+      STUDENT_GPUS="${READ_GPUS#* }"
+      continue
+    else
+      echo "ERROR: Tutor GPU ${TUTOR_GPU} is no longer free (>=78000 MiB)" >&2
+      exit 1
+    fi
+  fi
+  break
+done
 
 # Start 60-second GPU process monitor for the 4 selected GPUs.
-"${PYTHON_BIN}" -B - "$$" "${TUTOR_GPU},${STUDENT_GPUS}" "${OUTPUT_DIR}/gpu_watch.log" <<'PY' &
+# Tracks host PIDs per GPU (container /proc PIDs differ from host PIDs in nvidia-smi).
+"${PYTHON_BIN}" -B - "${TUTOR_GPU},${STUDENT_GPUS}" "${OUTPUT_DIR}/gpu_watch.log" <<'PY' &
 import subprocess, sys, time
 from pathlib import Path
 
-root_pid = int(sys.argv[1])
-watched_indices = {int(x) for x in sys.argv[2].split(",")}
-log_path = Path(sys.argv[3])
-
-def descendants(parent: int) -> set[int]:
-    children_map = {}
-    for p in Path("/proc").iterdir():
-        if not p.name.isdigit():
-            continue
-        try:
-            st = (p / "stat").read_text()
-            ppid = int(st[st.rfind(")") + 2:].split()[1])
-            children_map.setdefault(ppid, []).append(int(p.name))
-        except OSError:
-            continue
-    out, stack = set(), [parent]
-    while stack:
-        cur = stack.pop()
-        out.add(cur)
-        stack.extend(children_map.get(cur, []))
-    return out
+watched_indices = {int(x) for x in sys.argv[1].split(",")}
+log_path = Path(sys.argv[2])
 
 gpu_csv = subprocess.check_output(
     ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits"], text=True
@@ -409,28 +515,32 @@ for line in gpu_csv.strip().splitlines():
     idx, uuid = [x.strip() for x in line.split(",")]
     uuid_to_idx[uuid] = int(idx)
 
+baseline_pids: dict[int, set[str]] = {}
 while True:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    own = descendants(root_pid)
     apps = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
         text=True,
     ).strip()
+    cur_pids: dict[int, set[str]] = {idx: set() for idx in watched_indices}
     entries = []
-    foreign = []
+    new_alerts = []
     if apps:
         for line in apps.splitlines():
             uuid, pid_s, mem = [x.strip() for x in line.split(",")]
             idx = uuid_to_idx.get(uuid)
             if idx in watched_indices:
-                pid = int(pid_s)
-                entries.append(f"gpu{idx}:pid={pid}({mem}MiB)")
-                if pid not in own:
-                    foreign.append(f"gpu{idx}:pid={pid}")
+                cur_pids[idx].add(pid_s)
+                entries.append(f"gpu{idx}:pid={pid_s}({mem}MiB)")
+                if idx in baseline_pids and pid_s not in baseline_pids[idx]:
+                    new_alerts.append(f"gpu{idx}:pid={pid_s}")
+    for idx, pids in cur_pids.items():
+        if idx not in baseline_pids and pids:
+            baseline_pids[idx] = set(pids)
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"[{ts}] apps=[{', '.join(entries)}]\n")
-        if foreign:
-            f.write(f"[{ts}] FOREIGN_PID_ALERT={foreign}\n")
+        if new_alerts:
+            f.write(f"[{ts}] NEW_HOST_PID_ALERT={new_alerts}\n")
     time.sleep(60)
 PY
 MONITOR_PID=$!
@@ -466,16 +576,22 @@ HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Print ONLY aggregate summary lines from eval_run.log (never raw conversations/problems/WARNING/ERROR).
 if [ -f "${OUTPUT_DIR}/eval_run.log" ]; then
-  "${PYTHON_BIN}" -B - "${HERE_DIR}" "${OUTPUT_DIR}/eval_run.log" <<'PY'
+  "${PYTHON_BIN}" -B - "${HERE_DIR}" "${OUTPUT_DIR}/eval_run.log" "${EVAL_RC}" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from summarize_author494 import format_eval_log_excerpt
+from summarize_author494 import format_eval_log_excerpt, extract_safe_failure_summary
 
 text = Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace")
+rc = int(sys.argv[3])
 excerpt = format_eval_log_excerpt(text)
 if excerpt:
     print(excerpt)
+if rc != 0:
+    fail_sum = extract_safe_failure_summary(text)
+    if fail_sum:
+        print("=== Sanitized Failure Summary ===")
+        print(fail_sum)
 PY
 fi
 

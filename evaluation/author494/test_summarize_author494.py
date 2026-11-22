@@ -359,6 +359,29 @@ class TestSummarizeAuthor494(unittest.TestCase):
             self.assertEqual(status_doc["state"], "ACQUIRED")
             self.assertEqual(status_doc["polls"], 3)
 
+    def test_find_replacement_tutor_and_safe_failure_summary(self):
+        csv = "\n".join([
+            "0, GPU-0, 45000, 81920, 10",
+            "1, GPU-1, 7000, 81920, 0",
+            "4, GPU-4, 7000, 81920, 0",
+            "5, GPU-5, 7000, 81920, 0",
+            "6, GPU-6, 81050, 81920, 0",
+        ])
+        snap = wg.parse_gpu_csv(csv, "")
+        rep = wg.find_replacement_tutor(snap, snap, exclude={1, 4, 5})
+        self.assertEqual(rep, 6)
+
+        fake_fail_log = "\n".join([
+            "2026-11-22 01:49:00 [WARNING] eduardo.metrics.judge_quality: Parse failure RAW_SECRET_SHOULD_NOT_APPEAR",
+            "Traceback (most recent call last):",
+            '  File "/workspace/source/eval/run_env_test_eval.py", line 942, in main',
+            'ValueError: Free memory on device cuda:0 (45.49/79.15 GiB) on startup is less than desired',
+        ])
+        fail_summary = s.extract_safe_failure_summary(fake_fail_log)
+        self.assertNotIn("RAW_SECRET_SHOULD_NOT_APPEAR", fail_summary)
+        self.assertIn("run_env_test_eval.py", fail_summary)
+        self.assertIn("ValueError: Free memory on device cuda:0", fail_summary)
+
 
 if __name__ == "__main__":
     unittest.main()
