@@ -227,6 +227,7 @@ got_data = sha256_file(data_file) if data_file.is_file() else "MISSING"
 print(f"data_test_jsonl={'OK' if got_data == exp_data else 'MISMATCH'} sha256={got_data}")
 PY
 
+echo "Verifying 27B reference manifest across 1,497 sources..."
 CUDA_VISIBLE_DEVICES="" "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval.py" \
   --repo "${REPO_ROOT}" \
   --data "${DATA_FILE}" \

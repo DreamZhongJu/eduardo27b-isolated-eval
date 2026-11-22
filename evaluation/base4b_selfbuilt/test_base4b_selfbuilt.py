@@ -261,6 +261,16 @@ class TestBase4BSelfBuilt(unittest.TestCase):
                 repo_root=REPO_ROOT,
                 require_exact_totals=False,
             )
+            full_manifest = mf.build_manifest(
+                data_path,
+                ref_root,
+                overlay_root,
+                decisions_root,
+                repo_root=REPO_ROOT,
+                require_exact_totals=False,
+                verify_receipts=True,
+            )
+            self.assertEqual(manifest, full_manifest)
             self.assertEqual(manifest["eligible_count"], 9)  # 4*3 - 3
             self.assertEqual(manifest["skipped_count"], 3)
             eligible_pairs = {(e["difficulty"], e["source_id"]) for e in manifest["eligible"]}

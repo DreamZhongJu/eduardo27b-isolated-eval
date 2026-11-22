@@ -443,6 +443,7 @@ def main() -> int:
         args.decisions,
         repo_root=args.repo,
         require_exact_totals=True,
+        show_progress=True,
     )
     print(
         f"[base4b] manifest_ok eligible={manifest['eligible_count']} skipped={manifest['skipped_count']} "
