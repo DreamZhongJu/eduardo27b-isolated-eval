@@ -34,6 +34,14 @@
 /evaluation/agnes_rejudge/*
 !/evaluation/agnes_rejudge/*.py
 !/evaluation/agnes_rejudge/README.md
+!/evaluation/base4b_selfbuilt/
+/evaluation/base4b_selfbuilt/*
+!/evaluation/base4b_selfbuilt/*.py
+!/evaluation/base4b_selfbuilt/*.sh
+!/evaluation/base4b_selfbuilt/README.md
+!/evaluation/base4b_selfbuilt/SHA256SUMS
+!/evaluation/base4b_selfbuilt/base4b-selfbuilt-kit-v1.zip
+!/evaluation/base4b_selfbuilt/base4b-selfbuilt-kit-v1.zip.sha256
 !/parallel_eval_v3
 !/evaluation/parallel_eval_v3/
 /evaluation/parallel_eval_v3/*
