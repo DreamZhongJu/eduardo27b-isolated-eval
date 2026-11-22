@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
+import math
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -18,6 +21,7 @@ if str(HERE) not in sys.path:
 import summarize_author494 as s  # noqa: E402
 import agnes_ping_author494 as ping  # noqa: E402
 import wait_gpus_author494 as wg  # noqa: E402
+import run_control_author494 as rc_mod  # noqa: E402
 
 
 def _find_author_repo() -> Path:
@@ -39,6 +43,7 @@ if str(AUTHOR_REPO) not in sys.path:
     sys.path.insert(0, str(AUTHOR_REPO))
 
 from eval.run_env_test_eval import compute_summary as author_compute_summary  # noqa: E402
+from eduardo.create_transfer_dataset import _solve_rate as author_solve_rate  # noqa: E402
 
 
 def _make_record(
@@ -375,12 +380,250 @@ class TestSummarizeAuthor494(unittest.TestCase):
             "2026-11-22 01:49:00 [WARNING] eduardo.metrics.judge_quality: Parse failure RAW_SECRET_SHOULD_NOT_APPEAR",
             "Traceback (most recent call last):",
             '  File "/workspace/source/eval/run_env_test_eval.py", line 942, in main',
-            'ValueError: Free memory on device cuda:0 (45.49/79.15 GiB) on startup is less than desired',
+            "    secret_var = UNQUOTED_CODE_LINE_SHOULD_NOT_APPEAR",
+            "ValueError: UNQUOTED_PROBLEM_TEXT_IN_EXCEPTION_MESSAGE x + y = 999",
         ])
         fail_summary = s.extract_safe_failure_summary(fake_fail_log)
         self.assertNotIn("RAW_SECRET_SHOULD_NOT_APPEAR", fail_summary)
-        self.assertIn("run_env_test_eval.py", fail_summary)
-        self.assertIn("ValueError: Free memory on device cuda:0", fail_summary)
+        self.assertNotIn("UNQUOTED_CODE_LINE_SHOULD_NOT_APPEAR", fail_summary)
+        self.assertNotIn("UNQUOTED_PROBLEM_TEXT_IN_EXCEPTION_MESSAGE", fail_summary)
+        self.assertNotIn("x + y = 999", fail_summary)
+        self.assertEqual(
+            fail_summary,
+            'File "/workspace/source/eval/run_env_test_eval.py", line 942, in main\nValueError',
+        )
+
+    def test_stage3_hake_g_cohens_d_correlations_and_control_metrics(self):
+        # Hand-calculated 4-problem dataset:
+        # pre_transfer  = [0.2, 0.4, 0.6, 0.8] -> mean 0.5
+        # post_transfer = [0.4, 0.6, 0.8, 1.0] -> mean 0.7
+        # Hake g (transfer) = (0.7 - 0.5) / (1 - 0.5) = 0.4
+        # Cohen d (transfer) = (0.7 - 0.5) / sqrt(0.2/3) = sqrt(0.6)
+        pre_t = [0.2, 0.4, 0.6, 0.8]
+        post_t = [0.4, 0.6, 0.8, 1.0]
+        self.assertAlmostEqual(s.compute_hake_g(pre_t, post_t), 0.4, places=12)
+        self.assertAlmostEqual(s.compute_cohens_d(pre_t, post_t), math.sqrt(0.6), places=12)
+
+        # Correlation helpers: exact +1, uncorrelated 0, and Spearman with ties.
+        self.assertAlmostEqual(s.pearson_r([1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0]), 1.0, places=12)
+        self.assertAlmostEqual(s.pearson_r([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]), 0.0, places=12)
+        self.assertAlmostEqual(
+            s.spearman_rho([1.0, 2.0, 2.0, 4.0], [10.0, 20.0, 30.0, 40.0]),
+            math.sqrt(0.9),
+            places=12,
+        )
+
+        # Difficulty tier exact boundaries at 1/3 and 2/3.
+        self.assertEqual(s.classify_difficulty_tier(0.0), "hard")
+        self.assertEqual(s.classify_difficulty_tier(1.0 / 3.0 - 1e-9), "hard")
+        self.assertEqual(s.classify_difficulty_tier(1.0 / 3.0), "medium")
+        self.assertEqual(s.classify_difficulty_tier(2.0 / 3.0 - 1e-9), "medium")
+        self.assertEqual(s.classify_difficulty_tier(2.0 / 3.0), "easy")
+        self.assertEqual(s.classify_difficulty_tier(1.0), "easy")
+
+        # Full end-to-end Stage 2 + Stage 3 control summary + reproducibility + retry exclusion.
+        ctl1_t = [0.25, 0.50, 0.50, 0.75]
+        ctl2_t = [0.20, 1.0 / 3.0, 2.0 / 3.0, 0.80]  # 1 hard, 1 medium (==1/3), 2 easy (==2/3, 0.8)
+        pre_s = [0.25, 0.25, 0.50, 0.75]
+        post_s = [0.50, 0.50, 0.75, 0.75]
+        ctl1_s = [0.25, 0.50, 0.50, 0.75]
+        ctl2_s = [0.25, 0.50, 0.60, 0.80]
+
+        records = []
+        ctl_records = []
+        for i in range(4):
+            dt = s.normalized_delta(post_t[i], pre_t[i])
+            ds = s.normalized_delta(post_s[i], pre_s[i])
+            no_leak_r = (
+                "[Vote 1: REJECT] Judge call failed after retries | [Vote 2: OK] ok2 | [Vote 3: OK] ok3"
+                if i == 0
+                else "[Vote 1: OK] ok1 | [Vote 2: OK] ok2 | [Vote 3: OK] ok3"
+            )
+            rec = _make_record(
+                9000 + i,
+                delta_transfer=dt,
+                delta_same=ds,
+                leaked=1 if i == 3 else 0,
+                teaching_rejected=1 if i in (1, 2) else 0,
+                no_leak_reasoning=no_leak_r,
+                pedagogy=float(i + 1),
+                correctness=float(i + 1),
+            )
+            rec["pre_solve_rate"] = pre_s[i]
+            rec["pre_solve_rate_transfer"] = pre_t[i]
+            rec["post_solve_same"] = post_s[i]
+            rec["post_solve_transfer"] = post_t[i]
+            rec["delta_transfer_raw"] = post_t[i] - pre_t[i]
+            rec["delta_same_raw"] = post_s[i] - pre_s[i]
+            rec["delta_transfer_gated"] = 0.0 if rec["leaked"] else dt
+            rec["delta_same_gated"] = 0.0 if rec["leaked"] else ds
+            rec["transfer_gap"] = ds - dt
+            records.append(rec)
+            ctl_records.append({
+                "row_index": 9000 + i,
+                "pre_solve_rate": pre_s[i],
+                "pre_solve_rate_transfer": pre_t[i],
+                "ctl1_same": ctl1_s[i],
+                "ctl1_same_scored": 16,
+                "ctl1_same_failed": 0,
+                "ctl1_transfer": ctl1_t[i],
+                "ctl1_transfer_scored": 16,
+                "ctl1_transfer_failed": 0,
+                "ctl2_same": ctl2_s[i],
+                "ctl2_same_scored": 16,
+                "ctl2_same_failed": 0,
+                "ctl2_transfer": ctl2_t[i],
+                "ctl2_transfer_scored": 16,
+                "ctl2_transfer_failed": 0,
+            })
+
+        doc = _make_doc(records)
+        ctl_doc = rc_mod.build_control_doc(
+            ctl_records,
+            tag="synthetic_ctl",
+            student_model="synthetic-student",
+            k=16,
+            student_temperature=0.6,
+            student_max_tokens=1024,
+            elapsed_seconds=1.0,
+            timestamp="20261122_000000",
+        )
+        sum1 = s.build_summary(doc, seed=42, draws=300, control_doc=ctl_doc)
+        sum2 = s.build_summary(doc, seed=42, draws=300, control_doc=ctl_doc)
+        self.assertEqual(sum1, sum2)
+
+        self.assertAlmostEqual(sum1["metrics"]["r2_hake_g_transfer"]["mean"], 0.4, places=12)
+        self.assertAlmostEqual(sum1["metrics"]["r3_cohens_d_transfer"]["mean"], math.sqrt(0.6), places=12)
+
+        # Conversation 0 (row 9000) has a retry fail vote -> excluded from process-outcome correlations (3 remain).
+        poc = sum1["process_outcome_correlations"]
+        self.assertEqual(poc["n_clean_retry_conversations"], 3)
+        self.assertEqual(poc["pedagogy_vs_delta_transfer"]["n_conversations"], 3)
+
+        ca = sum1["control_analysis"]
+        exp_r4_r1_t = sum(s.normalized_delta(c, p) for p, c in zip(pre_t, ctl1_t)) / 4.0
+        exp_re_r1_t = sum(s.normalized_delta(po, c) for c, po in zip(ctl1_t, post_t)) / 4.0
+        self.assertAlmostEqual(ca["r4_untutored_baseline"]["transfer"]["r1"]["mean"], exp_r4_r1_t, places=12)
+        self.assertAlmostEqual(ca["rebaselined_gain_ctl1_to_post"]["transfer"]["r1"]["mean"], exp_re_r1_t, places=12)
+        self.assertAlmostEqual(
+            ca["test_retest_reliability"]["transfer_pre_ctl1"]["mean"],
+            s.pearson_r(pre_t, ctl1_t),
+            places=12,
+        )
+        tiers = ca["difficulty_tiers_by_ctl2_transfer"]
+        self.assertEqual(tiers["hard"]["n_problems"], 1)
+        self.assertEqual(tiers["medium"]["n_problems"], 1)
+        self.assertEqual(tiers["easy"]["n_problems"], 2)
+
+        rendered = s.format_report(sum1) + "\n" + json.dumps(sum1, ensure_ascii=False)
+        for forbidden in ("9000", "9001", "9002", "9003", "SYNTHETIC_SECRET_PROBLEM", "SYNTHETIC_SECRET_ANSWER"):
+            self.assertNotIn(forbidden, rendered)
+
+        # Control fail rate > 1% should mark control_available=False and control_analysis=None.
+        bad_ctl_records = copy.deepcopy(ctl_records)
+        bad_ctl_records[0]["ctl1_same_scored"] = 10
+        bad_ctl_records[0]["ctl1_same_failed"] = 6  # 6/256 = 2.34% > 1%
+        bad_ctl_doc = rc_mod.build_control_doc(
+            bad_ctl_records,
+            tag="bad_ctl",
+            student_model="synthetic-student",
+            k=16,
+            student_temperature=0.6,
+            student_max_tokens=1024,
+            elapsed_seconds=1.0,
+            timestamp="20261122_000001",
+        )
+        self.assertTrue(bad_ctl_doc["metrics"]["exceeds_1pct"])
+        bad_sum = s.build_summary(doc, seed=42, draws=100, control_doc=bad_ctl_doc)
+        self.assertFalse(bad_sum["control_diagnostics"]["control_available"])
+        self.assertIsNone(bad_sum["control_analysis"])
+        self.assertIn("不可用", s.format_report(bad_sum))
+
+    def test_run_control_calls_author_solve_rate_with_fake_client(self):
+        calls = []
+
+        class _FakeCompletions:
+            async def create(self, *, model, messages, temperature, max_tokens, extra_body):
+                content_prompt = messages[0]["content"]
+                calls.append({
+                    "model": model,
+                    "prompt": content_prompt,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "extra_body": extra_body,
+                })
+                if "FAKE_FAIL_ONCE" in content_prompt and len(calls) == 1:
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=r"\boxed{0}"))])
+                ans = "SECRET_ANS_ORIG" if "SECRET_ORIG_PROB" in content_prompt else "SECRET_ANS_TRANS"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=f"Reasoning...\n\\boxed{{{ans}}}"))]
+                )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions()))
+        rows = [{
+            "row_index": 555,
+            "problem": "SECRET_ORIG_PROB FAKE_FAIL_ONCE",
+            "answer": "SECRET_ANS_ORIG",
+            "transfer_problem": "SECRET_TRANS_PROB",
+            "transfer_answer": "SECRET_ANS_TRANS",
+            "pre_solve_rate": 0.5,
+            "pre_solve_rate_transfer": 0.25,
+        }]
+        records = asyncio.run(
+            rc_mod.run_control_rounds(
+                rows,
+                client=fake_client,
+                solve_rate_fn=author_solve_rate,
+                student_model="Llama-3.1-8B-Instruct-test",
+                student_temperature=0.6,
+                student_max_tokens=1024,
+                k=4,
+                student_concurrency=8,
+                row_concurrency=4,
+            )
+        )
+        # 1 row x 2 rounds (ctl1, ctl2) x 2 problems (orig, trans) x k=4 = 16 calls
+        self.assertEqual(len(calls), 16)
+        self.assertTrue(all(c["temperature"] == 0.6 and c["max_tokens"] == 1024 for c in calls))
+        self.assertTrue(all(c["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}} for c in calls))
+        self.assertEqual(records[0]["ctl1_same"], 0.75)  # first call returned \boxed{0}
+        self.assertEqual(records[0]["ctl1_transfer"], 1.0)
+        self.assertEqual(records[0]["ctl2_same"], 1.0)
+        self.assertEqual(records[0]["ctl2_transfer"], 1.0)
+
+        doc = rc_mod.build_control_doc(
+            records,
+            tag="fake",
+            student_model="Llama-3.1-8B-Instruct-test",
+            k=4,
+            student_temperature=0.6,
+            student_max_tokens=1024,
+            elapsed_seconds=0.5,
+            timestamp="20261122_000002",
+        )
+        safe_dump = json.dumps(doc["metrics"], ensure_ascii=False)
+        for forbidden in ("SECRET_ORIG_PROB", "SECRET_ANS_ORIG", "SECRET_TRANS_PROB", "SECRET_ANS_TRANS", "555"):
+            self.assertNotIn(forbidden, safe_dump)
+
+    def test_wait_for_three_gpus_for_control(self):
+        ready_csv = "\n".join([
+            "0, GPU-0, 35000, 81920, 50",
+            "2, GPU-2, 80000, 81920, 0",
+            "5, GPU-5, 80000, 81920, 0",
+            "7, GPU-7, 80000, 81920, 0",
+        ])
+        snaps = iter([wg.parse_gpu_csv(ready_csv, ""), wg.parse_gpu_csv(ready_csv, "")])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chosen = wg.wait_for_gpus(
+                status_path=Path(tmpdir) / "wait_status.json",
+                log_path=Path(tmpdir) / "wait.log",
+                port=18961,
+                num_gpus=3,
+                snapshot_fn=lambda: next(snaps),
+                port_fn=lambda _p: True,
+                sleep_fn=lambda _s: None,
+            )
+            self.assertEqual(chosen, [2, 5, 7])
 
 
 if __name__ == "__main__":

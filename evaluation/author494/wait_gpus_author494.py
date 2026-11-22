@@ -68,13 +68,16 @@ def is_gpu_eligible(gpu: dict[str, Any], min_free_mib: int = 78000) -> bool:
     )
 
 
-def select_confirmed_four(
+def select_confirmed_gpus(
     snap1: list[dict[str, Any]],
     snap2: list[dict[str, Any]],
     *,
+    num_gpus: int = 4,
     min_free_mib: int = 78000,
 ) -> list[int] | None:
-    """Return 4 GPU indices eligible with matching UUIDs in both snapshots, or None."""
+    """Return num_gpus indices eligible with matching UUIDs in both snapshots, or None."""
+    if num_gpus <= 0:
+        raise ValueError("num_gpus must be positive")
     by_idx1 = {g["index"]: g for g in snap1}
     by_idx2 = {g["index"]: g for g in snap2}
     eligible: list[int] = []
@@ -85,9 +88,19 @@ def select_confirmed_four(
             continue
         if is_gpu_eligible(g1, min_free_mib) and is_gpu_eligible(g2, min_free_mib):
             eligible.append(idx)
-    if len(eligible) < 4:
+    if len(eligible) < num_gpus:
         return None
-    return eligible[:4]
+    return eligible[:num_gpus]
+
+
+def select_confirmed_four(
+    snap1: list[dict[str, Any]],
+    snap2: list[dict[str, Any]],
+    *,
+    min_free_mib: int = 78000,
+) -> list[int] | None:
+    """Backwards-compatible 4-GPU selector."""
+    return select_confirmed_gpus(snap1, snap2, num_gpus=4, min_free_mib=min_free_mib)
 
 
 def find_replacement_tutor(
@@ -151,6 +164,77 @@ def _write_json(path: Path, obj: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def wait_for_gpus(
+    *,
+    status_path: Path,
+    log_path: Path,
+    port: int,
+    num_gpus: int = 4,
+    min_free_mib: int = 78000,
+    poll_seconds: int = 60,
+    confirm_seconds: int = 5,
+    snapshot_fn: Callable[[], list[dict[str, Any]]] = snapshot_nvidia_smi,
+    port_fn: Callable[[int], bool] = port_is_free,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    max_polls: int = 0,
+) -> list[int]:
+    """Poll until num_gpus idle GPUs are confirmed across two snapshots and port is free."""
+    if num_gpus <= 0:
+        raise ValueError("num_gpus must be positive")
+    polls = 0
+    while True:
+        polls += 1
+        snap1 = snapshot_fn()
+        elig1 = [g["index"] for g in snap1 if is_gpu_eligible(g, min_free_mib)]
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        if len(elig1) >= num_gpus:
+            sleep_fn(confirm_seconds)
+            snap2 = snapshot_fn()
+            chosen = select_confirmed_gpus(
+                snap1, snap2, num_gpus=num_gpus, min_free_mib=min_free_mib
+            )
+            if chosen is not None and port_fn(port):
+                _write_json(
+                    status_path,
+                    {
+                        "state": "ACQUIRED",
+                        "polls": polls,
+                        "num_gpus": num_gpus,
+                        "selected_gpus": chosen,
+                        "port": port,
+                        "updated_at": ts,
+                    },
+                )
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{ts}] ACQUIRED poll={polls} num_gpus={num_gpus} selected={chosen} port={port}\n"
+                    )
+                return chosen
+
+        free_summary = {g["index"]: g["free_mib"] for g in snap1}
+        _write_json(
+            status_path,
+            {
+                "state": "WAITING",
+                "polls": polls,
+                "num_gpus": num_gpus,
+                "eligible_gpus": elig1,
+                "eligible_count": len(elig1),
+                "free_mib_by_gpu": free_summary,
+                "updated_at": ts,
+            },
+        )
+        if polls == 1 or polls % 10 == 0 or len(elig1) >= num_gpus:
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"[{ts}] WAITING poll={polls} eligible={elig1} ({len(elig1)}/{num_gpus}) free_mib={free_summary}\n"
+                )
+        if max_polls and polls >= max_polls:
+            raise TimeoutError(f"Timed out after {polls} polls waiting for {num_gpus} GPUs")
+        sleep_fn(poll_seconds)
+
+
 def wait_for_four_gpus(
     *,
     status_path: Path,
@@ -165,58 +249,20 @@ def wait_for_four_gpus(
     max_polls: int = 0,
 ) -> tuple[int, list[int]]:
     """Poll until 4 idle GPUs are confirmed across two snapshots and port is free."""
-    polls = 0
-    while True:
-        polls += 1
-        snap1 = snapshot_fn()
-        elig1 = [g["index"] for g in snap1 if is_gpu_eligible(g, min_free_mib)]
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        if len(elig1) >= 4:
-            sleep_fn(confirm_seconds)
-            snap2 = snapshot_fn()
-            chosen = select_confirmed_four(snap1, snap2, min_free_mib=min_free_mib)
-            if chosen is not None and port_fn(port):
-                tutor_gpu = chosen[0]
-                student_gpus = chosen[1:4]
-                _write_json(
-                    status_path,
-                    {
-                        "state": "ACQUIRED",
-                        "polls": polls,
-                        "tutor_gpu": tutor_gpu,
-                        "student_gpus": student_gpus,
-                        "selected_gpus": chosen,
-                        "port": port,
-                        "updated_at": ts,
-                    },
-                )
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(
-                        f"[{ts}] ACQUIRED poll={polls} tutor={tutor_gpu} student={student_gpus} port={port}\n"
-                    )
-                return tutor_gpu, student_gpus
-
-        free_summary = {g["index"]: g["free_mib"] for g in snap1}
-        _write_json(
-            status_path,
-            {
-                "state": "WAITING",
-                "polls": polls,
-                "eligible_gpus": elig1,
-                "eligible_count": len(elig1),
-                "free_mib_by_gpu": free_summary,
-                "updated_at": ts,
-            },
-        )
-        if polls == 1 or polls % 10 == 0 or len(elig1) >= 4:
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(
-                    f"[{ts}] WAITING poll={polls} eligible={elig1} ({len(elig1)}/4) free_mib={free_summary}\n"
-                )
-        if max_polls and polls >= max_polls:
-            raise TimeoutError(f"Timed out after {polls} polls waiting for 4 GPUs")
-        sleep_fn(poll_seconds)
+    chosen = wait_for_gpus(
+        status_path=status_path,
+        log_path=log_path,
+        port=port,
+        num_gpus=4,
+        min_free_mib=min_free_mib,
+        poll_seconds=poll_seconds,
+        confirm_seconds=confirm_seconds,
+        snapshot_fn=snapshot_fn,
+        port_fn=port_fn,
+        sleep_fn=sleep_fn,
+        max_polls=max_polls,
+    )
+    return chosen[0], chosen[1:4]
 
 
 def _set_pdeathsig() -> None:
@@ -264,6 +310,7 @@ def main() -> int:
     ap.add_argument("--status-file", type=Path, default=None)
     ap.add_argument("--log-file", type=Path, default=None)
     ap.add_argument("--port", type=int, default=18961)
+    ap.add_argument("--num-gpus", type=int, default=4)
     ap.add_argument("--min-free-mib", type=int, default=78000)
     ap.add_argument("--poll-seconds", type=int, default=60)
     ap.add_argument("--confirm-seconds", type=int, default=5)
@@ -286,15 +333,19 @@ def main() -> int:
     if args.status_file is None or args.log_file is None:
         ap.error("--status-file and --log-file are required when waiting")
 
-    tutor_gpu, student_gpus = wait_for_four_gpus(
+    chosen = wait_for_gpus(
         status_path=args.status_file,
         log_path=args.log_file,
         port=args.port,
+        num_gpus=args.num_gpus,
         min_free_mib=args.min_free_mib,
         poll_seconds=args.poll_seconds,
         confirm_seconds=args.confirm_seconds,
     )
-    print(f"{tutor_gpu} {','.join(map(str, student_gpus))}")
+    if args.num_gpus == 4:
+        print(f"{chosen[0]} {','.join(map(str, chosen[1:4]))}")
+    else:
+        print(",".join(map(str, chosen)))
     return 0
 
 

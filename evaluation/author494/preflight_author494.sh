@@ -131,6 +131,7 @@ EXPECTED_UPSTREAM = {
     "eval/run_env_test_eval.py": "f00a9730ef4f0e61f4eae7b5d8d1048beb5740068ad94a4071ca97b5f032479d",
     "eval/run_middleturn_eval.py": "8b095899f81e0872a36b77c4424e5107927645002727277ccce7db8cdd16ccbb",
     "eduardo/__init__.py": "c0061335e07747433ded663f72cb64768b6f4be240808e3b049ad256ae85708a",
+    "eduardo/create_transfer_dataset.py": "fd801436c412166230f7ff5d4442276336e1afeac8e5fede8009826298a15a5f",
     "eduardo/utils.py": "b80d8d512561d2de3bb0bce6e82a10e00916c0a1dc3f6d235b918e8c992e0eb4",
     "eduardo/process_dataset.py": "7624e717860f01a638d47abc81e6cec40369966213bba082bef4542feb196b1f",
     "eduardo/reward_function.py": "4b34fa6c90b9347d4fcc757b961ff7d8e0818ec21c8af3762ccfe133f343c69f",
