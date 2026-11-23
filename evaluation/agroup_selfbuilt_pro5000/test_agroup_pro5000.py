@@ -240,13 +240,14 @@ class TestT021AGroupPro5000(unittest.TestCase):
                 )
 
             out_csv = tmp / "paired.csv"
-            mcsv.build_selfbuilt_paired_csv(
+            p_info = mcsv.build_selfbuilt_paired_csv(
                 loaded_bundle=loaded,
                 a_group_root=ag_root,
                 base4b_counts_csv=None,
                 out_csv=out_csv,
                 grade_subdir="AGNES",
             )
+            self.assertTrue(p_info["emit_combined_orig"])
             csv_rows = pg.load_csv(out_csv)
 
             # Paired evaluation against 27B should use ONLY the 2 completed A-group sources per tier
@@ -257,6 +258,37 @@ class TestT021AGroupPro5000(unittest.TestCase):
             )
             self.assertEqual(cc["comparisons"]["未决按错.easy"]["n_paired_pg"], 2)
             self.assertEqual(cc["comparisons"]["未决按错.orig"]["n_paired_pg"], 2)
+
+            # When 27B EASY vs MEDIUM orig pre differs for the same source_id, CSV build omits
+            # conflicting combined "orig" instead of failing validate_pre_consistency, while keeping
+            # per-tier orig_easy/orig_medium/orig_hard and easy/medium/hard intact.
+            loaded_diff_orig = json.loads(json.dumps(loaded))
+            for item in loaded_diff_orig["eligible"]:
+                if item["source_id"] == "PAIR_SID_0" and item["difficulty"] == "easy":
+                    item["ref_counts"]["原题"]["pre"] = {"correct": 12, "incorrect": 4, "unknown": 0}
+                    item["ref_counts"]["原题"]["post"] = {"correct": 15, "incorrect": 1, "unknown": 0}
+                elif item["source_id"] == "PAIR_SID_0" and item["difficulty"] == "medium":
+                    item["ref_counts"]["原题"]["pre"] = {"correct": 4, "incorrect": 12, "unknown": 0}
+                    item["ref_counts"]["原题"]["post"] = {"correct": 10, "incorrect": 6, "unknown": 0}
+            out_csv_diff = tmp / "paired_diff_orig.csv"
+            p_diff = mcsv.build_selfbuilt_paired_csv(
+                loaded_bundle=loaded_diff_orig,
+                a_group_root=ag_root,
+                base4b_counts_csv=None,
+                out_csv=out_csv_diff,
+                grade_subdir="AGNES",
+            )
+            self.assertFalse(p_diff["emit_combined_orig"])
+            self.assertEqual(p_diff["orig_inconsistent_sources"], 1)
+            diff_rows = pg.load_csv(out_csv_diff)
+            self.assertFalse(any(r["group"] == "orig" for r in diff_rows))
+            all_27b_diff = [{"tier_zh": e["tier_zh"], "source_id": e["source_id"], "ref_counts": e["ref_counts"]} for e in loaded_diff_orig["eligible"]]
+            recs_diff, _ = sb.collect_base4b_records(loaded_diff_orig, ag_root, REPO_ROOT, grade_subdir="AGNES")
+            cc_diff = sap.cross_check_paired_diff(
+                diff_rows, recs_diff, all_27b_diff, base_name="eduardo27b", target_name="a_group", draws=2000, seed=42
+            )
+            self.assertEqual(cc_diff["comparisons"]["未决按错.orig_easy"]["n_paired_pg"], 2)
+            self.assertEqual(cc_diff["comparisons"]["未决按错.easy"]["n_paired_pg"], 2)
 
             # Check sanitization on markdown report & safe logs/exceptions
             md = pg.render_markdown(cc["pg_report"])

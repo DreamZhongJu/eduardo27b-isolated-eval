@@ -110,7 +110,7 @@ def build_selfbuilt_paired_csv(
     out_csv: Path,
     grade_subdir: str = "AGNES",
 ) -> dict[str, Any]:
-    """Write paired_gain.py CSV for groups orig, easy, medium, hard (base, a_group, eduardo27b)."""
+    """Write paired_gain.py CSV for orig_easy/orig_medium/orig_hard/easy/medium/hard (and orig when consistent)."""
     grader_prefix = "agnes" if grade_subdir == "AGNES" else "ar"
     ref_key = "ref_counts" if grade_subdir == "AGNES" else "ref_counts_ar"
     entries = loaded_bundle["eligible"]
@@ -125,6 +125,17 @@ def build_selfbuilt_paired_csv(
         if base4b_counts_csv is not None
         else {}
     )
+
+    # paired_gain.py rejects duplicate (group="orig", unit_id) rows if 27B EASY/MEDIUM/HARD
+    # measured slightly different independent pre-test draws for the same source_id.
+    orig_pre_by_sid: dict[str, list[float]] = {}
+    for e in entries:
+        pre_orig = e[ref_key]["原题"]["pre"]["correct"] / 16.0
+        orig_pre_by_sid.setdefault(e["source_id"], []).append(pre_orig)
+    orig_inconsistent_sources = sum(
+        1 for vals in orig_pre_by_sid.values() if max(vals) - min(vals) > pg.PRE_CONSISTENCY_TOL
+    )
+    emit_combined_orig = orig_inconsistent_sources == 0
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp_csv = out_csv.with_name(f".{out_csv.name}.{os.getpid()}.tmp")
@@ -156,17 +167,23 @@ def build_selfbuilt_paired_csv(
                     written[f"{cond}.{grp}"] += 1
 
                 # Eduardo-27B always available across all eligible entries.
-                _emit("eduardo27b", "orig", pre_orig, rc["原题"]["post"])
+                if emit_combined_orig:
+                    _emit("eduardo27b", "orig", pre_orig, rc["原题"]["post"])
+                _emit("eduardo27b", f"orig_{diff}", pre_orig, rc["原题"]["post"])
                 _emit("eduardo27b", diff, pre_trans, rc["迁移题"]["post"])
 
                 if (diff, sid) in base_counts:
                     bc = base_counts[(diff, sid)]
-                    _emit("base", "orig", pre_orig, bc["orig"])
+                    if emit_combined_orig:
+                        _emit("base", "orig", pre_orig, bc["orig"])
+                    _emit("base", f"orig_{diff}", pre_orig, bc["orig"])
                     _emit("base", diff, pre_trans, bc["trans"])
 
                 if (diff, sid) in ag_counts:
                     ac = ag_counts[(diff, sid)]
-                    _emit("a_group", "orig", pre_orig, ac["orig"])
+                    if emit_combined_orig:
+                        _emit("a_group", "orig", pre_orig, ac["orig"])
+                    _emit("a_group", f"orig_{diff}", pre_orig, ac["orig"])
                     _emit("a_group", diff, pre_trans, ac["trans"])
 
         # Validate immediately with paired_gain loader.
@@ -176,7 +193,12 @@ def build_selfbuilt_paired_csv(
         tmp_csv.unlink(missing_ok=True)
         raise
 
-    return {"csv_path": str(out_csv), "row_counts": dict(sorted(written.items()))}
+    return {
+        "csv_path": str(out_csv),
+        "row_counts": dict(sorted(written.items())),
+        "emit_combined_orig": emit_combined_orig,
+        "orig_inconsistent_sources": orig_inconsistent_sources,
+    }
 
 
 def main() -> int:

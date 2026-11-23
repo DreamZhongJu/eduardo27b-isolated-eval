@@ -30,6 +30,9 @@ from summarize_base4b import (  # noqa: E402
 
 GROUP_TO_SUMMARY_LABEL = {
     "orig": "原题合并",
+    "orig_easy": "原题-简单对话",
+    "orig_medium": "原题-中等对话",
+    "orig_hard": "原题-困难对话",
     "easy": "简单迁移题",
     "medium": "中等迁移题",
     "hard": "困难迁移题",
@@ -68,7 +71,7 @@ def cross_check_paired_diff(
     comparisons: dict[str, Any] = {}
     for policy in ("未决按错", "排除未决"):
         sb_rows = {r["label"]: r for r in sb_sum["analyses"][policy]}
-        for grp in ("orig", "easy", "medium", "hard"):
+        for grp in GROUP_TO_SUMMARY_LABEL:
             pg_entry = pg_index.get((policy, grp))
             sb_entry = sb_rows.get(GROUP_TO_SUMMARY_LABEL[grp], {}).get("paired_4b_minus_27b")
             if not pg_entry or not pg_entry.get("stats") or not sb_entry or sb_entry.get("mean_diff") is None:
@@ -137,7 +140,7 @@ def main() -> int:
     )
 
     paired_csv = args.out_root / f"paired_{args.grade_subdir.lower()}.csv"
-    build_selfbuilt_paired_csv(
+    paired_info = build_selfbuilt_paired_csv(
         loaded_bundle=loaded,
         a_group_root=args.out_root,
         base4b_counts_csv=args.base4b_counts_csv,
@@ -145,10 +148,21 @@ def main() -> int:
         grade_subdir=args.grade_subdir,
     )
     csv_rows = pg.load_csv(paired_csv)
+    if not paired_info.get("emit_combined_orig", True):
+        print(
+            "[base4b_summary] note: group=orig omitted from paired_gain CSV "
+            f"(27B orig_pre differs across tiers for {paired_info['orig_inconsistent_sources']} sources; "
+            "combined 原题合并 uses exact per-tier 27B aggregation in summary above, "
+            "and orig_easy/orig_medium/orig_hard are included in paired_gain CSV)"
+        )
 
     payload: dict[str, Any] = {
         "diagnostics": diagnostics,
         "summary_vs_27b": summary,
+        "paired_csv_info": {
+            "emit_combined_orig": paired_info.get("emit_combined_orig"),
+            "orig_inconsistent_sources": paired_info.get("orig_inconsistent_sources"),
+        },
     }
     if records:
         cc_27b = cross_check_paired_diff(
