@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Cross-machine Student stack check (Pro 5000 vLLM 0.18.0 float16 vs A100 27B pre-test).
+"""Cross-machine Student stack check (Pro 5000 existing vLLM env vs A100 27B pre-test).
 
 Samples 30 sources per tier (seed=42 hash of source_id, 90 sources = 2,880 student calls),
-runs 16-attempt pre-tests for original and transfer problems under exact 27B student params,
+runs 16-attempt pre-tests for original and transfer problems under exact 27B student params
+(float16 preferred, bfloat16 fallback logged as deviation if unsupported),
 grades offline with Author-Rule (\boxed{} + math_verify), and verifies:
   - |mean_pro - mean_a100| <= 0.03 (both original and transfer)
   - pearson_r(pro_pre, a100_pre) >= pearson_r(a100_pre, a100_ctl) - 0.05 (both orig & trans)
@@ -270,6 +271,12 @@ def format_stack_report(res: dict[str, Any]) -> str:
         "[base4b_summary] " + "=" * 80,
         f"[base4b_summary] Pro 5000 vs A100 Student Stack Check Verdict: {res['verdict']} (n={res['n_sources']}, calls={res['n_calls']}, stu_fail={res['student_calls_failed']})",
     ]
+    rt = res.get("student_runtime")
+    if isinstance(rt, dict):
+        lines.append(
+            f"[base4b_summary]   student_runtime: dtype={rt.get('student_dtype')} vllm={rt.get('vllm')} "
+            f"torch={rt.get('torch')} transformers={rt.get('transformers')} math_verify={rt.get('math_verify')}"
+        )
     for label, d in (("原题 pre", res["orig"]), ("迁移题 pre", res["trans"])):
         lines.append(
             f"[base4b_summary]   {label}: Pro5000={d['pro5000_mean']:.4f} vs A100={d['a100_27b_mean']:.4f} "
@@ -286,6 +293,7 @@ def main() -> int:
     ap.add_argument("--bundle-dir", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--student-url", default="http://127.0.0.1:18702/v1")
+    ap.add_argument("--student-runtime-json", type=Path, default=None)
     ap.add_argument("--per-tier", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--concurrency", type=int, default=16)
@@ -304,6 +312,8 @@ def main() -> int:
         )
     )
     res = evaluate_stack_check(sampled, pro_rates, stu_fail=stu_fail)
+    if args.student_runtime_json is not None and args.student_runtime_json.is_file():
+        res["student_runtime"] = json.loads(args.student_runtime_json.read_text(encoding="utf-8"))
     (args.out_dir / "STACK_CHECK.json").write_text(
         json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )

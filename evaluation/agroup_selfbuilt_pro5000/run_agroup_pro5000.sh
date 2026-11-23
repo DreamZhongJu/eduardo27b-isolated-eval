@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Launch T-021 evaluation on RTX PRO 5000:
-# - --stack-check: 1-GPU Student (vLLM 0.18.0 float16) for 90x32 pre-test vs A100 27B
-# - --mode pilot|full: 1-GPU Tutor (A-group step_100, vLLM 0.19.1 --max-num-seqs 8) +
-#   1-GPU Student (vLLM 0.18.0 float16); optional head-16 gate & <=3-worker Agnes after T-020.
+# Launch T-021 evaluation on RTX PRO 5000 (existing pro5000-fast env for both Tutor and Student):
+# - --stack-check: 1-GPU Student (strict --dtype float16; fail closed if unsupported) for 90x32 pre-test vs A100 27B
+# - --mode pilot|full: 1-GPU Tutor (A-group step_100, bfloat16, --max-num-seqs 8) +
+#   1-GPU Student (strict --dtype float16); optional head-16 gate & <=3-worker Agnes after T-020.
 # - --grade-only <dir> / --status <dir>
 set -euo pipefail
 
@@ -27,7 +27,7 @@ HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE_DIR}/../.." && pwd)"
 BASE="${PRO5000_BASE:-${HOME}/bzhang/a_group_pro5000}"
 TUTOR_ENV_DIR="${PRO5000_ENV_DIR:-${BASE}/envs/pro5000-fast}"
-STUDENT_ENV_DIR="${PRO5000_STUDENT_ENV_DIR:-${BASE}/envs/pro5000-student-vllm018}"
+STUDENT_ENV_DIR="${PRO5000_STUDENT_ENV_DIR:-${TUTOR_ENV_DIR}}"
 TUTOR_PY="${TUTOR_PY:-${TUTOR_ENV_DIR}/bin/python}"
 TUTOR_VLLM="${TUTOR_VLLM:-${TUTOR_ENV_DIR}/bin/vllm}"
 STUDENT_PY="${STUDENT_PY:-${STUDENT_ENV_DIR}/bin/python}"
@@ -46,6 +46,14 @@ if [ "${1:-}" = "--status" ]; then
     if kill -0 "${RPID}" 2>/dev/null; then echo "runner_pid=${RPID} state=RUNNING"; else echo "runner_pid=${RPID} state=EXITED"; fi
   else
     echo "runner_pid=MISSING"
+  fi
+  if [ -f "${OUT_DIR}/student_runtime.json" ]; then
+    python3 -B - "${OUT_DIR}/student_runtime.json" <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"student_runtime dtype={r.get('student_dtype')} tutor_dtype={r.get('tutor_dtype')} vllm={r.get('vllm')} torch={r.get('torch')} transformers={r.get('transformers')} math_verify={r.get('math_verify')}")
+PY
   fi
   if [ -f "${OUT_DIR}/wait_status.json" ]; then
     python3 -B - "${OUT_DIR}/wait_status.json" <<'PY'
@@ -284,6 +292,72 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+record_student_runtime() {
+  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" "${STUDENT_PY}" -B - \
+    "${OUTPUT_DIR}/student_runtime.json" "${STUDENT_ENV_DIR}" "${RESOLVED_STUDENT}" <<'PY'
+import importlib.metadata as md, json, sys
+from pathlib import Path
+import torch, transformers, vllm, openai
+
+out_p = Path(sys.argv[1])
+doc = {
+    "student_dtype": "float16",
+    "tutor_dtype": "bfloat16",
+    "env_dir": sys.argv[2],
+    "model_dir": sys.argv[3],
+    "python": sys.version.split()[0],
+    "torch": torch.__version__,
+    "torch_cuda": str(torch.version.cuda),
+    "vllm": vllm.__version__,
+    "transformers": transformers.__version__,
+    "openai": openai.__version__,
+    "math_verify": md.version("math-verify"),
+}
+out_p.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(
+    f"[base4b] student_env/dtype={doc['student_dtype']} tutor_env/dtype={doc['tutor_dtype']} "
+    f"vllm={doc['vllm']} torch={doc['torch']} transformers={doc['transformers']} "
+    f"math_verify={doc['math_verify']}"
+)
+PY
+}
+
+start_student_and_wait() {
+  local gpu_id=$1
+  CUDA_VISIBLE_DEVICES="${gpu_id}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
+    "${STUDENT_VLLM}" serve "${RESOLVED_STUDENT}" \
+    --host 127.0.0.1 --port "${STUDENT_PORT}" --served-model-name "Llama-3.1-8B-Instruct" \
+    --api-key "${SERVING_API_KEY}" --dtype float16 --max-model-len 20000 \
+    --gpu-memory-utilization 0.90 --seed 42 \
+    > "${OUTPUT_DIR}/student_server.log" 2>&1 &
+  STUDENT_PID=$!
+  if ! "${TUTOR_PY}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'; then
+import os, sys, time, urllib.request
+pid, port = int(sys.argv[1]), int(sys.argv[2])
+deadline = time.monotonic() + 600
+url = f"http://127.0.0.1:{port}/health"
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        sys.exit(1)
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            if resp.status == 200:
+                print(f"[base4b] student server healthy on 127.0.0.1:{port} (dtype=float16)")
+                sys.exit(0)
+    except OSError:
+        pass
+    time.sleep(5)
+sys.exit(1)
+PY
+    echo "[base4b] Student vLLM (--dtype float16) failed to start; stopping without switching to bfloat16 (see student_server.log)." >&2
+    return 1
+  fi
+  record_student_runtime
+  return 0
+}
+
 if [ "${STACK_CHECK}" = "1" ]; then
   if [ "${AUTO_WAIT}" = "1" ]; then
     READ_GPU="$("${TUTOR_PY}" -B "${HERE_DIR}/wait_gpus_agroup_pro5000.py" \
@@ -291,33 +365,11 @@ if [ "${STACK_CHECK}" = "1" ]; then
       --ports "${STUDENT_PORT}" --num-gpus 1 --min-free-mib 70000 --poll-seconds "${POLL_SECONDS}")"
     STUDENT_GPU="${READ_GPU}"
   fi
-  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
-    "${STUDENT_VLLM}" serve "${RESOLVED_STUDENT}" \
-    --host 127.0.0.1 --port "${STUDENT_PORT}" --served-model-name "Llama-3.1-8B-Instruct" \
-    --api-key "${SERVING_API_KEY}" --dtype float16 --max-model-len 20000 \
-    --gpu-memory-utilization 0.90 --seed 42 \
-    > "${OUTPUT_DIR}/student_server.log" 2>&1 &
-  STUDENT_PID=$!
-  "${TUTOR_PY}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'
-import os, sys, time, urllib.request
-pid, port = int(sys.argv[1]), int(sys.argv[2])
-deadline = time.monotonic() + 600
-url = f"http://127.0.0.1:{port}/health"
-while time.monotonic() < deadline:
-    os.kill(pid, 0)
-    try:
-        with urllib.request.urlopen(url, timeout=3) as resp:
-            if resp.status == 200:
-                print(f"[base4b] student server healthy on 127.0.0.1:{port}")
-                sys.exit(0)
-    except OSError:
-        pass
-    time.sleep(5)
-raise SystemExit("ERROR: student server health check timed out")
-PY
+  start_student_and_wait "${STUDENT_GPU}"
   LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/stack_check_selfbuilt.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-dir "${OUTPUT_DIR}" \
-    --student-url "http://127.0.0.1:${STUDENT_PORT}/v1" --per-tier 30 --seed 42
+    --student-url "http://127.0.0.1:${STUDENT_PORT}/v1" \
+    --student-runtime-json "${OUTPUT_DIR}/student_runtime.json" --per-tier 30 --seed 42
   exit $?
 fi
 
@@ -357,34 +409,8 @@ PY
     exit 1
   fi
 
-  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
-    "${STUDENT_VLLM}" serve "${RESOLVED_STUDENT}" \
-    --host 127.0.0.1 --port "${STUDENT_PORT}" --served-model-name "Llama-3.1-8B-Instruct" \
-    --api-key "${SERVING_API_KEY}" --dtype float16 --max-model-len 20000 \
-    --gpu-memory-utilization 0.90 --seed 42 \
-    > "${OUTPUT_DIR}/student_server.log" 2>&1 &
-  STUDENT_PID=$!
-
-  if ! "${TUTOR_PY}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'; then
-import os, sys, time, urllib.request
-pid, port = int(sys.argv[1]), int(sys.argv[2])
-deadline = time.monotonic() + 600
-url = f"http://127.0.0.1:{port}/health"
-while time.monotonic() < deadline:
-    try: os.kill(pid, 0)
-    except OSError: sys.exit(1)
-    try:
-        with urllib.request.urlopen(url, timeout=3) as resp:
-            if resp.status == 200:
-                print(f"[base4b] student server healthy on 127.0.0.1:{port}")
-                sys.exit(0)
-    except OSError:
-        pass
-    time.sleep(5)
-sys.exit(1)
-PY
+  if ! start_student_and_wait "${STUDENT_GPU}"; then
     cleanup
-    if [ "${AUTO_WAIT}" = "1" ]; then sleep "${POLL_SECONDS}"; continue; fi
     exit 1
   fi
 

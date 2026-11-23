@@ -143,9 +143,17 @@ class TestT021AGroupPro5000(unittest.TestCase):
         # Boundary: stu_fail > 0 fails even with identical rates
         self.assertFalse(sc.evaluate_stack_check(s1, pro_ok, stu_fail=1)["passed"])
 
-        # No source_id in stack report
+        # No source_id in stack report; embeds student_runtime metadata cleanly
+        res_ok["student_runtime"] = {
+            "student_dtype": "float16",
+            "vllm": "0.19.1",
+            "torch": "2.10.0+cu128",
+            "transformers": "5.7.0",
+            "math_verify": "0.8.0",
+        }
         rep = sc.format_stack_report(res_ok)
         self.assertNotIn("SC_SID_", rep)
+        self.assertIn("dtype=float16", rep)
 
     def test_t020_agnes_guard_and_max_3_workers(self):
         with tempfile.TemporaryDirectory() as td:

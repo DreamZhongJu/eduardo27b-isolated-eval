@@ -8,9 +8,11 @@ REPO_ROOT="$(cd "${HERE_DIR}/../.." && pwd)"
 
 BASE="${PRO5000_BASE:-${HOME}/bzhang/a_group_pro5000}"
 TUTOR_ENV_DIR="${PRO5000_ENV_DIR:-${BASE}/envs/pro5000-fast}"
-STUDENT_ENV_DIR="${PRO5000_STUDENT_ENV_DIR:-${BASE}/envs/pro5000-student-vllm018}"
+STUDENT_ENV_DIR="${PRO5000_STUDENT_ENV_DIR:-${TUTOR_ENV_DIR}}"
 TUTOR_PY="${TUTOR_PY:-${TUTOR_ENV_DIR}/bin/python}"
 STUDENT_PY="${STUDENT_PY:-${STUDENT_ENV_DIR}/bin/python}"
+STUDENT_DTYPE="float16"
+TUTOR_DTYPE="bfloat16"
 
 A_GROUP_RUN_DIR="${A_GROUP_RUN_DIR:-${BASE}/runs/stage3_formal_20261121_144311}"
 TUTOR_MODEL="${TUTOR_MODEL:-${A_GROUP_RUN_DIR}/exports/step_100}"
@@ -74,28 +76,38 @@ for g in s2:
 print(f"idle_gpus_2snap={elig} count={len(elig)} required={min_idle}")
 PY
 
-echo "=== 4. Tutor & Student Environments ==="
+echo "=== 4. Tutor & Student Environments (Existing pro5000-fast) ==="
+if [ ! -x "${TUTOR_PY}" ] || [ ! -x "${STUDENT_PY}" ]; then
+  echo "ERROR: python missing (tutor=${TUTOR_PY}, student=${STUDENT_PY})" >&2
+  exit 2
+fi
 "${TUTOR_PY}" -B - <<'PY'
 import importlib.metadata as md, sys
 import torch, transformers, vllm, openai
-print(f"tutor_env/python={sys.version.split()[0]} torch={torch.__version__} vllm={vllm.__version__} transformers={transformers.__version__} openai={openai.__version__}")
 try:
-    print(f"tutor_env/math-verify={md.version('math-verify')}")
+    mv = md.version("math-verify")
 except md.PackageNotFoundError:
-    print("tutor_env/math-verify=NOT_INSTALLED")
+    raise SystemExit("ERROR: math-verify not installed in tutor env")
+print(f"tutor_env/python={sys.version.split()[0]} torch={torch.__version__} cuda={torch.version.cuda} vllm={vllm.__version__} transformers={transformers.__version__} openai={openai.__version__} math-verify={mv} dtype=bfloat16")
 PY
 
-if [ ! -x "${STUDENT_PY}" ]; then
-  echo "ERROR: student python missing: ${STUDENT_PY}" >&2
-  exit 2
-fi
-LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib:${LD_LIBRARY_PATH}" "${STUDENT_PY}" -B - <<'PY'
+LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib:${LD_LIBRARY_PATH}" "${STUDENT_PY}" -B - "${STUDENT_ENV_DIR}" <<'PY'
 import importlib.metadata as md, sys
 import torch, transformers, vllm, openai
-mv = md.version("math-verify")
-print(f"student_env/python={sys.version.split()[0]} torch={torch.__version__} vllm={vllm.__version__} transformers={transformers.__version__} openai={openai.__version__} math-verify={mv}")
-if not vllm.__version__.startswith("0.18.0") or not torch.__version__.startswith("2.10.0") or not transformers.__version__.startswith("4.57.6"):
-    raise SystemExit("ERROR: Student environment version mismatch (must be vllm 0.18.0, torch 2.10.0, transformers 4.57.6)")
+env_dir = sys.argv[1]
+try:
+    mv = md.version("math-verify")
+except md.PackageNotFoundError:
+    raise SystemExit("ERROR: math-verify not installed in student env")
+print(
+    f"student_env/dir={env_dir} python={sys.version.split()[0]} torch={torch.__version__} "
+    f"cuda={torch.version.cuda} vllm={vllm.__version__} transformers={transformers.__version__} "
+    f"openai={openai.__version__} math-verify={mv} dtype=float16"
+)
+ref27b = {"torch": "2.10.0", "vllm": "0.18.0", "transformers": "4.57.6", "dtype": "float16"}
+cur = {"torch": torch.__version__, "vllm": vllm.__version__, "transformers": transformers.__version__, "dtype": "float16"}
+devs = [f"{k}:{ref27b[k]}->{cur[k]}" for k in ("torch", "vllm", "transformers", "dtype") if not cur[k].startswith(ref27b[k])]
+print("student_deviations_vs_27b=" + (", ".join(devs) if devs else "NONE"))
 PY
 
 echo "=== 5. Models & Imported A100 Bundle Check ==="
