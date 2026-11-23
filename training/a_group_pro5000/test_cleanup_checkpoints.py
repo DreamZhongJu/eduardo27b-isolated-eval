@@ -2,8 +2,10 @@
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -85,6 +87,52 @@ class CleanupCheckpointsTest(unittest.TestCase):
             self.assertTrue((formal / 'exports' / 'step_100' / 'model.safetensors').is_file())
             self.assertTrue((formal / 'trainer.log').is_file())
             self.assertTrue((base / 'envs' / 'pro5000-fast').is_dir())
+
+    def test_compare_tokenizer_reports_functional_equivalence_despite_resave_diff(self):
+        with tempfile.TemporaryDirectory() as td:
+            exp = Path(td) / 'exp'
+            base = Path(td) / 'base'
+            exp.mkdir()
+            base.mkdir()
+            for fn, content in (
+                ('chat_template.jinja', 'tpl'),
+                ('tokenizer.json', '{"v": 1}'),
+                ('tokenizer_config.json', '{"k": 1}'),
+            ):
+                (base / fn).write_text(content)
+            (exp / 'chat_template.jinja').write_text('tpl')
+            (exp / 'tokenizer.json').write_text('{"v": 2}')  # v5 re-serialized
+            (exp / 'tokenizer_config.json').write_text('{"k": 2}')
+
+            class FakeTok:
+                chat_template = 'tpl'
+                eos_token_id = 248046
+                pad_token_id = 248044
+                all_special_ids = [248044, 248046]
+                added_tokens_decoder = {248046: types.SimpleNamespace(content='<|im_end|>')}
+
+                def get_vocab(self):
+                    return {'a': 0}
+
+                def apply_chat_template(self, msgs, tokenize=True, add_generation_prompt=True, enable_thinking=True):
+                    return [1, 2, 3 if enable_thinking else 4]
+
+                def encode(self, s):
+                    return [10, 11]
+
+                def decode(self, ids, skip_special_tokens=True):
+                    return 'x' if skip_special_tokens else '<|im_end|>x'
+
+            fake_tf = types.SimpleNamespace(
+                AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **kw: FakeTok())
+            )
+            with mock.patch.dict(sys.modules, {'transformers': fake_tf}):
+                res = cc.compare_tokenizer_and_template(exp, base)
+            self.assertTrue(res['chat_template_same'])
+            self.assertTrue(res['tokenizer_same'])
+            self.assertFalse(res['tokenizer_files_same'])
+            self.assertEqual(res['tokenizer_behavior'], '一样')
+            self.assertEqual(res['tokenizer_files'], '不一样')
 
 
 if __name__ == '__main__':

@@ -163,18 +163,56 @@ def compare_tokenizer_and_template(export_dir: Path, base_dir: Path) -> dict:
     ids_base = tok_base.apply_chat_template(
         sample_msgs, tokenize=True, add_generation_prompt=True, enable_thinking=True
     )
+    ids_exp_nothink = tok_exp.apply_chat_template(
+        sample_msgs, tokenize=True, add_generation_prompt=True, enable_thinking=False
+    )
+    ids_base_nothink = tok_base.apply_chat_template(
+        sample_msgs, tokenize=True, add_generation_prompt=True, enable_thinking=False
+    )
     vocab_equal = (tok_exp.get_vocab() == tok_base.get_vocab())
-    render_ids_equal = (ids_exp == ids_base)
+    render_ids_equal = (ids_exp == ids_base) and (ids_exp_nothink == ids_base_nothink)
+    eos_equal = (tok_exp.eos_token_id == tok_base.eos_token_id)
+    pad_equal = (tok_exp.pad_token_id == tok_base.pad_token_id)
+    special_ids_equal = (tok_exp.all_special_ids == tok_base.all_special_ids)
+    added_dec_equal = (
+        {k: v.content for k, v in tok_exp.added_tokens_decoder.items()}
+        == {k: v.content for k, v in tok_base.added_tokens_decoder.items()}
+    )
+    probe = '<think>x+1=2</think>\n\\boxed{1}<|im_end|>'
+    encode_equal = (tok_exp.encode(probe) == tok_base.encode(probe))
+    decode_equal = (
+        tok_exp.decode(tok_exp.encode(probe), skip_special_tokens=True)
+        == tok_base.decode(tok_base.encode(probe), skip_special_tokens=True)
+        and tok_exp.decode(tok_exp.encode(probe), skip_special_tokens=False)
+        == tok_base.decode(tok_base.encode(probe), skip_special_tokens=False)
+    )
 
     chat_tpl_same = tpl_equal and render_ids_equal
-    tok_same = tok_files_equal and vocab_equal and render_ids_equal
+    tok_functional_same = (
+        vocab_equal
+        and render_ids_equal
+        and eos_equal
+        and pad_equal
+        and special_ids_equal
+        and added_dec_equal
+        and encode_equal
+        and decode_equal
+    )
     return {
         'chat_template': '一样' if chat_tpl_same else '不一样',
-        'tokenizer': '一样' if tok_same else '不一样',
+        'tokenizer_files': '一样' if tok_files_equal else '不一样',
+        'tokenizer_behavior': '一样' if tok_functional_same else '不一样',
         'chat_template_same': chat_tpl_same,
-        'tokenizer_same': tok_same,
+        'tokenizer_files_same': tok_files_equal,
+        'tokenizer_same': tok_functional_same,
         'render_ids_equal': render_ids_equal,
         'vocab_equal': vocab_equal,
+        'eos_equal': eos_equal,
+        'pad_equal': pad_equal,
+        'special_ids_equal': special_ids_equal,
+        'added_dec_equal': added_dec_equal,
+        'encode_equal': encode_equal,
+        'decode_equal': decode_equal,
         'file_details': file_details,
     }
 
@@ -264,7 +302,7 @@ def run_verify_export(base: Path, run_dir: Path, base_model: Path, gpu_id: int |
 
     print(f'sha256_archived: {sha_txt} ({len(hashes)} files)')
     print(f'vllm_loaded: {vllm_res.get("loaded")} | generated_tokens: {vllm_res.get("generated_tokens")} | close_think_present: {vllm_res.get("has_close_think")}')
-    print(f'chat_template_vs_base: {cmp_res["chat_template"]} | tokenizer_vs_base: {cmp_res["tokenizer"]}')
+    print(f'chat_template_vs_base: {cmp_res["chat_template"]} | tokenizer_behavior_vs_base: {cmp_res["tokenizer_behavior"]} | tokenizer_raw_files: {cmp_res["tokenizer_files"]}')
     print(f'STEP2_EXPORT_VERIFY_PASSED={passed} receipt={receipt_path}')
     return 0 if passed else 2
 
