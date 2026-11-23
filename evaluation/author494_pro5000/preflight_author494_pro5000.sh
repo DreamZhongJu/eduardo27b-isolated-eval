@@ -15,6 +15,8 @@ BASE_TUTOR_MODEL="${BASE_TUTOR_MODEL:-/data/models/Qwen3.5-4B}"
 STUDENT_MODEL="${STUDENT_MODEL:-/dev/shm/zhujie_a_group/Meta-Llama-3.1-8B-Instruct}"
 STUDENT_SYMLINK="${STUDENT_SYMLINK:-${BASE}/models/Meta-Llama-3.1-8B-Instruct}"
 EVAL_PARQUET="${EVAL_PARQUET:-${BASE}/data/author494_eval/test.parquet}"
+T018_MANIFEST="${T018_MANIFEST:-${BASE}/t018_bundle/t018_manifest.json}"
+REQUIRE_T018_MANIFEST="${REQUIRE_T018_MANIFEST:-1}"
 AGNES_KEY_ENV="${AGNES_KEY_ENV:-AGNES_API_KEY}"
 AGNES_KEY_FILE="${AGNES_KEY_FILE:-${HOME}/.secrets/agnes_api_key}"
 REQUIRE_EVAL_PARQUET="${REQUIRE_EVAL_PARQUET:-1}"
@@ -178,6 +180,8 @@ git -C "${REPO}" status --porcelain --untracked-files=no
   "${BASE}" \
   "${EVAL_PARQUET}" \
   "${REQUIRE_EVAL_PARQUET}" \
+  "${T018_MANIFEST}" \
+  "${REQUIRE_T018_MANIFEST}" \
   "${AGNES_KEY_ENV}" <<'PY'
 import hashlib
 import importlib.metadata
@@ -199,8 +203,10 @@ from pathlib import Path
     base_s,
     eval_parquet_s,
     req_eval_pq_s,
+    t018_manifest_s,
+    req_t018_s,
     agnes_key_env,
-) = sys.argv[1:12]
+) = sys.argv[1:14]
 
 repo = Path(repo_s)
 agroup_dir = Path(agroup_dir_s)
@@ -212,6 +218,8 @@ student_sym_dir = Path(student_sym_s)
 base_dir = Path(base_s)
 eval_parquet = Path(eval_parquet_s)
 require_eval_parquet = req_eval_pq_s == "1"
+t018_manifest_path = Path(t018_manifest_s)
+require_t018_manifest = req_t018_s == "1"
 
 hard_errors = []
 
@@ -229,7 +237,6 @@ def git_sha1_file(p: Path) -> str:
     h.update(data)
     return h.hexdigest()
 
-# 4a. Upstream git & 22 files check
 head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 status = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"], text=True).strip()
 if head != "e8c89b7293e65e632149571b16a1c2d4e33c77fe":
@@ -289,29 +296,28 @@ for pkg in ("math-verify", "pyarrow", "flash-attn", "flash-linear-attention", "f
     except importlib.metadata.PackageNotFoundError:
         print(f"{pkg}=NOT_INSTALLED")
 
-print("=== 6. A-Group step_100 Export Check (T-017 Wrap-Up Manifest) ===")
-if not agroup_ver_file.is_file() or not agroup_sha_file.is_file():
-    print(f"A_GROUP_STEP100_MANIFEST_MISSING: verified={agroup_ver_file.is_file()} sha_txt={agroup_sha_file.is_file()}")
-    hard_errors.append("A_GROUP_STEP100_MANIFEST_MISSING")
-elif not agroup_dir.is_dir():
+print("=== 6. A-Group step_100 Export Check (T-017 收尾第 2 步锁定) ===")
+STEP100_LOCK = {
+    "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "config.json": "6d320dedc3a50ea3eb4bf7ab503fed018f21784f001c61ff9de9a7ed411e69f0",
+    "generation_config.json": "944b9abc4ec388933cc00c757a7b794683929e5a02e5123853892a750645689",
+    "model.safetensors": "35435951b689199681a59cc9667cda29e75025f575cd8758bb8320e2f11d88e8",
+    "processor_config.json": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "7488550a894dcf741616126e322ea31d66cf9457b59ec5825f4c7efdced421f8",
+}
+if not agroup_dir.is_dir():
     print(f"A_GROUP_STEP100_DIR_MISSING: {agroup_dir}")
     hard_errors.append("A_GROUP_STEP100_DIR_MISSING")
 else:
-    ver = json.loads(agroup_ver_file.read_text(encoding="utf-8"))
-    if ver.get("passed") is not True:
-        print(f"A_GROUP_STEP100_NOT_PASSED: passed={ver.get('passed')}")
-        hard_errors.append("A_GROUP_STEP100_NOT_PASSED")
-    sha_map = {}
-    for raw in agroup_sha_file.read_text(encoding="utf-8").splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        h_val, rel = raw.split(None, 1)
-        sha_map[rel] = h_val
-    ver_map = ver.get("files_sha256") or {}
-    if not sha_map or sha_map != ver_map:
-        print("A_GROUP_STEP100_MANIFEST_MISMATCH: export_step100_sha256.txt != export_step100_verified.json")
-        hard_errors.append("A_GROUP_STEP100_MANIFEST_MISMATCH")
+    if not agroup_ver_file.is_file() or not agroup_sha_file.is_file():
+        print("A_GROUP_STEP100_MANIFEST_MISSING")
+        hard_errors.append("A_GROUP_STEP100_MANIFEST_MISSING")
+    else:
+        ver = json.loads(agroup_ver_file.read_text(encoding="utf-8"))
+        if ver.get("passed") is not True or ver.get("files_sha256") != STEP100_LOCK:
+            print("A_GROUP_STEP100_RECEIPT_MISMATCH")
+            hard_errors.append("A_GROUP_STEP100_RECEIPT_MISMATCH")
     actual_files = {}
     agroup_bad = 0
     for p in sorted(agroup_dir.rglob("*")):
@@ -321,8 +327,8 @@ else:
         elif p.is_file():
             rel = str(p.relative_to(agroup_dir))
             actual_files[rel] = sha256_file(p)
-    for rel in sorted(set(sha_map) | set(actual_files)):
-        exp_h = sha_map.get(rel)
+    for rel in sorted(set(STEP100_LOCK) | set(actual_files)):
+        exp_h = STEP100_LOCK.get(rel)
         got_h = actual_files.get(rel)
         if exp_h is None:
             print(f"a_group/{rel}: EXTRA_FILE sha256={got_h}")
@@ -335,7 +341,7 @@ else:
             agroup_bad += 1
         else:
             print(f"a_group/{rel}: OK sha256={got_h}")
-    print(f"a_group_step100_checked={len(sha_map)} mismatches={agroup_bad}")
+    print(f"a_group_step100_checked={len(STEP100_LOCK)} mismatches={agroup_bad}")
     if agroup_bad:
         hard_errors.append(f"A_GROUP_STEP100_MISMATCH:{agroup_bad}")
 
@@ -398,8 +404,6 @@ if student_dir is None:
     hard_errors.append("STUDENT_MISSING")
 else:
     print(f"student_resolved_dir={student_dir}")
-    if not str(student_dir).startswith("/dev/shm/zhujie_a_group"):
-        print(f"WARNING: student not under /dev/shm/zhujie_a_group: {student_dir}")
     cfg = json.loads((student_dir / "config.json").read_text())
     print(f"student_config: model_type={cfg.get('model_type')} hidden={cfg.get('hidden_size')} layers={cfg.get('num_hidden_layers')}")
     idx = json.loads((student_dir / "model.safetensors.index.json").read_text())
@@ -424,7 +428,7 @@ else:
     if student_bad:
         hard_errors.append(f"STUDENT_MISMATCH:{student_bad}")
 
-print("=== 9. Dataset Check (5d7529f0 & author494_eval/test.parquet) ===")
+print("=== 9. Dataset & A100 T-018 Table Check ===")
 RAW_TEST_SHA = "109b45cf350cb70414a294ff999d4f545b06e9df91e02ec1a0a3b30783c46ec0"
 RAW_TRAIN_SHA = "5171c9891b502f9792b14ac2b15684ce85b8ceb2593689ed3e88b9f349b25d61"
 found_raw_test = None
@@ -438,19 +442,38 @@ if data_root.is_dir():
             found_raw_test = p
         elif p.name.startswith("train-00000") and sha256_file(p) == RAW_TRAIN_SHA:
             found_raw_train = p
-print(f"raw_test_parquet={'OK ' + str(found_raw_test) if found_raw_test else 'NOT_FOUND_IN_' + str(data_root)}")
-print(f"raw_train_parquet={'OK ' + str(found_raw_train) if found_raw_train else 'NOT_FOUND_IN_' + str(data_root)}")
+print(f"raw_test_parquet={'OK ' + str(found_raw_test) if found_raw_test else 'NOT_FOUND'}")
+print(f"raw_train_parquet={'OK ' + str(found_raw_train) if found_raw_train else 'NOT_FOUND'}")
 
+eval_pq_sha = None
 if eval_parquet.is_file():
+    eval_pq_sha = sha256_file(eval_parquet)
     df = pandas.read_parquet(eval_parquet)
     n_tp = sum(1 for r in df["extra_info"] if isinstance(r, dict) and r.get("transfer_problem") and r.get("transfer_answer"))
-    print(f"eval_test_parquet={eval_parquet} rows={len(df)} transfer_valid={n_tp} sha256={sha256_file(eval_parquet)}")
+    print(f"eval_test_parquet={eval_parquet} rows={len(df)} transfer_valid={n_tp} sha256={eval_pq_sha}")
     if len(df) != 494 or n_tp != 494:
         hard_errors.append(f"EVAL_PARQUET_INVALID:rows={len(df)},valid={n_tp}")
 else:
     print(f"eval_test_parquet={eval_parquet} MISSING")
     if require_eval_parquet:
         hard_errors.append("EVAL_PARQUET_MISSING")
+
+if t018_manifest_path.is_file():
+    t_man = json.loads(t018_manifest_path.read_text(encoding="utf-8"))
+    t_csv = t018_manifest_path.parent / str(t_man.get("table_filename", "t018_per_problem.csv"))
+    t_csv_sha = sha256_file(t_csv) if t_csv.is_file() else "MISSING"
+    print(f"t018_table={t_csv} sha256_match={t_csv_sha == t_man.get('table_sha256')}")
+    if t_csv_sha != t_man.get("table_sha256"):
+        hard_errors.append("T018_TABLE_SHA_MISMATCH")
+    exp_pq_sha = t_man.get("test_parquet_sha256")
+    pq_match = (eval_pq_sha is not None and eval_pq_sha == exp_pq_sha)
+    print(f"test_parquet_matches_a100_t018={pq_match} (pro5000={eval_pq_sha} a100={exp_pq_sha})")
+    if eval_pq_sha is not None and not pq_match:
+        hard_errors.append("EVAL_PARQUET_SHA_DIFFERS_FROM_A100_T018")
+else:
+    print(f"t018_manifest={t018_manifest_path} MISSING")
+    if require_t018_manifest:
+        hard_errors.append("T018_MANIFEST_MISSING")
 
 data_free_gb = shutil.disk_usage("/data").free / 1e9
 print(f"data_free_gb={data_free_gb:.2f}")

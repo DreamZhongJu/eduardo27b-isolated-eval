@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build paired_gain.py CSV from Pro 5000 A-group and base author-494 result JSONs.
+"""Build paired_gain.py CSV from Pro 5000 A-group JSON and A100 T-018 per-problem table.
 
 - Uses row_index as unit_id (kept strictly local; never printed).
-- Requires 0 student failed calls in both JSONs.
+- Requires 0 student failed calls in A-group JSON.
 - Requires identical row_index sets and identical pre_solve_rate / pre_solve_rate_transfer
-  for every row_index across both runs (within 1e-9).
+  for every row_index across A-group JSON and T-018 table (within 1e-9).
 - Immediately verifies that paired_gain.py's mean normalized delta per (condition, group)
-  matches the author JSON metrics within < 1e-9 before committing the output CSV.
+  matches A-group JSON metrics and T-018 table recomputed deltas within < 1e-9.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ for p in (HERE, PAIRED_DIR):
         sys.path.insert(0, str(p))
 
 import paired_gain as pg  # noqa: E402
+from export_t018_table import load_t018_table, recompute_from_t018_table  # noqa: E402
 from summarize_author494_pro5000 import (  # noqa: E402
     recompute_author_summary,
     validate_results_doc,
@@ -59,88 +60,66 @@ def _counts_from_rate(rate: float, total: int, field: str) -> int:
     return rounded
 
 
-def _group_by_row(records: list[dict[str, Any]], label: str) -> dict[int, list[dict[str, Any]]]:
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for rec in records:
-        grouped.setdefault(rec["row_index"], []).append(rec)
-    for ridx, recs in grouped.items():
-        if len(recs) > 1:
-            # Verify internal consistency if multiple samples exist for one row.
-            p_s0 = float(recs[0]["pre_solve_rate"])
-            p_t0 = float(recs[0]["pre_solve_rate_transfer"])
-            for r in recs[1:]:
-                if not math.isclose(float(r["pre_solve_rate"]), p_s0, abs_tol=PRE_TOL) or not math.isclose(
-                    float(r["pre_solve_rate_transfer"]), p_t0, abs_tol=PRE_TOL
-                ):
-                    raise ValueError(f"{label} JSON has inconsistent pre_solve_rate within a problem")
-    return grouped
-
-
 def build_and_verify_paired_csv(
     *,
-    base_doc: dict[str, Any],
+    t018_by_row: dict[int, dict[str, Any]],
     a_group_doc: dict[str, Any],
     out_csv: Path,
     base_name: str = "base",
     target_name: str = "a_group",
+    t018_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Validate both docs, write paired CSV atomically, and verify exact delta match."""
-    base_metrics, base_records, _ = validate_results_doc(base_doc)
+    """Validate inputs, write paired CSV atomically, and verify <1e-9 delta match."""
     ag_metrics, ag_records, _ = validate_results_doc(a_group_doc)
-
-    base_re = recompute_author_summary(base_records)
     ag_re = recompute_author_summary(ag_records)
-    verify_author_summary_match(base_re, base_metrics)
     verify_author_summary_match(ag_re, ag_metrics)
 
-    if base_re["n_student_calls_failed"] != 0:
-        raise ValueError(f"base JSON has student_calls_failed={base_re['n_student_calls_failed']} != 0")
     if ag_re["n_student_calls_failed"] != 0:
         raise ValueError(f"a_group JSON has student_calls_failed={ag_re['n_student_calls_failed']} != 0")
 
-    k_base = _extract_num_attempts(base_doc, "base")
     k_ag = _extract_num_attempts(a_group_doc, "a_group")
-    if k_base != k_ag:
-        raise ValueError(f"num_student_attempts mismatch: base={k_base} vs a_group={k_ag}")
+    ag_by_row: dict[int, list[dict[str, Any]]] = {}
+    for rec in ag_records:
+        ag_by_row.setdefault(rec["row_index"], []).append(rec)
 
-    base_by_row = _group_by_row(base_records, "base")
-    ag_by_row = _group_by_row(ag_records, "a_group")
-
-    if set(base_by_row) != set(ag_by_row):
-        only_base = len(set(base_by_row) - set(ag_by_row))
-        only_ag = len(set(ag_by_row) - set(base_by_row))
+    if set(t018_by_row) != set(ag_by_row):
+        only_base = len(set(t018_by_row) - set(ag_by_row))
+        only_ag = len(set(ag_by_row) - set(t018_by_row))
         raise ValueError(
-            f"row_index sets differ between base and a_group (only_base={only_base}, only_a_group={only_ag})"
+            f"row_index sets differ between T-018 table and a_group (only_base={only_base}, only_a_group={only_ag})"
         )
 
-    sorted_rows = sorted(base_by_row)
+    sorted_rows = sorted(t018_by_row)
     mismatch_same = 0
     mismatch_transfer = 0
-    sample_mismatch = 0
     for ridx in sorted_rows:
-        b_recs = base_by_row[ridx]
-        a_recs = ag_by_row[ridx]
-        if len(b_recs) != len(a_recs):
-            sample_mismatch += 1
-        if not math.isclose(
-            float(b_recs[0]["pre_solve_rate"]),
-            float(a_recs[0]["pre_solve_rate"]),
-            abs_tol=PRE_TOL,
-        ):
-            mismatch_same += 1
-        if not math.isclose(
-            float(b_recs[0]["pre_solve_rate_transfer"]),
-            float(a_recs[0]["pre_solve_rate_transfer"]),
-            abs_tol=PRE_TOL,
-        ):
-            mismatch_transfer += 1
+        t_rec = t018_by_row[ridx]
+        for a_rec in ag_by_row[ridx]:
+            if not math.isclose(
+                float(t_rec["pre_solve_rate"]),
+                float(a_rec["pre_solve_rate"]),
+                abs_tol=PRE_TOL,
+            ):
+                mismatch_same += 1
+            if not math.isclose(
+                float(t_rec["pre_solve_rate_transfer"]),
+                float(a_rec["pre_solve_rate_transfer"]),
+                abs_tol=PRE_TOL,
+            ):
+                mismatch_transfer += 1
 
-    if sample_mismatch or mismatch_same or mismatch_transfer:
+    if mismatch_same or mismatch_transfer:
         raise ValueError(
-            "Pre-test or sample-count mismatch across runs "
-            f"(sample_mismatch={sample_mismatch}, pre_same_mismatch={mismatch_same}, "
-            f"pre_transfer_mismatch={mismatch_transfer})"
+            "Pre-test consistency mismatch between T-018 table and a_group "
+            f"(pre_same_mismatch={mismatch_same}, pre_transfer_mismatch={mismatch_transfer})"
         )
+
+    t018_recomp = recompute_from_t018_table(t018_by_row)
+    if t018_manifest is not None:
+        mc = t018_manifest.get("recomputed_checks") or {}
+        for k in ("delta_transfer", "delta_same"):
+            if k in mc and abs(t018_recomp[k] - float(mc[k])) >= DELTA_TOL:
+                raise ValueError(f"T-018 table {k} mismatch against t018_manifest.json")
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     tmp_csv = out_csv.with_name(f".{out_csv.name}.{os.getpid()}.tmp")
@@ -149,41 +128,71 @@ def build_and_verify_paired_csv(
         with tmp_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(pg.REQUIRED_COLUMNS))
             writer.writeheader()
-            for cond_name, by_row in ((base_name, base_by_row), (target_name, ag_by_row)):
-                for ridx in sorted_rows:
-                    for rec in by_row[ridx]:
-                        c_trans = _counts_from_rate(
-                            float(rec["post_solve_transfer"]), k_base, "post_solve_transfer"
-                        )
-                        c_same = _counts_from_rate(
-                            float(rec["post_solve_same"]), k_base, "post_solve_same"
-                        )
-                        writer.writerow({
-                            "unit_id": str(ridx),
-                            "condition": cond_name,
-                            "group": "author494_transfer",
-                            "pre": f"{float(rec['pre_solve_rate_transfer']):.17g}",
-                            "post_correct": c_trans,
-                            "post_total": k_base,
-                            "post_unknown": 0,
-                        })
-                        writer.writerow({
-                            "unit_id": str(ridx),
-                            "condition": cond_name,
-                            "group": "author494_same",
-                            "pre": f"{float(rec['pre_solve_rate']):.17g}",
-                            "post_correct": c_same,
-                            "post_total": k_base,
-                            "post_unknown": 0,
-                        })
-                        n_rows_written += 2
+            # Write base rows from A100 T-018 per-problem table.
+            for ridx in sorted_rows:
+                t_rec = t018_by_row[ridx]
+                writer.writerow({
+                    "unit_id": str(ridx),
+                    "condition": base_name,
+                    "group": "author494_transfer",
+                    "pre": f"{float(t_rec['pre_solve_rate_transfer']):.17g}",
+                    "post_correct": int(t_rec["post_transfer_correct"]),
+                    "post_total": int(t_rec["post_transfer_total"]),
+                    "post_unknown": 0,
+                })
+                writer.writerow({
+                    "unit_id": str(ridx),
+                    "condition": base_name,
+                    "group": "author494_same",
+                    "pre": f"{float(t_rec['pre_solve_rate']):.17g}",
+                    "post_correct": int(t_rec["post_same_correct"]),
+                    "post_total": int(t_rec["post_same_total"]),
+                    "post_unknown": 0,
+                })
+                n_rows_written += 2
+
+            # Write a_group rows from Pro 5000 result JSON.
+            for ridx in sorted_rows:
+                for rec in ag_by_row[ridx]:
+                    c_trans = _counts_from_rate(
+                        float(rec["post_solve_transfer"]), k_ag, "post_solve_transfer"
+                    )
+                    c_same = _counts_from_rate(
+                        float(rec["post_solve_same"]), k_ag, "post_solve_same"
+                    )
+                    writer.writerow({
+                        "unit_id": str(ridx),
+                        "condition": target_name,
+                        "group": "author494_transfer",
+                        "pre": f"{float(rec['pre_solve_rate_transfer']):.17g}",
+                        "post_correct": c_trans,
+                        "post_total": k_ag,
+                        "post_unknown": 0,
+                    })
+                    writer.writerow({
+                        "unit_id": str(ridx),
+                        "condition": target_name,
+                        "group": "author494_same",
+                        "pre": f"{float(rec['pre_solve_rate']):.17g}",
+                        "post_correct": c_same,
+                        "post_total": k_ag,
+                        "post_unknown": 0,
+                    })
+                    n_rows_written += 2
 
         loaded_rows = pg.load_csv(tmp_csv)
         checks: dict[str, dict[str, float]] = {}
-        for cond_name, expected_metrics in (
-            (base_name, base_metrics),
-            (target_name, ag_metrics),
-        ):
+        expected_by_cond = {
+            base_name: {
+                "delta_transfer": t018_recomp["delta_transfer"],
+                "delta_same": t018_recomp["delta_same"],
+            },
+            target_name: {
+                "delta_transfer": float(ag_metrics["delta_transfer"]),
+                "delta_same": float(ag_metrics["delta_same"]),
+            },
+        }
+        for cond_name, expected_metrics in expected_by_cond.items():
             for grp_name, metric_key in (
                 ("author494_transfer", "delta_transfer"),
                 ("author494_same", "delta_same"),
@@ -197,16 +206,16 @@ def build_and_verify_paired_csv(
                         f"units={len(unit_gains)} expected={len(sorted_rows)} skip={n_skip} excl={n_excl}"
                     )
                 csv_mean = sum(unit_gains.values()) / len(unit_gains)
-                json_mean = float(expected_metrics[metric_key])
-                diff = abs(csv_mean - json_mean)
+                ref_mean = float(expected_metrics[metric_key])
+                diff = abs(csv_mean - ref_mean)
                 if diff >= DELTA_TOL:
                     raise ValueError(
                         f"CSV delta check failed for ({cond_name}, {grp_name}): "
-                        f"csv={csv_mean:.12f} json={json_mean:.12f} diff={diff:.3e} >= {DELTA_TOL:.1e}"
+                        f"csv={csv_mean:.12f} ref={ref_mean:.12f} diff={diff:.3e} >= {DELTA_TOL:.1e}"
                     )
                 checks[f"{cond_name}.{grp_name}"] = {
                     "csv_mean": csv_mean,
-                    "json_mean": json_mean,
+                    "ref_mean": ref_mean,
                     "abs_diff": diff,
                 }
 
@@ -218,29 +227,38 @@ def build_and_verify_paired_csv(
     return {
         "n_problems": len(sorted_rows),
         "n_csv_rows": n_rows_written,
-        "post_total": k_base,
+        "post_total_a_group": k_ag,
         "delta_checks": checks,
     }
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Create and verify paired_gain CSV from two author-494 JSONs.")
-    ap.add_argument("--base-json", required=True, type=Path)
+    ap = argparse.ArgumentParser(
+        description="Create and verify paired_gain CSV from Pro 5000 A-group JSON and A100 T-018 table."
+    )
     ap.add_argument("--a-group-json", required=True, type=Path)
+    ap.add_argument("--t018-table", required=True, type=Path)
+    ap.add_argument("--t018-manifest", type=Path, default=None)
     ap.add_argument("--out-csv", required=True, type=Path)
     ap.add_argument("--base-name", default="base")
     ap.add_argument("--target-name", default="a_group")
     args = ap.parse_args()
 
     try:
-        base_doc = json.loads(args.base_json.read_text(encoding="utf-8"))
+        t018_rows = load_t018_table(args.t018_table)
         ag_doc = json.loads(args.a_group_json.read_text(encoding="utf-8"))
+        manifest = (
+            json.loads(args.t018_manifest.read_text(encoding="utf-8"))
+            if args.t018_manifest is not None
+            else None
+        )
         info = build_and_verify_paired_csv(
-            base_doc=base_doc,
+            t018_by_row=t018_rows,
             a_group_doc=ag_doc,
             out_csv=args.out_csv,
             base_name=args.base_name,
             target_name=args.target_name,
+            t018_manifest=manifest,
         )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -248,12 +266,12 @@ def main() -> int:
 
     print(
         f"[make_paired_csv] OK problems={info['n_problems']} csv_rows={info['n_csv_rows']} "
-        f"post_total={info['post_total']}"
+        f"post_total_a_group={info['post_total_a_group']}"
     )
     for label, d in info["delta_checks"].items():
         print(
             f"[make_paired_csv] check {label}: csv={d['csv_mean']:+.6f} "
-            f"json={d['json_mean']:+.6f} diff={d['abs_diff']:.2e}"
+            f"ref={d['ref_mean']:+.6f} diff={d['abs_diff']:.2e}"
         )
     return 0
 

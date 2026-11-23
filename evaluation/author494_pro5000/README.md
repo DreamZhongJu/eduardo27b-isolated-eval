@@ -1,26 +1,18 @@
-# Author-494 Evaluation on RTX PRO 5000 (T-020: A-group step_100 & Qwen3.5-4B base)
+# Author-494 Evaluation Kit v2 (T-020: Pro 5000 A-group step_100 vs A100 T-018 base)
 
-用于在 RTX PRO 5000 服务器（`~/bzhang/a_group_pro5000`）上按 T-018 同一套作者上游 `e8c89b7` 评测代码和参数，对以下两个 Tutor 各跑一次作者 494 题全量评测并配对对比：
+用于在 **A100**（抽取 T-018 逐题表）与 **RTX PRO 5000**（换机器检查、A 组第 100 步全量、配对 bootstrap 与汇总）上按作者上游 `e8c89b7` 评测作者 494 题。
 
-1. **A 组第 100 步导出**：`~/bzhang/a_group_pro5000/runs/stage3_formal_20261121_144311/exports/step_100`
-2. **Base 基座模型**：`/data/models/Qwen3.5-4B`（HF `851bf6e8`）
+## v2 核心流程
 
-## 与 T-018（A100）的核心差异（已固定）
-
-- 硬件：`8 × RTX PRO 5000 72GB Blackwell`（`73,415 MiB`/卡，`--min-free-mib 70000`；处理 GPU 6 空闲传感器 `util=100` 特性）
-- 运行时：`LD_LIBRARY_PATH=$ENV_DIR/lib`（conda `libstdc++ CXXABI_1.3.15`）、`CUDA_DEVICE_ORDER=PCI_BUS_ID`、缓存目录全部指向 `$BASE`
-- Agnes 并发：Pro 5000 上限 **3 路**（`--judge-concurrency 2 --eval-judge-concurrency 1`）
-
-## 文件清单
-
-- `preflight_author494_pro5000.sh`：只读预检（不占卡、不调 Agnes），核对卡/进程/端口/磁盘、上游 `e8c89b7` 22 个文件、包版本、A 组第 100 步导出清单（T-017 收尾第 2 步生成的 `export_step100_verified.json` 与 `export_step100_sha256.txt`）、base Tutor 11 文件、`/dev/shm/zhujie_a_group/` 学生 8B（7 文件）及 `test.parquet`（494 行）。
-- `agnes_ping_author494.py`：用 1 条合成对话走作者 `make_judge_client` 路径测试 Pro 5000 到 Agnes 的连通性与 JSON 解析。
-- `wait_gpus_author494_pro5000.py`：只读 4 卡等卡器与学生启动期间 Tutor 卡占位器（`min_free_mib=70000`）。
-- `run_author494_pro5000.sh`：Pro 5000 通用评测启动器（A 组与 base 共用，参数完全一致），支持 `--prepare-only`、`--auto-wait`、`--status`。
-- `make_paired_csv.py`：读取 A 组和 base 两次全量结果 JSON，按 `row_index` 对齐生成 `paired_gain.py` 所需 CSV（只留 Pro 5000），校验前测一致且 CSV 均值与作者 JSON `DELTA_TRANSFER` / `DELTA_SAME` 差 `< 1e-9`。
-- `summarize_author494_pro5000.py`：单次运行汇总（用于阶段 1 base 20 题冒烟）与全量三表汇总（判定 A 复现、判定 B `paired_gain.py` 配对差、判定 C Pro 5000 base vs A100 base T-018，及次要指标并排表）。
-- `paired_gain/`：照原样收入 `组织/参考/a-group-paired-gain/` 的三个文件（`paired_gain.py`、`test_paired_gain.py`、`README.md`）。
-- `test_author494_pro5000.py`：标准库 `unittest`（纯假数据）。
+1. **A100 侧（`export_t018_table.py`）**：从 T-018 阶段 2/3 两个结果 JSON 抽出脱敏逐题表 `t018_per_problem.csv`（494 行，无题面/答案/对话/裁判理由）与 `t018_manifest.json`（含 T-018 `test.parquet` 的 SHA-256），复算核对 `< 1e-9` 后打包为 `t018_table_bundle.tar.gz`。
+2. **Pro 5000 侧换机器检查（`run_control_author494_pro5000.sh` + `compare_stack.py`）**：
+   - 先核对 Pro 5000 `test.parquet` 与 A100 T-018 的 `test.parquet` SHA-256 逐字节一致；
+   - 跑一轮 494 题无辅导对照 `ctl`（调用作者 `_solve_rate`，约 15,808 次，不调 Agnes），与 A100 `ctl1` 比均值差 `<= 0.02` 与逐题相关（迁移 `>= 0.834`、原题 `>= 0.817`）；
+   - 核对 base 20 题冒烟（`assume_thinking=True`、`Empty%` 在 `70.14% ± 15pp`、`student_calls_failed=0`）。
+3. **Pro 5000 侧阶段 2（A 组第 100 步全量 → `make_paired_csv.py` → `summarize_author494_pro5000.py`）**：
+   - 只跑 A 组第 100 步全量（Agnes 并发 `2 + 1 = 3` 路），不再重跑 base 全量；
+   - `make_paired_csv.py` 读 A 组结果 JSON 与 A100 `t018_per_problem.csv`，核对行号对齐、前测一致、CSV 均值与两边原始结果差 `< 1e-9`；
+   - `summarize_author494_pro5000.py` 给出判定 A（对比论文 Eduardo-4B）、判定 B（`paired_gain.py` 逐题配对）、换机器检查表及次要指标并排表（含 `ctl1` 换基线、R2、R3、均值差）。
 
 ## cu04 本地单元测试
 

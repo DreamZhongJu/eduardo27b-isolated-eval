@@ -4,8 +4,10 @@
 Supports:
 1. Single-run mode (e.g., Stage 1 20-problem base smoke test):
    summarize_author494_pro5000.py <result_json> [--paper-baseline base|eduardo4b]
-2. Full T-020 comparison mode (Verdicts A, B, C + secondary metrics):
-   summarize_author494_pro5000.py --a-group-json <path> --base-json <path> --paired-csv <path>
+2. Full T-020 comparison mode (Verdict A, Verdict B paired with A100 base,
+   cross-machine stack check table, and secondary metrics including ctl1 rebaselined):
+   summarize_author494_pro5000.py --a-group-json <path> --t018-table <path> --paired-csv <path> \
+     [--compare-stack-json <path>] [--pro5000-ctl-json <path>]
 
 Never prints problem IDs, row_index, unit_id, problem text, answers, dialogues,
 or judge reasoning.
@@ -14,6 +16,7 @@ or judge reasoning.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -28,6 +31,7 @@ PAIRED_DIR = HERE / "paired_gain"
 if str(PAIRED_DIR) not in sys.path:
     sys.path.insert(0, str(PAIRED_DIR))
 
+import numpy as np  # noqa: E402
 import paired_gain as pg  # noqa: E402
 
 PAPER_EDUARDO_4B: dict[str, Any] = {
@@ -60,19 +64,13 @@ PAPER_BASE_4B: dict[str, Any] = {
     "thinking_tokens_avg_per_turn": 596.0,
 }
 
-# T-018 A100 Qwen3.5-4B base full-494 summary numbers (from 组织/结果/T-018.md).
+# T-018 A100 Qwen3.5-4B base reference (from 组织/结果/T-018.md) for dialogue-level diagnostics
+# not present in the per-problem table (Empty%, EoC rate, Thinking tok/turn).
 A100_T018_BASE: dict[str, Any] = {
     "delta_transfer": 0.1247,
     "delta_transfer_ci": (0.0888, 0.1596),
     "delta_same": 0.1769,
     "delta_same_ci": (0.1377, 0.2158),
-    "delta_transfer_gated": 0.1097,
-    "delta_same_gated": 0.1575,
-    "leak_rate": 0.0668,
-    "leak_rate_ci": (0.0466, 0.0891),
-    "teaching_reject_rate": 0.6316,
-    "eval_judge_pedagogy": 2.47,
-    "eval_judge_correctness": 3.24,
     "blanked_teacher_turn_rate": 0.7108,
     "token_budget_truncated_rate": 0.3057,
     "eoc_rate": 0.6943,
@@ -420,7 +418,6 @@ def analyze_judge_failures(records: list[dict[str, Any]], expected_votes: int) -
             eval_correctness_missing += 1
 
     clean_retry_records = [r for r, bad in zip(records, convs_with_retry_fail) if not bad]
-    clean_any_records = [r for r, bad in zip(records, convs_with_any_fail) if not bad]
     retry_fail_rate = (retry_failed_votes / total_votes) if total_votes else 0.0
     parse_fail_rate = (parse_failed_votes / total_votes) if total_votes else 0.0
 
@@ -434,7 +431,6 @@ def analyze_judge_failures(records: list[dict[str, Any]], expected_votes: int) -
         "conversations_with_retry_fail": sum(convs_with_retry_fail),
         "conversations_with_any_fail": sum(convs_with_any_fail),
         "clean_retry_records": clean_retry_records,
-        "clean_any_records": clean_any_records,
         "judge_available": retry_fail_rate <= 0.01 + _EPS,
         "eval_pedagogy_missing": eval_pedagogy_missing,
         "eval_correctness_missing": eval_correctness_missing,
@@ -553,33 +549,6 @@ def judge_paired_verdict(diff_ci_low: float, diff_ci_high: float) -> str:
     return "看不出差别"
 
 
-def judge_cross_machine_verdict(
-    delta_transfer: float,
-    ci_transfer: tuple[float, float],
-    delta_same: float,
-    ci_same: tuple[float, float],
-    *,
-    a100_ref: dict[str, Any] = A100_T018_BASE,
-) -> tuple[str, dict[str, Any]]:
-    """Apply T-020 Verdict C rule comparing Pro 5000 base vs A100 T-018 base."""
-    diff_t = abs(delta_transfer - float(a100_ref["delta_transfer"]))
-    diff_s = abs(delta_same - float(a100_ref["delta_same"]))
-    overlap_t = intervals_overlap(ci_transfer, tuple(a100_ref["delta_transfer_ci"]))
-    overlap_s = intervals_overlap(ci_same, tuple(a100_ref["delta_same_ci"]))
-    consistent = (
-        diff_t <= 0.04 + _EPS
-        and diff_s <= 0.04 + _EPS
-        and overlap_t
-        and overlap_s
-    )
-    return ("一致" if consistent else "不一致"), {
-        "diff_transfer": diff_t,
-        "diff_same": diff_s,
-        "overlap_transfer": overlap_t,
-        "overlap_same": overlap_s,
-    }
-
-
 def summarize_single_run(
     doc: dict[str, Any],
     *,
@@ -695,6 +664,152 @@ def summarize_single_run(
     }
 
 
+def _summarize_t018_table(
+    t018_by_row: dict[int, dict[str, Any]],
+    *,
+    seed: int,
+    draws: int,
+) -> dict[str, Any]:
+    """Compute base metrics from the sanitized A100 T-018 per-problem table."""
+    sorted_rows = sorted(t018_by_row)
+    pre_t: list[float] = []
+    pre_s: list[float] = []
+    post_t: list[float] = []
+    post_s: list[float] = []
+    ctl1_t: list[float] = []
+    ctl1_s: list[float] = []
+    dt_vals: list[float] = []
+    ds_vals: list[float] = []
+    dt_g_vals: list[float] = []
+    ds_g_vals: list[float] = []
+    gap_vals: list[float] = []
+    leaks: list[float] = []
+    teach_rejs: list[float] = []
+    peds: list[float] = []
+    facts: list[float] = []
+    truncs: list[float] = []
+
+    for ridx in sorted_rows:
+        r = t018_by_row[ridx]
+        pt = r["post_transfer_correct"] / r["post_transfer_total"]
+        ps = r["post_same_correct"] / r["post_same_total"]
+        prt = float(r["pre_solve_rate_transfer"])
+        prs = float(r["pre_solve_rate"])
+        c1t = r["ctl1_transfer_correct"] / r["ctl1_transfer_total"]
+        c1s = r["ctl1_same_correct"] / r["ctl1_same_total"]
+
+        dt = pg.normalized_gain(prt, pt)
+        ds = pg.normalized_gain(prs, ps)
+        lk = int(r["leaked"])
+
+        pre_t.append(prt)
+        pre_s.append(prs)
+        post_t.append(pt)
+        post_s.append(ps)
+        ctl1_t.append(c1t)
+        ctl1_s.append(c1s)
+        dt_vals.append(dt)
+        ds_vals.append(ds)
+        dt_g_vals.append(0.0 if lk else dt)
+        ds_g_vals.append(0.0 if lk else ds)
+        gap_vals.append(ds - dt)
+        leaks.append(float(lk))
+        teach_rejs.append(float(r["teaching_rejected"]))
+        if r["eval_judge_pedagogy"] is not None:
+            peds.append(float(r["eval_judge_pedagogy"]))
+        if r["eval_judge_correctness"] is not None:
+            facts.append(float(r["eval_judge_correctness"]))
+        truncs.append(float(r["is_truncated"]))
+
+    dt_m, dt_lo, dt_hi, n_prob = bootstrap_ci(dt_vals, seed=seed, draws=draws)
+    ds_m, ds_lo, ds_hi, _ = bootstrap_ci(ds_vals, seed=seed, draws=draws)
+    dtg_m, dtg_lo, dtg_hi, _ = bootstrap_ci(dt_g_vals, seed=seed, draws=draws)
+    dsg_m, dsg_lo, dsg_hi, _ = bootstrap_ci(ds_g_vals, seed=seed, draws=draws)
+    gap_m, gap_lo, gap_hi, _ = bootstrap_ci(gap_vals, seed=seed, draws=draws)
+    lk_m, lk_lo, lk_hi, _ = bootstrap_ci(leaks, seed=seed, draws=draws)
+
+    r2_t = bootstrap_paired_stat(list(zip(pre_t, post_t)), compute_hake_g, seed=seed, draws=draws)
+    r2_s = bootstrap_paired_stat(list(zip(pre_s, post_s)), compute_hake_g, seed=seed, draws=draws)
+    r3_t = bootstrap_paired_stat(list(zip(pre_t, post_t)), compute_cohens_d, seed=seed, draws=draws)
+    r3_s = bootstrap_paired_stat(list(zip(pre_s, post_s)), compute_cohens_d, seed=seed, draws=draws)
+
+    return {
+        "num_problems": n_prob,
+        "pre_solve_rate_transfer": statistics.fmean(pre_t),
+        "pre_solve_rate": statistics.fmean(pre_s),
+        "post_solve_transfer": statistics.fmean(post_t),
+        "post_solve_same": statistics.fmean(post_s),
+        "ctl1_transfer": statistics.fmean(ctl1_t),
+        "ctl1_same": statistics.fmean(ctl1_s),
+        "delta_transfer": {"mean": dt_m, "ci": [dt_lo, dt_hi]},
+        "delta_same": {"mean": ds_m, "ci": [ds_lo, ds_hi]},
+        "delta_transfer_gated": {"mean": dtg_m, "ci": [dtg_lo, dtg_hi]},
+        "delta_same_gated": {"mean": dsg_m, "ci": [dsg_lo, dsg_hi]},
+        "transfer_gap": {"mean": gap_m, "ci": [gap_lo, gap_hi]},
+        "r2_hake_g_transfer": r2_t,
+        "r2_hake_g_same": r2_s,
+        "r3_cohens_d_transfer": r3_t,
+        "r3_cohens_d_same": r3_s,
+        "leak_rate_author": {"mean": lk_m, "ci": [lk_lo, lk_hi]},
+        "teaching_reject_rate": statistics.fmean(teach_rejs),
+        "eval_judge_pedagogy": statistics.fmean(peds) if peds else 0.0,
+        "eval_judge_correctness": statistics.fmean(facts) if facts else 0.0,
+        "token_budget_truncated_rate": statistics.fmean(truncs),
+        "blanked_teacher_turn_rate": A100_T018_BASE["blanked_teacher_turn_rate"],
+        "eoc_rate": A100_T018_BASE["eoc_rate"],
+        "thinking_tokens_avg_per_turn": A100_T018_BASE["thinking_tokens_avg_per_turn"],
+    }
+
+
+def _load_t018_csv_rows(csv_path: Path) -> dict[int, dict[str, Any]]:
+    by_row: dict[int, dict[str, Any]] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            ridx = int(raw["row_index"])
+            ped_s = raw["eval_judge_pedagogy"].strip()
+            fact_s = raw["eval_judge_correctness"].strip()
+            by_row[ridx] = {
+                "row_index": ridx,
+                "pre_solve_rate": float(raw["pre_solve_rate"]),
+                "pre_solve_rate_transfer": float(raw["pre_solve_rate_transfer"]),
+                "post_same_correct": int(raw["post_same_correct"]),
+                "post_same_total": int(raw["post_same_total"]),
+                "post_transfer_correct": int(raw["post_transfer_correct"]),
+                "post_transfer_total": int(raw["post_transfer_total"]),
+                "ctl1_same_correct": int(raw["ctl1_same_correct"]),
+                "ctl1_same_total": int(raw["ctl1_same_total"]),
+                "ctl1_transfer_correct": int(raw["ctl1_transfer_correct"]),
+                "ctl1_transfer_total": int(raw["ctl1_transfer_total"]),
+                "leaked": int(raw["leaked"]),
+                "teaching_rejected": int(raw["teaching_rejected"]),
+                "eval_judge_pedagogy": float(ped_s) if ped_s != "" else None,
+                "eval_judge_correctness": float(fact_s) if fact_s != "" else None,
+                "has_blanked_turn": int(raw["has_blanked_turn"]),
+                "is_truncated": int(raw["is_truncated"]),
+            }
+    if not by_row:
+        raise ValueError("Empty T-018 table CSV")
+    return by_row
+
+
+def _paired_bootstrap_arrays(
+    base_vals: list[float],
+    target_vals: list[float],
+    *,
+    seed: int,
+    draws: int,
+    group_label: str,
+) -> dict[str, float]:
+    sub_seed = pg.derive_seed(seed, group_label, True, False)
+    return pg._bootstrap_stats_from_arrays(
+        np.array(base_vals, dtype=np.float64),
+        np.array(target_vals, dtype=np.float64),
+        seed=sub_seed,
+        draws=draws,
+    )
+
+
 def _fmt_stat_ci(val: dict[str, Any] | None, *, pct: bool = False, signed: bool = True) -> str:
     if not val or val.get("mean") is None:
         return "N/A"
@@ -781,19 +896,18 @@ def format_single_report(summary: dict[str, Any], *, paper_label: str = "Paper (
 def build_full_comparison(
     *,
     a_group_doc: dict[str, Any],
-    base_doc: dict[str, Any],
+    t018_by_row: dict[int, dict[str, Any]],
     paired_csv_path: Path,
     seed: int = 42,
     draws: int = 10000,
+    compare_stack_res: dict[str, Any] | None = None,
+    pro5000_ctl_doc: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build T-020 Verdicts A, B, C and secondary metrics comparison."""
+    """Build T-020 Verdicts A, B, stack-check table, and secondary metrics."""
     ag_sum = summarize_single_run(a_group_doc, seed=seed, draws=draws, paper_ref=PAPER_EDUARDO_4B)
-    base_sum = summarize_single_run(base_doc, seed=seed, draws=draws, paper_ref=PAPER_BASE_4B)
+    base_sum = _summarize_t018_table(t018_by_row, seed=seed, draws=draws)
 
     ag_m = ag_sum["metrics"]
-    base_m = base_sum["metrics"]
-
-    # Verdict A: A group vs Paper Eduardo-4B
     verdict_a, details_a = judge_repro_verdict(
         ag_m["delta_transfer"]["mean"],
         tuple(ag_m["delta_transfer"]["ci"]),
@@ -802,7 +916,6 @@ def build_full_comparison(
         paper_ref=PAPER_EDUARDO_4B,
     )
 
-    # Verdict B: Paired gain (A group - Pro 5000 base) using T-006 paired_gain.py
     csv_rows = pg.load_csv(paired_csv_path)
     paired_report = pg.evaluate_dataset(
         rows=csv_rows,
@@ -824,20 +937,102 @@ def build_full_comparison(
     sm_stats = by_group["author494_same"]["stats"]
     verdict_b = judge_paired_verdict(tr_stats["diff_ci_low"], tr_stats["diff_ci_high"])
 
-    # Verdict C: Pro 5000 base vs A100 base (T-018)
-    verdict_c, details_c = judge_cross_machine_verdict(
-        base_m["delta_transfer"]["mean"],
-        tuple(base_m["delta_transfer"]["ci"]),
-        base_m["delta_same"]["mean"],
-        tuple(base_m["delta_same"]["ci"]),
-        a100_ref=A100_T018_BASE,
-    )
+    # Secondary paired comparisons:
+    # 1) Rebaselined R1 using A100 ctl1 as common baseline, and raw post - pre / post - ctl1 mean diffs.
+    ag_by_row: dict[int, list[dict[str, Any]]] = {}
+    for rec in a_group_doc["conversations"]:
+        ag_by_row.setdefault(rec["row_index"], []).append(rec)
+
+    sorted_rows = sorted(t018_by_row)
+    if set(ag_by_row) != set(t018_by_row):
+        raise ValueError("row_index sets differ between A-group JSON and T-018 table")
+
+    pro_ctl_by_row: dict[int, dict[str, Any]] | None = None
+    if pro5000_ctl_doc is not None:
+        pro_ctl_by_row = {int(r["row_index"]): r for r in pro5000_ctl_doc.get("records", [])}
+        if set(pro_ctl_by_row) != set(t018_by_row):
+            raise ValueError("row_index sets differ between Pro 5000 ctl JSON and T-018 table")
+
+    base_ctl1_r1_t: list[float] = []
+    base_ctl1_r1_s: list[float] = []
+    ag_ctl1_r1_t: list[float] = []
+    ag_ctl1_r1_s: list[float] = []
+    base_raw_pre_t: list[float] = []
+    base_raw_pre_s: list[float] = []
+    ag_raw_pre_t: list[float] = []
+    ag_raw_pre_s: list[float] = []
+    base_raw_ctl1_t: list[float] = []
+    base_raw_ctl1_s: list[float] = []
+    ag_raw_ctl1_t: list[float] = []
+    ag_raw_ctl1_s: list[float] = []
+
+    ag_own_ctl_r1_t: list[float] = []
+    ag_own_ctl_r1_s: list[float] = []
+
+    for ridx in sorted_rows:
+        t_rec = t018_by_row[ridx]
+        c1_t = t_rec["ctl1_transfer_correct"] / t_rec["ctl1_transfer_total"]
+        c1_s = t_rec["ctl1_same_correct"] / t_rec["ctl1_same_total"]
+        b_post_t = t_rec["post_transfer_correct"] / t_rec["post_transfer_total"]
+        b_post_s = t_rec["post_same_correct"] / t_rec["post_same_total"]
+        a_post_t = statistics.fmean(float(r["post_solve_transfer"]) for r in ag_by_row[ridx])
+        a_post_s = statistics.fmean(float(r["post_solve_same"]) for r in ag_by_row[ridx])
+        pre_t = float(t_rec["pre_solve_rate_transfer"])
+        pre_s = float(t_rec["pre_solve_rate"])
+
+        base_ctl1_r1_t.append(pg.normalized_gain(c1_t, b_post_t))
+        base_ctl1_r1_s.append(pg.normalized_gain(c1_s, b_post_s))
+        ag_ctl1_r1_t.append(pg.normalized_gain(c1_t, a_post_t))
+        ag_ctl1_r1_s.append(pg.normalized_gain(c1_s, a_post_s))
+
+        base_raw_pre_t.append(b_post_t - pre_t)
+        base_raw_pre_s.append(b_post_s - pre_s)
+        ag_raw_pre_t.append(a_post_t - pre_t)
+        ag_raw_pre_s.append(a_post_s - pre_s)
+
+        base_raw_ctl1_t.append(b_post_t - c1_t)
+        base_raw_ctl1_s.append(b_post_s - c1_s)
+        ag_raw_ctl1_t.append(a_post_t - c1_t)
+        ag_raw_ctl1_s.append(a_post_s - c1_s)
+
+        if pro_ctl_by_row is not None:
+            pc = pro_ctl_by_row[ridx]
+            ag_own_ctl_r1_t.append(pg.normalized_gain(float(pc["ctl_transfer"]), a_post_t))
+            ag_own_ctl_r1_s.append(pg.normalized_gain(float(pc["ctl_same"]), a_post_s))
+
+    secondary_paired = {
+        "ctl1_rebaselined_r1_transfer": _paired_bootstrap_arrays(
+            base_ctl1_r1_t, ag_ctl1_r1_t, seed=seed, draws=draws, group_label="ctl1_r1_transfer"
+        ),
+        "ctl1_rebaselined_r1_same": _paired_bootstrap_arrays(
+            base_ctl1_r1_s, ag_ctl1_r1_s, seed=seed, draws=draws, group_label="ctl1_r1_same"
+        ),
+        "raw_post_minus_pre_transfer": _paired_bootstrap_arrays(
+            base_raw_pre_t, ag_raw_pre_t, seed=seed, draws=draws, group_label="raw_pre_transfer"
+        ),
+        "raw_post_minus_pre_same": _paired_bootstrap_arrays(
+            base_raw_pre_s, ag_raw_pre_s, seed=seed, draws=draws, group_label="raw_pre_same"
+        ),
+        "raw_post_minus_ctl1_transfer": _paired_bootstrap_arrays(
+            base_raw_ctl1_t, ag_raw_ctl1_t, seed=seed, draws=draws, group_label="raw_ctl1_transfer"
+        ),
+        "raw_post_minus_ctl1_same": _paired_bootstrap_arrays(
+            base_raw_ctl1_s, ag_raw_ctl1_s, seed=seed, draws=draws, group_label="raw_ctl1_same"
+        ),
+    }
+    if pro_ctl_by_row is not None:
+        secondary_paired["own_ctl_r1_transfer"] = _paired_bootstrap_arrays(
+            base_ctl1_r1_t, ag_own_ctl_r1_t, seed=seed, draws=draws, group_label="own_ctl_r1_transfer"
+        )
+        secondary_paired["own_ctl_r1_same"] = _paired_bootstrap_arrays(
+            base_ctl1_r1_s, ag_own_ctl_r1_s, seed=seed, draws=draws, group_label="own_ctl_r1_same"
+        )
 
     return {
         "seed": seed,
         "draws": draws,
         "a_group": ag_sum,
-        "base_pro5000": base_sum,
+        "base_a100_t018": base_sum,
         "verdict_a": {
             "verdict": verdict_a,
             "details": details_a,
@@ -858,22 +1053,18 @@ def build_full_comparison(
                 "paper_ref_diff": PAPER_EDUARDO_4B["delta_same"] - PAPER_BASE_4B["delta_same"],
             },
         },
-        "verdict_c": {
-            "verdict": verdict_c,
-            "details": details_c,
-            "a100_t018_base": A100_T018_BASE,
-        },
+        "compare_stack": compare_stack_res,
+        "secondary_paired": secondary_paired,
     }
 
 
 def format_full_comparison(comp: dict[str, Any]) -> str:
     ag = comp["a_group"]
-    bs = comp["base_pro5000"]
+    bs = comp["base_a100_t018"]
     ag_m = ag["metrics"]
-    bs_m = bs["metrics"]
     va = comp["verdict_a"]
     vb = comp["verdict_b"]
-    vc = comp["verdict_c"]
+    sp = comp["secondary_paired"]
 
     def _p_ci(st: dict[str, Any], prefix: str) -> str:
         return (
@@ -882,102 +1073,118 @@ def format_full_comparison(comp: dict[str, Any]) -> str:
         )
 
     lines = [
-        "=" * 92,
-        f"T-020 Pro 5000 Full Comparison Report (Bootstrap {comp['draws']}x, seed={comp['seed']})",
-        f"A-group: tag={ag['tag']} n={ag['num_problems']} failed={ag['n_student_calls_failed']} "
+        "=" * 100,
+        f"T-020 Pro 5000 A-Group vs A100 T-018 Base Report (Bootstrap {comp['draws']}x, seed={comp['seed']})",
+        f"A-group (Pro 5000): tag={ag['tag']} n={ag['num_problems']} failed={ag['n_student_calls_failed']} "
         f"assume_thinking={ag['assume_thinking']} transfer_tested={ag['transfer_tested_rate']:.2%}",
-        f"Base:    tag={bs['tag']} n={bs['num_problems']} failed={bs['n_student_calls_failed']} "
-        f"assume_thinking={bs['assume_thinking']} transfer_tested={bs['transfer_tested_rate']:.2%}",
+        f"Base (A100 T-018):  n={bs['num_problems']} (from t018_per_problem.csv)",
         "",
         "### 表 A：复现判定（A 组第 100 步 vs 论文 Eduardo-4B）",
         f"{'指标':<20} | {'A 组 (Pro 5000)':<28} | {'论文 Eduardo-4B':<24} | {'差值 / CI 重叠'}",
-        "-" * 92,
+        "-" * 100,
         f"{'Δ_transfer (主口径)':<20} | {_fmt_stat_ci(ag_m['delta_transfer']):<28} | "
         f"+0.2500 [+0.2100, +0.2900] | diff={va['details']['diff_transfer']:.4f} overlap={va['details']['overlap_transfer']}",
         f"{'Δ_same (主口径)':<20} | {_fmt_stat_ci(ag_m['delta_same']):<28} | "
         f"+0.3700 [+0.3300, +0.4200] | diff={va['details']['diff_same']:.4f} overlap={va['details']['overlap_same']}",
         f"判定 A 结论: {va['verdict']}",
         "",
-        "### 表 B：训练效果（A 组减 Pro 5000 base，同题配对 bootstrap）",
-        f"{'题集':<20} | {'n_paired':>8} | {'base 增益':<24} | {'A 组增益':<24} | {'配对差 (A组-base) [95% CI]'} | {'P(diff>0)'} | {'论文参考差'}",
-        "-" * 116,
+        "### 表 B：训练效果（A 组 Pro 5000 减 base A100 T-018，逐题配对 bootstrap）",
+        f"{'题集':<20} | {'n_paired':>8} | {'base (A100) 增益':<24} | {'A 组 (Pro5000) 增益':<24} | {'配对差 (A组-base) [95% CI]'} | {'P(diff>0)'} | {'论文参考差'}",
+        "-" * 118,
     ]
-    for grp, label in (("author494_transfer", "author494_transfer"), ("author494_same", "author494_same")):
+    for grp in ("author494_transfer", "author494_same"):
         st = vb[grp]
         lines.append(
-            f"{label:<20} | {st['n_paired']:>8} | {_p_ci(st, 'base'):<24} | {_p_ci(st, 'target'):<24} | "
+            f"{grp:<20} | {st['n_paired']:>8} | {_p_ci(st, 'base'):<24} | {_p_ci(st, 'target'):<24} | "
             f"{_p_ci(st, 'diff'):<27} | {st['prop_diff_gt_zero']:.4f}    | {st['paper_ref_diff']:+.2f}"
         )
-    lines.extend([
-        f"判定 B 结论 (Δ_transfer 配对差): {vb['verdict']}",
-        "",
-        "### 表 C：换机器核对（Pro 5000 base vs A100 base T-018）",
-        f"{'指标':<20} | {'Pro 5000 base':<28} | {'A100 base (T-018)':<28} | {'差值 / CI 重叠'}",
-        "-" * 96,
-        f"{'Δ_transfer (主口径)':<20} | {_fmt_stat_ci(bs_m['delta_transfer']):<28} | "
-        f"+0.1247 [+0.0888, +0.1596] | diff={vc['details']['diff_transfer']:.4f} overlap={vc['details']['overlap_transfer']}",
-        f"{'Δ_same (主口径)':<20} | {_fmt_stat_ci(bs_m['delta_same']):<28} | "
-        f"+0.1769 [+0.1377, +0.2158] | diff={vc['details']['diff_same']:.4f} overlap={vc['details']['overlap_same']}",
-        f"判定 C 结论: {vc['verdict']}",
-        "",
-        "### 次要指标与诊断并排表",
-        f"{'指标':<26} | {'A 组 (Pro 5000)':<24} | {'base (Pro 5000)':<24} | {'base (A100 T-018)':<18} | {'论文 Eduardo-4B / base'}",
-        "-" * 118,
-    ])
+    lines.append(f"判定 B 结论 (Δ_transfer 配对差): {vb['verdict']}")
+    lines.append("")
+
+    cs = comp.get("compare_stack")
+    lines.append("### 换机器检查（Pro 5000 vs A100 T-018）")
+    if cs is None:
+        lines.append("  未传入 --compare-stack-json（请参照阶段 1 换机器检查结果）")
+    else:
+        st_s = cs["student_side"]
+        tt_s = cs["tutor_side"]
+        lines.extend([
+            f"  总结论: {cs['verdict']}",
+            f"  学生侧 ({'通过' if st_s['passed'] else '不通过'}): n={st_s['n_problems']} failed={st_s['calls_failed']} | "
+            f"orig_mean Pro5000={st_s['pro5000_ctl_same_mean']:.4f} vs A100={st_s['a100_ctl1_same_mean']:.4f} (|diff|={st_s['abs_diff_same']:.4f}, r={st_s['pearson_r_same']:.4f}) | "
+            f"trans_mean Pro5000={st_s['pro5000_ctl_transfer_mean']:.4f} vs A100={st_s['a100_ctl1_transfer_mean']:.4f} (|diff|={st_s['abs_diff_transfer']:.4f}, r={st_s['pearson_r_transfer']:.4f})",
+            f"  Tutor 侧 ({'通过' if tt_s['passed'] else '不通过'}): n={tt_s['n_problems']} assume_thinking={tt_s['assume_thinking']} | "
+            f"Empty%={tt_s['blanked_teacher_turn_rate']*100:.2f}% vs T-018={tt_s['t018_smoke_empty_rate']*100:.2f}% (|diff|={tt_s['abs_diff_empty_rate']*100:.2f}pp) | failed={tt_s['student_calls_failed']}",
+        ])
+    lines.append("")
 
     ag_diag = ag["agnes_diagnostics"]
-    bs_diag = bs["agnes_diagnostics"]
     ag_ok = ag_diag["judge_available"]
-    bs_ok = bs_diag["judge_available"]
     ag_leak_str = _fmt_stat_ci(ag_m["leak_rate_author"], pct=True) if ag_ok else "不可用"
-    bs_leak_str = _fmt_stat_ci(bs_m["leak_rate_author"], pct=True) if bs_ok else "不可用"
+    bs_leak_str = _fmt_stat_ci(bs["leak_rate_author"], pct=True)
     ag_leak_sens = _fmt_stat_ci(ag_m["leak_rate_excl_tech_fail"], pct=True) if ag_ok else "不可用"
-    bs_leak_sens = _fmt_stat_ci(bs_m["leak_rate_excl_tech_fail"], pct=True) if bs_ok else "不可用"
     ag_teach_str = f"{ag_m['teaching_reject_rate'] * 100:.2f}%" if ag_ok else "不可用"
-    bs_teach_str = f"{bs_m['teaching_reject_rate'] * 100:.2f}%" if bs_ok else "不可用"
+    bs_teach_str = f"{bs['teaching_reject_rate'] * 100:.2f}%"
     ag_pf_str = f"{ag_m['eval_judge_pedagogy']:.2f} / {ag_m['eval_judge_correctness']:.2f}" if ag_ok else "不可用"
-    bs_pf_str = f"{bs_m['eval_judge_pedagogy']:.2f} / {bs_m['eval_judge_correctness']:.2f}" if bs_ok else "不可用"
+    bs_pf_str = f"{bs['eval_judge_pedagogy']:.2f} / {bs['eval_judge_correctness']:.2f}"
 
     lines.extend([
-        f"{'pre / post (transfer)':<26} | {ag_m['pre_solve_rate_transfer']:.3f} / {ag_m['post_solve_transfer']:.3f}{'':<11} | "
-        f"{bs_m['pre_solve_rate_transfer']:.3f} / {bs_m['post_solve_transfer']:.3f}{'':<11} | 0.255 / 0.306      | —",
-        f"{'pre / post (same)':<26} | {ag_m['pre_solve_rate']:.3f} / {ag_m['post_solve_same']:.3f}{'':<11} | "
-        f"{bs_m['pre_solve_rate']:.3f} / {bs_m['post_solve_same']:.3f}{'':<11} | 0.258 / 0.345      | —",
-        f"{'Δ_transfer (gated)':<26} | {_fmt_stat_ci(ag_m['delta_transfer_gated']):<24} | "
-        f"{_fmt_stat_ci(bs_m['delta_transfer_gated']):<24} | +0.1097            | —",
-        f"{'Δ_same (gated)':<26} | {_fmt_stat_ci(ag_m['delta_same_gated']):<24} | "
-        f"{_fmt_stat_ci(bs_m['delta_same_gated']):<24} | +0.1575            | —",
-        f"{'R2 Hake g (transfer)':<26} | {_fmt_stat_ci(ag_m['r2_hake_g_transfer']):<24} | "
-        f"{_fmt_stat_ci(bs_m['r2_hake_g_transfer']):<24} | +0.0678            | —",
-        f"{'R2 Hake g (same)':<26} | {_fmt_stat_ci(ag_m['r2_hake_g_same']):<24} | "
-        f"{_fmt_stat_ci(bs_m['r2_hake_g_same']):<24} | +0.1170            | —",
-        f"{'R3 Cohen d (transfer)':<26} | {_fmt_stat_ci(ag_m['r3_cohens_d_transfer']):<24} | "
-        f"{_fmt_stat_ci(bs_m['r3_cohens_d_transfer']):<24} | +0.1670            | —",
-        f"{'R3 Cohen d (same)':<26} | {_fmt_stat_ci(ag_m['r3_cohens_d_same']):<24} | "
-        f"{_fmt_stat_ci(bs_m['r3_cohens_d_same']):<24} | +0.2736            | —",
-        f"{'Transfer gap (same-trans)':<26} | {_fmt_stat_ci(ag_m['transfer_gap']):<24} | "
-        f"{_fmt_stat_ci(bs_m['transfer_gap']):<24} | +0.0522            | —",
-        f"{'Leak rate (Agnes author)':<26} | {ag_leak_str:<24} | {bs_leak_str:<24} | 6.68%              | 30.6% / 16.8% (仅内部比)",
-        f"{'Leak rate (excl tech)':<26} | {ag_leak_sens:<24} | {bs_leak_sens:<24} | 6.68%              | —",
-        f"{'Teaching reject (Agnes)':<26} | {ag_teach_str:<24} | {bs_teach_str:<24} | 63.16%             | 仅内部比",
-        f"{'Ped. / Fact. (Agnes 1-5)':<26} | {ag_pf_str:<24} | {bs_pf_str:<24} | 2.47 / 3.24        | 3.66/4.19 vs 2.26/2.88 (仅内部比)",
-        f"{'Empty% (blanked turns)':<26} | {ag_m['blanked_teacher_turn_rate']*100:>6.2f}%{'':<17} | "
-        f"{bs_m['blanked_teacher_turn_rate']*100:>6.2f}%{'':<17} | 71.08%             | 3.7% / 70.0%",
-        f"{'Seq. trunc.%':<26} | {ag_m['token_budget_truncated_rate']*100:>6.2f}%{'':<17} | "
-        f"{bs_m['token_budget_truncated_rate']*100:>6.2f}%{'':<17} | 30.57%             | 10.7% / 31.2%",
-        f"{'EoC rate':<26} | {ag_m['eoc_rate']*100:>6.2f}%{'':<17} | "
-        f"{bs_m['eoc_rate']*100:>6.2f}%{'':<17} | 69.43%             | 69.6% / 68.8%",
-        f"{'Thinking tok/turn':<26} | {ag_m['thinking_tokens_avg_per_turn']:>6.1f}{'':<18} | "
-        f"{bs_m['thinking_tokens_avg_per_turn']:>6.1f}{'':<18} | 599.7              | 544 / 596",
+        "### 次要指标与诊断并排表",
+        f"{'指标':<28} | {'A 组 (Pro 5000)':<24} | {'base (A100 T-018)':<24} | {'配对差 / 论文参考'}",
+        "-" * 108,
+        f"{'pre / post (transfer)':<28} | {ag_m['pre_solve_rate_transfer']:.3f} / {ag_m['post_solve_transfer']:.3f}{'':<11} | "
+        f"{bs['pre_solve_rate_transfer']:.3f} / {bs['post_solve_transfer']:.3f}{'':<11} | raw_diff={_p_ci(sp['raw_post_minus_pre_transfer'], 'diff')}",
+        f"{'pre / post (same)':<28} | {ag_m['pre_solve_rate']:.3f} / {ag_m['post_solve_same']:.3f}{'':<11} | "
+        f"{bs['pre_solve_rate']:.3f} / {bs['post_solve_same']:.3f}{'':<11} | raw_diff={_p_ci(sp['raw_post_minus_pre_same'], 'diff')}",
+        f"{'R1 (ctl1 -> post) transfer':<28} | {_p_ci(sp['ctl1_rebaselined_r1_transfer'], 'target'):<24} | "
+        f"{_p_ci(sp['ctl1_rebaselined_r1_transfer'], 'base'):<24} | diff={_p_ci(sp['ctl1_rebaselined_r1_transfer'], 'diff')}",
+        f"{'R1 (ctl1 -> post) same':<28} | {_p_ci(sp['ctl1_rebaselined_r1_same'], 'target'):<24} | "
+        f"{_p_ci(sp['ctl1_rebaselined_r1_same'], 'base'):<24} | diff={_p_ci(sp['ctl1_rebaselined_r1_same'], 'diff')}",
+        f"{'raw (post - ctl1) transfer':<28} | {sp['raw_post_minus_ctl1_transfer']['target_mean']:+.4f}{'':<17} | "
+        f"{sp['raw_post_minus_ctl1_transfer']['base_mean']:+.4f}{'':<17} | diff={_p_ci(sp['raw_post_minus_ctl1_transfer'], 'diff')}",
+        f"{'raw (post - ctl1) same':<28} | {sp['raw_post_minus_ctl1_same']['target_mean']:+.4f}{'':<17} | "
+        f"{sp['raw_post_minus_ctl1_same']['base_mean']:+.4f}{'':<17} | diff={_p_ci(sp['raw_post_minus_ctl1_same'], 'diff')}",
+    ])
+    if "own_ctl_r1_transfer" in sp:
+        lines.extend([
+            f"{'R1 (own ctl->post) transfer':<28} | {_p_ci(sp['own_ctl_r1_transfer'], 'target'):<24} | "
+            f"{_p_ci(sp['own_ctl_r1_transfer'], 'base'):<24} | diff={_p_ci(sp['own_ctl_r1_transfer'], 'diff')}",
+            f"{'R1 (own ctl->post) same':<28} | {_p_ci(sp['own_ctl_r1_same'], 'target'):<24} | "
+            f"{_p_ci(sp['own_ctl_r1_same'], 'base'):<24} | diff={_p_ci(sp['own_ctl_r1_same'], 'diff')}",
+        ])
+    lines.extend([
+        f"{'Δ_transfer (gated)':<28} | {_fmt_stat_ci(ag_m['delta_transfer_gated']):<24} | "
+        f"{_fmt_stat_ci(bs['delta_transfer_gated']):<24} | —",
+        f"{'Δ_same (gated)':<28} | {_fmt_stat_ci(ag_m['delta_same_gated']):<24} | "
+        f"{_fmt_stat_ci(bs['delta_same_gated']):<24} | —",
+        f"{'R2 Hake g (transfer)':<28} | {_fmt_stat_ci(ag_m['r2_hake_g_transfer']):<24} | "
+        f"{_fmt_stat_ci(bs['r2_hake_g_transfer']):<24} | —",
+        f"{'R2 Hake g (same)':<28} | {_fmt_stat_ci(ag_m['r2_hake_g_same']):<24} | "
+        f"{_fmt_stat_ci(bs['r2_hake_g_same']):<24} | —",
+        f"{'R3 Cohen d (transfer)':<28} | {_fmt_stat_ci(ag_m['r3_cohens_d_transfer']):<24} | "
+        f"{_fmt_stat_ci(bs['r3_cohens_d_transfer']):<24} | —",
+        f"{'R3 Cohen d (same)':<28} | {_fmt_stat_ci(ag_m['r3_cohens_d_same']):<24} | "
+        f"{_fmt_stat_ci(bs['r3_cohens_d_same']):<24} | —",
+        f"{'Transfer gap (same-trans)':<28} | {_fmt_stat_ci(ag_m['transfer_gap']):<24} | "
+        f"{_fmt_stat_ci(bs['transfer_gap']):<24} | —",
+        f"{'Leak rate (Agnes author)':<28} | {ag_leak_str:<24} | {bs_leak_str:<24} | 论文 30.6% / 16.8% (仅内部比)",
+        f"{'Leak rate (excl tech)':<28} | {ag_leak_sens:<24} | 6.68% [4.66%, 8.91%]     | —",
+        f"{'Teaching reject (Agnes)':<28} | {ag_teach_str:<24} | {bs_teach_str:<24} | 仅内部比",
+        f"{'Ped. / Fact. (Agnes 1-5)':<28} | {ag_pf_str:<24} | {bs_pf_str:<24} | 论文 3.66/4.19 vs 2.26/2.88 (仅内部比)",
+        f"{'Empty% (blanked turns)':<28} | {ag_m['blanked_teacher_turn_rate']*100:>6.2f}%{'':<17} | "
+        f"{bs['blanked_teacher_turn_rate']*100:>6.2f}%{'':<17} | 论文 3.7% / 70.0%",
+        f"{'Seq. trunc.%':<28} | {ag_m['token_budget_truncated_rate']*100:>6.2f}%{'':<17} | "
+        f"{bs['token_budget_truncated_rate']*100:>6.2f}%{'':<17} | 论文 10.7% / 31.2%",
+        f"{'EoC rate':<28} | {ag_m['eoc_rate']*100:>6.2f}%{'':<17} | "
+        f"{bs['eoc_rate']*100:>6.2f}%{'':<17} | 论文 69.6% / 68.8%",
+        f"{'Thinking tok/turn':<28} | {ag_m['thinking_tokens_avg_per_turn']:>6.1f}{'':<18} | "
+        f"{bs['thinking_tokens_avg_per_turn']:>6.1f}{'':<18} | 论文 544 / 596",
         "",
-        "Agnes 诊断:",
-        f"  A-group: votes={ag_diag['total_votes']} retry_fail={ag_diag['retry_failed_votes']} "
+        "Agnes 诊断 (A 组 Pro 5000):",
+        f"  votes={ag_diag['total_votes']} retry_fail={ag_diag['retry_failed_votes']} "
         f"parse_fail={ag_diag['parse_failed_votes']} regex_rec={ag_diag['regex_recovered_votes']} "
         f"eval_ok={ag_m['eval_judge_ok']:.2%} status={'可用' if ag_ok else '不可用'}",
-        f"  Base:    votes={bs_diag['total_votes']} retry_fail={bs_diag['retry_failed_votes']} "
-        f"parse_fail={bs_diag['parse_failed_votes']} regex_rec={bs_diag['regex_recovered_votes']} "
-        f"eval_ok={bs_m['eval_judge_ok']:.2%} status={'可用' if bs_ok else '不可用'}",
-        "=" * 92,
+        "=" * 100,
     ])
     return "\n".join(lines)
 
@@ -987,25 +1194,39 @@ def main() -> int:
     ap.add_argument("result_json", nargs="?", type=Path, default=None, help="Single transfer_eval_*.json")
     ap.add_argument("--paper-baseline", choices=("base", "eduardo4b"), default="base")
     ap.add_argument("--a-group-json", type=Path, default=None, help="Full A-group transfer_eval_*.json")
-    ap.add_argument("--base-json", type=Path, default=None, help="Full Pro 5000 base transfer_eval_*.json")
+    ap.add_argument("--t018-table", type=Path, default=None, help="A100 T-018 t018_per_problem.csv")
     ap.add_argument("--paired-csv", type=Path, default=None, help="Paired CSV generated by make_paired_csv.py")
+    ap.add_argument("--compare-stack-json", type=Path, default=None, help="Optional compare_stack.py JSON output")
+    ap.add_argument("--pro5000-ctl-json", type=Path, default=None, help="Optional Pro 5000 ctl JSON")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--draws", type=int, default=10000)
     ap.add_argument("--json-out", type=Path, default=None)
     args = ap.parse_args()
 
     try:
-        if args.a_group_json or args.base_json or args.paired_csv:
-            if not (args.a_group_json and args.base_json and args.paired_csv):
-                raise ValueError("--a-group-json, --base-json, and --paired-csv must all be provided together")
+        if args.a_group_json or args.t018_table or args.paired_csv:
+            if not (args.a_group_json and args.t018_table and args.paired_csv):
+                raise ValueError("--a-group-json, --t018-table, and --paired-csv must all be provided together")
             ag_doc = json.loads(args.a_group_json.read_text(encoding="utf-8"))
-            bs_doc = json.loads(args.base_json.read_text(encoding="utf-8"))
+            t018_rows = _load_t018_csv_rows(args.t018_table)
+            cs_res = (
+                json.loads(args.compare_stack_json.read_text(encoding="utf-8"))
+                if args.compare_stack_json is not None
+                else None
+            )
+            ctl_doc = (
+                json.loads(args.pro5000_ctl_json.read_text(encoding="utf-8"))
+                if args.pro5000_ctl_json is not None
+                else None
+            )
             out = build_full_comparison(
                 a_group_doc=ag_doc,
-                base_doc=bs_doc,
+                t018_by_row=t018_rows,
                 paired_csv_path=args.paired_csv,
                 seed=args.seed,
                 draws=args.draws,
+                compare_stack_res=cs_res,
+                pro5000_ctl_doc=ctl_doc,
             )
             print(format_full_comparison(out))
         elif args.result_json is not None:
@@ -1015,7 +1236,7 @@ def main() -> int:
             out = summarize_single_run(doc, seed=args.seed, draws=args.draws, paper_ref=ref)
             print(format_single_report(out, paper_label=label))
         else:
-            ap.error("Provide either <result_json> OR (--a-group-json, --base-json, --paired-csv)")
+            ap.error("Provide either <result_json> OR (--a-group-json, --t018-table, --paired-csv)")
             return 2
 
         if args.json_out is not None:
