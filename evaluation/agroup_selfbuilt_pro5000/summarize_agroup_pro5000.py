@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Sanitized Pro 5000 summary + paired_gain.py vs summarize_base4b cross-check for T-021."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT_DEFAULT = HERE.parents[1]
+BASE4B_DIR = REPO_ROOT_DEFAULT / "evaluation" / "base4b_selfbuilt"
+PAIRED_DIR = REPO_ROOT_DEFAULT / "evaluation" / "paired_gain"
+for _p in (str(HERE), str(BASE4B_DIR), str(PAIRED_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import paired_gain as pg  # noqa: E402
+from import_bundle import load_and_verify_bundle  # noqa: E402
+from make_selfbuilt_paired_csv import build_selfbuilt_paired_csv  # noqa: E402
+from summarize_base4b import (  # noqa: E402
+    collect_base4b_records,
+    compute_summary,
+    extract_safe_failure_summary,
+    format_report,
+)
+
+GROUP_TO_SUMMARY_LABEL = {
+    "orig": "原题合并",
+    "easy": "简单迁移题",
+    "medium": "中等迁移题",
+    "hard": "困难迁移题",
+}
+
+
+def cross_check_paired_diff(
+    paired_csv_rows: list[dict[str, Any]],
+    summary_records: list[dict[str, Any]],
+    ref_records: list[dict[str, Any]],
+    *,
+    base_name: str,
+    target_name: str = "a_group",
+    draws: int = 10000,
+    seed: int = 42,
+    ci_tol: float = 0.01,
+) -> dict[str, Any]:
+    """Compare paired_gain.py output against summarize_base4b bootstrap on matched sources."""
+    pg_res = pg.evaluate_dataset(
+        paired_csv_rows,
+        base_condition=base_name,
+        target_condition=target_name,
+        draws=draws,
+        seed=seed,
+        include_high_pre_filtered=False,
+    )
+    sb_sum = compute_summary(
+        summary_records, all_27b_records=ref_records, seed=seed, draws=draws
+    )
+    pg_index = {
+        (r["unknown_policy_label"], r["group"]): r
+        for r in pg_res.get("results", [])
+        if r.get("source_filter") == "all"
+    }
+    mismatches: list[str] = []
+    comparisons: dict[str, Any] = {}
+    for policy in ("未决按错", "排除未决"):
+        sb_rows = {r["label"]: r for r in sb_sum["analyses"][policy]}
+        for grp in ("orig", "easy", "medium", "hard"):
+            pg_entry = pg_index.get((policy, grp))
+            sb_entry = sb_rows.get(GROUP_TO_SUMMARY_LABEL[grp], {}).get("paired_4b_minus_27b")
+            if not pg_entry or not pg_entry.get("stats") or not sb_entry or sb_entry.get("mean_diff") is None:
+                continue
+            pg_st = pg_entry["stats"]
+            diff_pt = abs(float(pg_st["diff_mean"]) - float(sb_entry["mean_diff"]))
+            diff_lo = abs(float(pg_st["diff_ci_low"]) - float(sb_entry["ci"][0]))
+            diff_hi = abs(float(pg_st["diff_ci_high"]) - float(sb_entry["ci"][1]))
+            comparisons[f"{policy}.{grp}"] = {
+                "n_paired_pg": pg_entry["n_paired"],
+                "n_paired_sb": sb_entry["n_paired"],
+                "pg_diff": pg_st["diff_mean"],
+                "sb_diff": sb_entry["mean_diff"],
+                "pt_diff": diff_pt,
+                "ci_lo_diff": diff_lo,
+                "ci_hi_diff": diff_hi,
+            }
+            if pg_entry["n_paired"] != sb_entry["n_paired"] or diff_pt > 1e-12 or diff_lo > ci_tol or diff_hi > ci_tol:
+                mismatches.append(f"{policy}.{grp}")
+
+    if mismatches:
+        raise ValueError(f"paired_gain vs summarize_base4b cross-check mismatch: {mismatches}")
+    return {"pg_report": pg_res, "sb_summary": sb_sum, "comparisons": comparisons}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Sanitized summary + paired comparison for T-021.")
+    ap.add_argument("--repo", type=Path, required=True)
+    ap.add_argument("--bundle-dir", type=Path, required=True)
+    ap.add_argument("--out-root", type=Path, required=True)
+    ap.add_argument("--base4b-counts-csv", type=Path, default=None)
+    ap.add_argument("--grade-subdir", choices=("AGNES", "AUTHOR_RULE"), default="AGNES")
+    ap.add_argument("--draws", type=int, default=10000)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--elapsed-seconds", type=float, default=0.0)
+    ap.add_argument("--gen-elapsed-seconds", type=float, default=0.0)
+    ap.add_argument("--grade-elapsed-seconds", type=float, default=0.0)
+    ap.add_argument("--json-out", type=Path, default=None)
+    args = ap.parse_args()
+
+    loaded = load_and_verify_bundle(args.bundle_dir, require_exact_totals=True)
+    if args.grade_subdir == "AUTHOR_RULE":
+        loaded_view = {
+            **loaded,
+            "eligible": [{**e, "ref_counts": e["ref_counts_ar"]} for e in loaded["eligible"]],
+        }
+    else:
+        loaded_view = loaded
+    records, diagnostics = collect_base4b_records(
+        loaded_view, args.out_root, args.repo, grade_subdir=args.grade_subdir
+    )
+    all_27b = [
+        {"tier_zh": e["tier_zh"], "source_id": e["source_id"], "ref_counts": e["ref_counts"]}
+        for e in loaded_view["eligible"]
+    ]
+    summary = compute_summary(records, all_27b_records=all_27b, seed=args.seed, draws=args.draws)
+    print(
+        format_report(
+            loaded_view,
+            diagnostics,
+            summary,
+            elapsed_seconds=args.elapsed_seconds,
+            gen_elapsed_seconds=args.gen_elapsed_seconds,
+            grade_elapsed_seconds=args.grade_elapsed_seconds,
+        )
+    )
+
+    paired_csv = args.out_root / f"paired_{args.grade_subdir.lower()}.csv"
+    build_selfbuilt_paired_csv(
+        loaded_bundle=loaded,
+        a_group_root=args.out_root,
+        base4b_counts_csv=args.base4b_counts_csv,
+        out_csv=paired_csv,
+        grade_subdir=args.grade_subdir,
+    )
+    csv_rows = pg.load_csv(paired_csv)
+
+    payload: dict[str, Any] = {
+        "diagnostics": diagnostics,
+        "summary_vs_27b": summary,
+    }
+    if records:
+        cc_27b = cross_check_paired_diff(
+            csv_rows,
+            records,
+            all_27b,
+            base_name="eduardo27b",
+            target_name="a_group",
+            draws=args.draws,
+            seed=args.seed,
+        )
+        md_27b = pg.render_markdown(cc_27b["pg_report"])
+        for ln in md_27b.splitlines():
+            print(f"[base4b_summary] {ln}")
+        payload["paired_vs_27b"] = cc_27b["pg_report"]
+        payload["cross_check_27b"] = cc_27b["comparisons"]
+
+    if args.base4b_counts_csv is not None and records:
+        pg_base = pg.evaluate_dataset(
+            csv_rows,
+            base_condition="base",
+            target_condition="a_group",
+            draws=args.draws,
+            seed=args.seed,
+            include_high_pre_filtered=True,
+        )
+        payload["paired_vs_base"] = pg_base
+        for ln in pg.render_markdown(pg_base).splitlines():
+            print(f"[base4b_summary] {ln}")
+
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        print(extract_safe_failure_summary(traceback.format_exc()), file=sys.stderr)
+        raise SystemExit(1)
