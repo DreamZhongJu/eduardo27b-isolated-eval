@@ -303,6 +303,15 @@ class TestT021AGroupPro5000(unittest.TestCase):
             self.assertEqual(t_gpu, 0)
             self.assertEqual(s_gpus, [6])
 
+    def test_preflight_model_hashes_are_64_hex(self):
+        import re
+
+        txt = (HERE / "preflight_agroup_pro5000.sh").read_text(encoding="utf-8")
+        hashes = re.findall(r':\s*"([0-9a-f]+)"', txt)
+        self.assertEqual(len(hashes), 14)
+        for h in hashes:
+            self.assertEqual(len(h), 64, f"Expected 64-char sha256, got {len(h)}: {h}")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -127,7 +127,7 @@ def sha256_file(p: Path) -> str:
 STEP100_LOCK = {
     "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
     "config.json": "6d320dedc3a50ea3eb4bf7ab503fed018f21784f001c61ff9de9a7ed411e69f0",
-    "generation_config.json": "944b9abc4ec388933cc00c757a7b794683929e5a02e5123853892a750645689",
+    "generation_config.json": "944b9abc4ec388933cc00c757a7b794683929e5a02e5123853892a5750645689",
     "model.safetensors": "35435951b689199681a59cc9667cda29e75025f575cd8758bb8320e2f11d88e8",
     "processor_config.json": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
     "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
