@@ -344,6 +344,56 @@ class TestT021AGroupPro5000(unittest.TestCase):
         for h in hashes:
             self.assertEqual(len(h), 64, f"Expected 64-char sha256, got {len(h)}: {h}")
 
+    def test_stack_check_regrade_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            entries = []
+            for diff in ("easy", "medium", "hard"):
+                sid = f"RG_{diff}"
+                key = hashlib.sha256(f"{diff}:{sid}".encode()).hexdigest()[:24]
+                entries.append(
+                    {
+                        "difficulty": diff,
+                        "source_id": sid,
+                        "source_key": key,
+                        "ref_counts_ar": {
+                            "原题": {"pre": {"correct": 16}, "control": {"correct": 16}},
+                            "迁移题": {"pre": {"correct": 0}, "control": {"correct": 0}},
+                        },
+                        "row": {
+                            "source_id": sid,
+                            "answer": "2",
+                            "transfer_target": f"ours_{diff}",
+                            "transfer_answer": "5",
+                        },
+                    }
+                )
+                stage = sb.STAGE_BY_DIFF[diff]
+                base = tmp / "pre_runs" / stage / "sources" / key / "samples"
+                for tgt, txt in (("source", "\\boxed{2}"), (f"ours_{diff}", "\\boxed{9}")):
+                    for i in range(16):
+                        p = base / tgt / "pre" / f"{i:02d}" / "RESPONSE.json"
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_text(json.dumps({"text": txt}), encoding="utf-8")
+
+            rates, fail = sc.regrade_stack_check_dir(
+                entries,
+                out_dir=tmp,
+                grade_fn=lambda resp, gold: {"acc": 1.0 if f"\\boxed{{{gold}}}" in resp else 0.0},
+            )
+            self.assertEqual(fail, 0)
+            self.assertEqual(rates[("easy", "RG_easy")]["orig_pre_rate"], 1.0)
+            self.assertEqual(rates[("easy", "RG_easy")]["trans_pre_rate"], 0.0)
+
+            # Missing one saved RESPONSE.json must fail closed
+            (tmp / "pre_runs" / "EASY" / "sources" / entries[0]["source_key"] / "samples" / "source" / "pre" / "15" / "RESPONSE.json").unlink()
+            with self.assertRaises(FileNotFoundError):
+                sc.regrade_stack_check_dir(
+                    entries,
+                    out_dir=tmp,
+                    grade_fn=lambda resp, gold: {"acc": 1.0},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

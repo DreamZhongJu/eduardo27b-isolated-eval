@@ -130,6 +130,7 @@ def main() -> int:
     ap.add_argument("--run-generation", action="store_true")
     ap.add_argument("--run-grading", action="store_true")
     ap.add_argument("--run-author-rule", action="store_true")
+    ap.add_argument("--require-math-verify", default=None)
     args = ap.parse_args()
 
     loaded = load_and_verify_bundle(args.bundle_dir, require_exact_totals=True)
@@ -187,6 +188,14 @@ def main() -> int:
         print(f"[base4b] agnes_grading_done {json.dumps(grade_stats, sort_keys=True)}", flush=True)
 
     if args.run_author_rule:
+        import importlib.metadata as md
+
+        mv_ver = md.version("math-verify")
+        print(f"[base4b] author_rule_math_verify={mv_ver}", flush=True)
+        if args.require_math_verify and not mv_ver.startswith(args.require_math_verify):
+            raise RuntimeError(
+                f"math-verify version mismatch: expected {args.require_math_verify}, got {mv_ver}"
+            )
         ar_stats = grade_author_rule_entries(
             entries,
             out_root=args.out_root,
