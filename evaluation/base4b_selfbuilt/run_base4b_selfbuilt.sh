@@ -8,11 +8,11 @@ usage() {
 Usage:
   run_base4b_selfbuilt.sh (--tutor-gpu <id> --student-gpu <id> | --auto-wait) \
     --output-dir <dir> [--mode pilot|full] [--pilot-per-tier 3] \
-    [--concurrency 8] [--gate-first-n <auto>] [--max-est-days 3.0] [--resume] \
+    [--concurrency 8] [--agnes-workers 2] [--gate-first-n <auto>] [--max-est-days 3.0] [--resume] \
     [--teacher-port 18701] [--student-port 18702] [--poll-seconds 60] \
     [--skip-grading] [--skip-author-rule]
 
-  run_base4b_selfbuilt.sh --grade-only <output_dir> [--mode pilot|full] [--pilot-per-tier 3]
+  run_base4b_selfbuilt.sh --grade-only <output_dir> [--mode pilot|full] [--pilot-per-tier 3] [--agnes-workers 2]
   run_base4b_selfbuilt.sh --status <output_dir>
 EOF
 }
@@ -110,6 +110,7 @@ OUTPUT_DIR=""
 MODE="pilot"
 PILOT_PER_TIER="3"
 CONCURRENCY="8"
+AGNES_WORKERS="${AGNES_WORKERS:-2}"
 GATE_FIRST_N="-1"
 MAX_EST_DAYS="3.0"
 RESUME="0"
@@ -129,6 +130,7 @@ while [ "$#" -gt 0 ]; do
     --mode) MODE="$2"; shift 2 ;;
     --pilot-per-tier) PILOT_PER_TIER="$2"; shift 2 ;;
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --agnes-workers) AGNES_WORKERS="$2"; shift 2 ;;
     --gate-first-n) GATE_FIRST_N="$2"; shift 2 ;;
     --max-est-days) MAX_EST_DAYS="$2"; shift 2 ;;
     --resume) RESUME="1"; shift ;;
@@ -164,7 +166,7 @@ if [ -n "${GRADE_ONLY_DIR}" ]; then
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
     --out-root "${GRADE_ONLY_DIR}" --key-file "${AGNES_KEY_FILE}" \
-    --pilot-per-tier "${PILOT_PER_TIER}" --workers 5 --run-grading \
+    --pilot-per-tier "${PILOT_PER_TIER}" --workers "${AGNES_WORKERS}" --run-grading \
     $( [ "${SKIP_AUTHOR_RULE}" = "0" ] && echo "--run-author-rule" )
   "${TUTOR_PY}" -B "${HERE_DIR}/summarize_base4b.py" \
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
@@ -464,14 +466,14 @@ fi
 GRADE_RC=0
 GRADE_ELAPSED=0
 if [ "${GEN_RC}" = "0" ] && [ "${SKIP_GRADING}" = "0" ]; then
-  echo "[base4b] Starting Agnes grading (1 process, workers=5)..."
+  echo "[base4b] Starting Agnes grading (1 process, workers=${AGNES_WORKERS})..."
   GRADE_START_TS=$(date +%s)
   set +e
   "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval.py" \
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
     --out-root "${OUTPUT_DIR}" --key-file "${AGNES_KEY_FILE}" \
-    --pilot-per-tier "${PILOT_PER_TIER}" --workers 5 --run-grading \
+    --pilot-per-tier "${PILOT_PER_TIER}" --workers "${AGNES_WORKERS}" --run-grading \
     >> "${OUTPUT_DIR}/eval_run.log" 2>&1
   GRADE_RC=$?
   set -e
