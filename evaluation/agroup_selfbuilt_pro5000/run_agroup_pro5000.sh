@@ -32,8 +32,6 @@ TUTOR_PY="${TUTOR_PY:-${TUTOR_ENV_DIR}/bin/python}"
 TUTOR_VLLM="${TUTOR_VLLM:-${TUTOR_ENV_DIR}/bin/vllm}"
 STUDENT_PY="${STUDENT_PY:-${STUDENT_ENV_DIR}/bin/python}"
 STUDENT_VLLM="${STUDENT_VLLM:-${STUDENT_ENV_DIR}/bin/vllm}"
-AUTHOR_RULE_PY="${AUTHOR_RULE_PY:-${BASE}/envs/math_verify_090/bin/python}"
-AUTHOR_RULE_MV_VER="${AUTHOR_RULE_MV_VER:-0.9.0}"
 A_GROUP_RUN_DIR="${A_GROUP_RUN_DIR:-${BASE}/runs/stage3_formal_20261121_144311}"
 TUTOR_MODEL="${TUTOR_MODEL:-${A_GROUP_RUN_DIR}/exports/step_100}"
 STUDENT_MODEL="${STUDENT_MODEL:-/dev/shm/zhujie_a_group/Meta-Llama-3.1-8B-Instruct}"
@@ -189,24 +187,12 @@ fi
 
 if [ -n "${GRADE_ONLY_DIR}" ]; then
   test -s "${AGNES_KEY_FILE}"
-  if [ "${SKIP_AUTHOR_RULE}" = "0" ]; then
-    if [ ! -x "${AUTHOR_RULE_PY}" ]; then
-      echo "ERROR: author-rule python (${AUTHOR_RULE_MV_VER}) missing: ${AUTHOR_RULE_PY}; run setup_math_verify_090.sh first" >&2
-      exit 2
-    fi
-    "${AUTHOR_RULE_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
-      --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-root "${GRADE_ONLY_DIR}" \
-      --pilot-per-tier "${PILOT_PER_TIER}" --run-author-rule --require-math-verify "${AUTHOR_RULE_MV_VER}"
-    "${TUTOR_PY}" -B "${HERE_DIR}/summarize_agroup_pro5000.py" \
-      --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-root "${GRADE_ONLY_DIR}" \
-      --grade-subdir AUTHOR_RULE --json-out "${GRADE_ONLY_DIR}/summary_author_rule.json" \
-      | tee "${GRADE_ONLY_DIR}/summary_author_rule_report.txt"
-  fi
   "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" \
     --out-root "${GRADE_ONLY_DIR}" --key-file "${AGNES_KEY_FILE}" \
     --t020-base "${BASE}" $( [ -n "${T020_DIR}" ] && echo "--t020-dir ${T020_DIR}" ) \
-    --pilot-per-tier "${PILOT_PER_TIER}" --workers "${AGNES_WORKERS}" --run-grading
+    --pilot-per-tier "${PILOT_PER_TIER}" --workers "${AGNES_WORKERS}" --run-grading \
+    $( [ "${SKIP_AUTHOR_RULE}" = "0" ] && echo "--run-author-rule" )
   "${TUTOR_PY}" -B "${HERE_DIR}/summarize_agroup_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" \
     --out-root "${GRADE_ONLY_DIR}" --json-out "${GRADE_ONLY_DIR}/summary_agnes.json" \
@@ -391,10 +377,6 @@ if [ "${SKIP_GRADING}" = "0" ] && [ ! -s "${AGNES_KEY_FILE}" ]; then
   echo "ERROR: Agnes key file missing or empty: ${AGNES_KEY_FILE}" >&2
   exit 2
 fi
-if [ "${STACK_CHECK}" = "0" ] && [ "${SKIP_AUTHOR_RULE}" = "0" ] && [ ! -x "${AUTHOR_RULE_PY}" ]; then
-  echo "ERROR: author-rule python (${AUTHOR_RULE_MV_VER}) missing: ${AUTHOR_RULE_PY}; run setup_math_verify_090.sh first" >&2
-  exit 2
-fi
 
 while true; do
   if [ "${AUTO_WAIT}" = "1" ]; then
@@ -531,9 +513,9 @@ if [ -n "${MONITOR_PID}" ] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
 fi
 
 if [ "${GEN_RC}" = "0" ] && [ "${SKIP_AUTHOR_RULE}" = "0" ]; then
-  "${AUTHOR_RULE_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
+  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-root "${OUTPUT_DIR}" \
-    --pilot-per-tier "${PILOT_PER_TIER}" --run-author-rule --require-math-verify "${AUTHOR_RULE_MV_VER}" \
+    --pilot-per-tier "${PILOT_PER_TIER}" --run-author-rule \
     >> "${OUTPUT_DIR}/eval_run.log" 2>&1
 fi
 

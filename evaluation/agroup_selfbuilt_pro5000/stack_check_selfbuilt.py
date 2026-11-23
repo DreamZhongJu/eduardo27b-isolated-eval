@@ -266,55 +266,10 @@ async def run_pro5000_pre_samples(
     return pro_rates, stu_fail
 
 
-def regrade_stack_check_dir(
-    sampled_entries: list[dict[str, Any]],
-    *,
-    out_dir: Path,
-    grade_fn=None,
-) -> tuple[dict[tuple[str, str], dict[str, float]], int]:
-    """Re-grade saved 2,880 pre-test responses offline using grade_fn (zero GPU calls)."""
-    grader = grade_fn or grade_math_answer
-    pro_rates: dict[tuple[str, str], dict[str, float]] = {}
-    stu_fail = 0
-    for e in sampled_entries:
-        stage = STAGE_BY_DIFF[e["difficulty"]]
-        key = e["source_key"]
-        folder = out_dir / "pre_runs" / stage / "sources" / key
-        res_json = folder / "STACK_PRE_RESULT.json"
-        if res_json.is_file():
-            cached = json.loads(res_json.read_bytes())
-            stu_fail += int(cached.get("stu_fail", 0))
-        row = e["row"]
-        orig_correct = 0
-        trans_correct = 0
-        for tgt_name, ans, is_orig in (
-            ("source", row["answer"], True),
-            (row["transfer_target"], row["transfer_answer"], False),
-        ):
-            for i in range(16):
-                resp_p = folder / "samples" / tgt_name / "pre" / f"{i:02d}" / "RESPONSE.json"
-                if not resp_p.is_file():
-                    raise FileNotFoundError(
-                        f"Missing saved stack-check sample ({stage}/{tgt_name}/{i:02d})"
-                    )
-                rec = json.loads(resp_p.read_bytes())
-                v = grader(rec["text"], ans)
-                if float(v.get("acc", 0.0)) >= 0.5:
-                    if is_orig:
-                        orig_correct += 1
-                    else:
-                        trans_correct += 1
-        pro_rates[(e["difficulty"], e["source_id"])] = {
-            "orig_pre_rate": orig_correct / 16.0,
-            "trans_pre_rate": trans_correct / 16.0,
-        }
-    return pro_rates, stu_fail
-
-
 def format_stack_report(res: dict[str, Any]) -> str:
     lines = [
         "[base4b_summary] " + "=" * 80,
-        f"[base4b_summary] Pro 5000 vs A100 Student Stack Check Verdict: {res['verdict']} (n={res['n_sources']}, calls={res['n_calls']}, stu_fail={res['student_calls_failed']}, math_verify={res.get('math_verify_version', 'unknown')})",
+        f"[base4b_summary] Pro 5000 vs A100 Student Stack Check Verdict: {res['verdict']} (n={res['n_sources']}, calls={res['n_calls']}, stu_fail={res['student_calls_failed']})",
     ]
     rt = res.get("student_runtime")
     if isinstance(rt, dict):
@@ -333,52 +288,33 @@ def format_stack_report(res: dict[str, Any]) -> str:
 
 
 def main() -> int:
-    import importlib.metadata as md
-
     ap = argparse.ArgumentParser(description="Pro 5000 vs A100 cross-machine Student stack check.")
     ap.add_argument("--repo", type=Path, required=True)
     ap.add_argument("--bundle-dir", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--student-url", default="http://127.0.0.1:18702/v1")
     ap.add_argument("--student-runtime-json", type=Path, default=None)
-    ap.add_argument("--regrade-only", action="store_true")
-    ap.add_argument("--json-name", default=None)
     ap.add_argument("--per-tier", type=int, default=30)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--concurrency", type=int, default=16)
     args = ap.parse_args()
 
-    try:
-        mv_ver = md.version("math-verify")
-    except md.PackageNotFoundError:
-        mv_ver = "NOT_INSTALLED"
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     loaded = load_and_verify_bundle(args.bundle_dir, require_exact_totals=True)
     sampled = select_stack_check_entries(loaded["eligible"], per_tier=args.per_tier, seed=args.seed)
-    if args.regrade_only:
-        pro_rates, stu_fail = regrade_stack_check_dir(sampled, out_dir=args.out_dir)
-    else:
-        pro_rates, stu_fail = asyncio.run(
-            run_pro5000_pre_samples(
-                sampled,
-                out_dir=args.out_dir,
-                repo_root=args.repo,
-                student_url=args.student_url,
-                concurrency=args.concurrency,
-            )
+    pro_rates, stu_fail = asyncio.run(
+        run_pro5000_pre_samples(
+            sampled,
+            out_dir=args.out_dir,
+            repo_root=args.repo,
+            student_url=args.student_url,
+            concurrency=args.concurrency,
         )
+    )
     res = evaluate_stack_check(sampled, pro_rates, stu_fail=stu_fail)
-    res["math_verify_version"] = mv_ver
-    rt_path = args.student_runtime_json
-    if rt_path is not None and rt_path.is_file():
-        res["student_runtime"] = json.loads(rt_path.read_text(encoding="utf-8"))
-    elif args.regrade_only and (args.out_dir / "STACK_CHECK.json").is_file():
-        prev = json.loads((args.out_dir / "STACK_CHECK.json").read_text(encoding="utf-8"))
-        if isinstance(prev.get("student_runtime"), dict):
-            res["student_runtime"] = prev["student_runtime"]
-    json_name = args.json_name or ("STACK_CHECK_MV090.json" if args.regrade_only else "STACK_CHECK.json")
-    (args.out_dir / json_name).write_text(
+    if args.student_runtime_json is not None and args.student_runtime_json.is_file():
+        res["student_runtime"] = json.loads(args.student_runtime_json.read_text(encoding="utf-8"))
+    (args.out_dir / "STACK_CHECK.json").write_text(
         json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(format_stack_report(res), flush=True)
