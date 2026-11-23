@@ -19,6 +19,12 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from agnes_window import AgnesWindowClient, AsyncCongestionWindow  # noqa: E402
+
 
 def _locate_author_repo() -> Path:
     candidates = []
@@ -77,6 +83,8 @@ async def _run_ping(args: argparse.Namespace) -> int:
         judge_api_base="",
     )
     client, model, extra_body = make_judge_client(judge_args)
+    if args.use_window:
+        client = AgnesWindowClient(client, window=AsyncCongestionWindow())
 
     prompt = judge_quality._JUDGE_PROMPTS["no_leak"].format(
         problem="Solve 2x = 6.",
@@ -122,6 +130,12 @@ async def _run_ping(args: argparse.Namespace) -> int:
     print(f"strict_detail={strict_detail}")
     print(f"author_decision={author_parsed['decision']}")
     print(f"author_fallback_used={author_fallback_used}")
+    if args.use_window and isinstance(client, AgnesWindowClient):
+        st = client.stats()
+        print(
+            f"window_stats http_attempts={st['http_attempts']} "
+            f"max_window={st['max_limit_reached']} drops={st['window_drops']}"
+        )
     return 0 if (http_status == 200 and strict_ok) else 1
 
 
@@ -131,6 +145,7 @@ def main() -> int:
     ap.add_argument("--model", default="agnes-3.0-flash")
     ap.add_argument("--api-key-env", default="AGNES_API_KEY")
     ap.add_argument("--reasoning-effort", default="high", choices=("low", "medium", "high"))
+    ap.add_argument("--no-window", dest="use_window", action="store_false", default=True)
     args = ap.parse_args()
     return asyncio.run(_run_ping(args))
 

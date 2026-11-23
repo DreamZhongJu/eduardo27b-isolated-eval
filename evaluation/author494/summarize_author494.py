@@ -24,6 +24,7 @@ from typing import Any
 
 # Paper baselines for Qwen3.5-4B base (n=494, Table 1, 7, 8).
 PAPER_BASE: dict[str, Any] = {
+    "label": "Paper (base 4B)",
     "delta_transfer": 0.10,
     "delta_transfer_ci": (0.06, 0.13),
     "delta_same": 0.11,
@@ -36,6 +37,28 @@ PAPER_BASE: dict[str, Any] = {
     "token_budget_truncated_rate": 0.312,
     "eoc_rate": 0.688,
     "thinking_tokens_avg_per_turn": 596.0,
+}
+
+# Paper baselines for Eduardo-27B (n=494, Table 1, 7, 8).
+PAPER_EDUARDO_27B: dict[str, Any] = {
+    "label": "Paper (Eduardo-27B)",
+    "delta_transfer": 0.29,
+    "delta_transfer_ci": (0.25, 0.32),
+    "delta_same": 0.46,
+    "delta_same_ci": (0.42, 0.51),
+    "leak_rate": 0.093,
+    "leak_rate_ci": (0.069, 0.119),
+    "eval_judge_pedagogy": 4.50,
+    "eval_judge_correctness": 4.56,
+    "blanked_teacher_turn_rate": 0.004,
+    "token_budget_truncated_rate": 0.000,
+    "eoc_rate": 0.534,
+    "thinking_tokens_avg_per_turn": 57.0,
+}
+
+PAPER_BASELINES: dict[str, dict[str, Any]] = {
+    "base-4b": PAPER_BASE,
+    "eduardo-27b": PAPER_EDUARDO_27B,
 }
 
 REQUIRED_METRICS_KEYS = (
@@ -125,8 +148,12 @@ _REGEX_RECOVERED_REASON = "<unparsed JSON>"
 _EPS = 1e-12
 
 _SAFE_INFO_LOG_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: "
+    r"^(?:"
+    r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: "
     r"(?:Thinking mode (?:AUTO|FORCED):|Rollout of |Scoring (?:\d+|took ))"
+    r"|(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo27b\.agnes_window: )?"
+    r"\[27b_agnes_window\] (?:STARTUP|SUMMARY|TUTOR_CONFIG) "
+    r")"
 )
 _SAFE_ROUND_INFO_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: Round \d+: "
@@ -516,12 +543,15 @@ def judge_alignment_verdict(
     ci_transfer: tuple[float, float],
     delta_same: float,
     ci_same: tuple[float, float],
+    *,
+    baseline: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Apply the pre-registered 3-tier decision rule on Δ_transfer and Δ_same."""
-    diff_t = abs(delta_transfer - PAPER_BASE["delta_transfer"])
-    diff_s = abs(delta_same - PAPER_BASE["delta_same"])
-    overlap_t = intervals_overlap(ci_transfer, PAPER_BASE["delta_transfer_ci"])
-    overlap_s = intervals_overlap(ci_same, PAPER_BASE["delta_same_ci"])
+    ref = baseline or PAPER_BASE
+    diff_t = abs(delta_transfer - ref["delta_transfer"])
+    diff_s = abs(delta_same - ref["delta_same"])
+    overlap_t = intervals_overlap(ci_transfer, ref["delta_transfer_ci"])
+    overlap_s = intervals_overlap(ci_same, ref["delta_same_ci"])
 
     if (
         diff_t > 0.08 + _EPS
@@ -905,6 +935,8 @@ def build_summary(
     seed: int = 42,
     draws: int = 10000,
     control_doc: dict[str, Any] | None = None,
+    paper_baseline: str = "base-4b",
+    agnes_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate, recompute, bootstrap, and assemble a completely sanitized summary dict."""
     recorded_metrics, records, judge_votes = validate_results_doc(doc)
@@ -981,13 +1013,17 @@ def build_summary(
         ),
     }
 
+    if paper_baseline not in PAPER_BASELINES:
+        raise ValueError(f"Unknown paper_baseline: {paper_baseline!r}")
+    baseline_ref = PAPER_BASELINES[paper_baseline]
     verdict, verdict_details = judge_alignment_verdict(
-        dt_mean, (dt_lo, dt_hi), ds_mean, (ds_lo, ds_hi)
+        dt_mean, (dt_lo, dt_hi), ds_mean, (ds_lo, ds_hi), baseline=baseline_ref
     )
 
     summary_out: dict[str, Any] = {
         "tag": str(doc.get("tag") or ""),
         "judge_model": str(doc.get("judge_model") or ""),
+        "paper_baseline": paper_baseline,
         "num_conversations": recomputed["num_conversations"],
         "num_problems": n_prob,
         "samples_per_problem": recomputed["samples_per_problem"],
@@ -1044,6 +1080,30 @@ def build_summary(
         "verdict": verdict,
         "verdict_details": verdict_details,
     }
+    if agnes_stats is not None:
+        summary_out["agnes_window_stats"] = {
+            k: agnes_stats[k]
+            for k in (
+                "window_init",
+                "window_max",
+                "inner_max_retries",
+                "outer_num_retries",
+                "max_http_requests_per_vote",
+                "backoff_base_s",
+                "backoff_cap_s",
+                "logical_calls",
+                "http_attempts",
+                "success_calls",
+                "transient_retries",
+                "ambiguous_failures",
+                "non_retriable_failures",
+                "max_limit_reached",
+                "final_limit",
+                "window_drops",
+                "congestion_events",
+            )
+            if k in agnes_stats
+        }
 
     if control_doc is not None:
         control_by_row, control_diag = validate_control_doc(control_doc, records)
@@ -1079,6 +1139,11 @@ def format_report(summary: dict[str, Any]) -> str:
     diag = summary["agnes_diagnostics"]
     vd = summary["verdict_details"]
     judge_ok = diag["judge_available"]
+    ref = PAPER_BASELINES.get(summary.get("paper_baseline", "base-4b"), PAPER_BASE)
+    ref_label = ref.get("label", "Paper (base 4B)")
+    ref_leak_lo, ref_leak_hi = ref["leak_rate_ci"]
+    ref_dt_lo, ref_dt_hi = ref["delta_transfer_ci"]
+    ref_ds_lo, ref_ds_hi = ref["delta_same_ci"]
 
     leak_author_str = _fmt_stat_ci(m["leak_rate_author"], pct=True) if judge_ok else "不可用 (>1% 技术失败)"
     leak_sens_str = _fmt_stat_ci(m["leak_rate_excl_tech_fail"], pct=True) if judge_ok else "不可用 (>1% 技术失败)"
@@ -1104,11 +1169,25 @@ def format_report(summary: dict[str, Any]) -> str:
         f"  Judge status (<=1%):   {'可用' if judge_ok else '不可用（技术失败票超过 1%，停下来报告）'}",
         f"  1-5 Eval judge missing: pedagogy={diag['eval_pedagogy_missing']}, "
         f"correctness={diag['eval_correctness_missing']} (eval_judge_ok={m['eval_judge_ok']:.2%})",
+    ]
+    ws = summary.get("agnes_window_stats")
+    if isinstance(ws, dict):
+        lines.extend([
+            "Agnes Congestion Window Diagnostics:",
+            f"  logical_calls={ws.get('logical_calls')} http_attempts={ws.get('http_attempts')} "
+            f"success_calls={ws.get('success_calls')} transient_retries={ws.get('transient_retries')} "
+            f"ambiguous_failures={ws.get('ambiguous_failures')}",
+            f"  window=[init={ws.get('window_init')}, max={ws.get('window_max')}, "
+            f"reached={ws.get('max_limit_reached')}, final={ws.get('final_limit')}] "
+            f"drops={ws.get('window_drops')} congestion_events={ws.get('congestion_events')} "
+            f"max_reqs_per_vote={ws.get('max_http_requests_per_vote')}",
+        ])
+    lines.extend([
         "-" * 78,
-        f"{'Metric':<30} | {'Ours (A100 + Agnes)':<30} | {'Paper (base 4B)':<22}",
+        f"{'Metric':<30} | {'Ours (A100 + Agnes)':<30} | {ref_label:<22}",
         "-" * 78,
-        f"{'Δ_transfer (primary)':<30} | {_fmt_stat_ci(m['delta_transfer']):<30} | +0.1000 [+0.0600, +0.1300]",
-        f"{'Δ_same (primary)':<30} | {_fmt_stat_ci(m['delta_same']):<30} | +0.1100 [+0.0800, +0.1500]",
+        f"{'Δ_transfer (primary)':<30} | {_fmt_stat_ci(m['delta_transfer']):<30} | {ref['delta_transfer']:+.4f} [{ref_dt_lo:+.4f}, {ref_dt_hi:+.4f}]",
+        f"{'Δ_same (primary)':<30} | {_fmt_stat_ci(m['delta_same']):<30} | {ref['delta_same']:+.4f} [{ref_ds_lo:+.4f}, {ref_ds_hi:+.4f}]",
         f"{'Δ_transfer (gated)':<30} | {_fmt_stat_ci(m['delta_transfer_gated']):<30} | —",
         f"{'Δ_same (gated)':<30} | {_fmt_stat_ci(m['delta_same_gated']):<30} | —",
         f"{'Transfer gap (same-transfer)':<30} | {_fmt_stat_ci(m['transfer_gap']):<30} | —",
@@ -1116,20 +1195,20 @@ def format_report(summary: dict[str, Any]) -> str:
         f"{'R2 Hake g (same)':<30} | {_fmt_stat_ci(m['r2_hake_g_same']):<30} | —",
         f"{'R3 Cohen d (transfer)':<30} | {_fmt_stat_ci(m['r3_cohens_d_transfer']):<30} | —",
         f"{'R3 Cohen d (same)':<30} | {_fmt_stat_ci(m['r3_cohens_d_same']):<30} | —",
-        f"{'Leak rate (author)':<30} | {leak_author_str:<30} | 16.80% [13.60%, 20.20%]",
+        f"{'Leak rate (author)':<30} | {leak_author_str:<30} | {ref['leak_rate']*100:.2f}% [{ref_leak_lo*100:.2f}%, {ref_leak_hi*100:.2f}%]",
         f"{'Leak rate (excl tech-fail)':<30} | {leak_sens_str:<30} | —",
         f"{'Teaching reject rate':<30} | {teach_str:<30} | —",
-        f"{'Ped. (1-5)':<30} | {ped_str:<30} | 2.26",
-        f"{'Fact. (1-5)':<30} | {fact_str:<30} | 2.88",
-        f"{'Empty% (blanked turns)':<30} | {m['blanked_teacher_turn_rate']*100:>6.2f}%{'':<23} | 70.00%",
-        f"{'Seq. trunc.%':<30} | {m['token_budget_truncated_rate']*100:>6.2f}%{'':<23} | 31.20%",
-        f"{'EoC rate':<30} | {m['eoc_rate']*100:>6.2f}%{'':<23} | 68.80%",
-        f"{'Thinking tok/turn':<30} | {m['thinking_tokens_avg_per_turn']:>6.1f}{'':<24} | 596.0",
+        f"{'Ped. (1-5)':<30} | {ped_str:<30} | {ref['eval_judge_pedagogy']:.2f}",
+        f"{'Fact. (1-5)':<30} | {fact_str:<30} | {ref['eval_judge_correctness']:.2f}",
+        f"{'Empty% (blanked turns)':<30} | {m['blanked_teacher_turn_rate']*100:>6.2f}%{'':<23} | {ref['blanked_teacher_turn_rate']*100:.2f}%",
+        f"{'Seq. trunc.%':<30} | {m['token_budget_truncated_rate']*100:>6.2f}%{'':<23} | {ref['token_budget_truncated_rate']*100:.2f}%",
+        f"{'EoC rate':<30} | {m['eoc_rate']*100:>6.2f}%{'':<23} | {ref['eoc_rate']*100:.2f}%",
+        f"{'Thinking tok/turn':<30} | {m['thinking_tokens_avg_per_turn']:>6.1f}{'':<24} | {ref['thinking_tokens_avg_per_turn']:.1f}",
         "-" * 78,
         f"判定结论 (仅看主口径 Δ_transfer & Δ_same): {summary['verdict']}",
-        f"  |Δ_transfer - 0.10| = {vd['diff_transfer']:.4f}, CI重叠={vd['overlap_transfer']}",
-        f"  |Δ_same - 0.11|     = {vd['diff_same']:.4f}, CI重叠={vd['overlap_same']}",
-    ]
+        f"  |Δ_transfer - {ref['delta_transfer']:.2f}| = {vd['diff_transfer']:.4f}, CI重叠={vd['overlap_transfer']}",
+        f"  |Δ_same - {ref['delta_same']:.2f}|     = {vd['diff_same']:.4f}, CI重叠={vd['overlap_same']}",
+    ])
 
     poc = summary["process_outcome_correlations"]
     lines.extend([
@@ -1202,6 +1281,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize Eduardo author-494 eval JSON safely.")
     ap.add_argument("result_json", type=Path, help="Path to transfer_eval_*.json")
     ap.add_argument("--control-json", type=Path, default=None, help="Optional Stage 3 control_eval_*.json")
+    ap.add_argument("--agnes-stats", type=Path, default=None, help="Optional agnes_window_stats.json")
+    ap.add_argument(
+        "--paper-baseline",
+        choices=sorted(PAPER_BASELINES),
+        default="base-4b",
+        help="Paper reference baseline for verdict and comparison table",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--draws", type=int, default=10000)
     ap.add_argument("--json-out", type=Path, default=None, help="Optional path to write aggregate summary JSON")
@@ -1210,7 +1296,15 @@ def main() -> int:
     try:
         doc = json.loads(args.result_json.read_text(encoding="utf-8"))
         control_doc = json.loads(args.control_json.read_text(encoding="utf-8")) if args.control_json else None
-        summary = build_summary(doc, seed=args.seed, draws=args.draws, control_doc=control_doc)
+        agnes_stats = json.loads(args.agnes_stats.read_text(encoding="utf-8")) if args.agnes_stats else None
+        summary = build_summary(
+            doc,
+            seed=args.seed,
+            draws=args.draws,
+            control_doc=control_doc,
+            paper_baseline=args.paper_baseline,
+            agnes_stats=agnes_stats,
+        )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
