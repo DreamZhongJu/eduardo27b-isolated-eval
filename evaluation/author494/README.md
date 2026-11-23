@@ -5,8 +5,11 @@
 ## 文件说明
 
 - `preflight_27b_author494.sh`：只读预检（不占卡、不调 Agnes），检查卡与进程归属、端口、磁盘、作者上游 `e8c89b7` 22 文件 SHA-256、严格版本钉死（`vllm==0.19.1`、`math-verify==0.8.0`、`latex2sympy2_extended==1.10.2`）、`Eduardo-27b-3bbf17e`（6 文件 + 与 `own-test-499-v1/PILOT/RUN_CONFIGURATION.json` 的 `teacher_config_sha256` 比对）、`Llama-3.1-8B-Instruct`（7 文件）及官方数据集 SHA-256。
+- `eval_hardening.py`：可复用的作者评测幂等续跑加固层（`ReplayStore`、`ReplayOpenAIClient`、`ReplayTeacherWrapper`、`build_replay_manifest`），在不改动作者源码/流程的前提下：
+  - 将 Tutor（`LocalVLLMTeacher`，支持续跑命中时延迟加载 vLLM）、学生与 Agnes 门控/1–5 分评审的每次完整合法调用按 `request_hash + seq_idx` 原子落盘到 `<output_dir>/replay_cache/replay_records.jsonl`（带单条 SHA-256 校验，最后一条写坏时自动截断丢弃并重发；技术失败/结果不明绝不落盘）；
+  - 通过 `replay_manifest.json` 严格绑定上游提交/文件 SHA-256、包装层 SHA-256、Tutor/学生权重 SHA-256、`test.parquet` SHA-256 与全部评测参数；支持 `--resume` 精确回放已落盘调用、补跑剩余调用。
 - `agnes_window.py`：面向 Agnes 接口的进程内 AIMD 拥塞窗口（初值 `1`、成功 `+1`、上限 `16`、遇到 408/429/5xx/超时/网络/结果不明时减半至不低于 `1` 并做指数退避加抖动上限 `60s`）与内层最多 `2` 次传输重传（叠加作者外层 `num_retries=3`，每票最多 `12` 次 HTTP 请求）。HTTP 200 且具备合法 completion 结构时原样交回作者解析，不额外重传；结果不明记成技术失败。
-- `run_eval_27b_author494.py`：不修改作者任何文件，在内存中包装 `eval.run_env_test_eval.make_judge_client` 与共享的 Agnes `get_async_openai_client`，确认 Tutor `config.json` 为 `bfloat16`，并写出脱敏汇总 `agnes_window_stats.json`。
+- `run_eval_27b_author494.py`：不修改作者任何文件，在内存中串联 `eval_hardening` 与 `AgnesWindowClient` 包装 `make_teacher`、`make_judge_client` 与 `get_async_openai_client`，确认 Tutor `config.json` 为 `bfloat16`，支持 `--resume` 并写出脱敏汇总 `agnes_window_stats.json` 与 `replay_stats.json`。
 - `probe_27b_load.py`：只读等 1 张空闲整卡，验证 `Eduardo-27b-3bbf17e` 在 `env-candidate-vllm0191` 下能否以 `tensor_parallel_size=1, gpu_memory_utilization=0.85, max_model_len=20000` 加载（可选 `--allow-tp2-fallback` 在 OOM/KV 不足时探测 TP=2）。
 - `run_27b_author494.sh`：阶段 1–2 启动器（支持 `--tutor-tp 1|2|auto`、`--auto-wait`、Tutor 占位防抢卡、`--judge-concurrency 12 --eval-judge-concurrency 4`、`--status` 及自动调用 `summarize_author494.py --paper-baseline eduardo-27b`）。
 - `agnes_ping_author494.py`：用 1 条合成假对话走作者 `make_judge_client` + `AgnesWindowClient` 调 1 次 Agnes，只打印 HTTP 状态、返回模型名、JSON 解析结果与窗口计数。
