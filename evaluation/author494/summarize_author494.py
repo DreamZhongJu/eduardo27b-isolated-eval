@@ -151,8 +151,8 @@ _SAFE_INFO_LOG_RE = re.compile(
     r"^(?:"
     r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo\.transfer_eval: "
     r"(?:Thinking mode (?:AUTO|FORCED):|Rollout of |Scoring (?:\d+|took ))"
-    r"|(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo27b\.agnes_window: )?"
-    r"\[27b_agnes_window\] (?:STARTUP|SUMMARY|TUTOR_CONFIG) "
+    r"|(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \[INFO\] eduardo27b\.(?:agnes_window|replay): )?"
+    r"\[(?:27b_agnes_window|27b_replay)\] (?:STARTUP|SUMMARY|TUTOR_CONFIG) "
     r")"
 )
 _SAFE_ROUND_INFO_RE = re.compile(

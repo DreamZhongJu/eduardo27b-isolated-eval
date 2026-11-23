@@ -14,7 +14,7 @@ Usage:
     [--agnes-api-base https://api.agnes-ai.cn/v1] \
     [--agnes-model agnes-3.0-flash] [--agnes-key-env AGNES_API_KEY] \
     [--judge-concurrency 12] [--eval-judge-concurrency 4] \
-    [--test-parquet <path>] [--prepare-only]
+    [--test-parquet <path>] [--prepare-only] [--resume]
 
   run_27b_author494.sh --status <output_dir>
 EOF
@@ -49,6 +49,15 @@ print(f"agnes_window logical_calls={w.get('logical_calls')} http_attempts={w.get
       f"max_window={w.get('max_limit_reached')} drops={w.get('window_drops')} "
       f"congestion={w.get('congestion_events')} http_429={w.get('http_429_events', 0)} "
       f"ambiguous={w.get('ambiguous_failures')}")
+PY
+  fi
+  if [ -f "${OUT_DIR}/replay_stats.json" ]; then
+    python3 -B - "${OUT_DIR}/replay_stats.json" <<'PY'
+import json, sys
+from pathlib import Path
+r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"replay loaded={r.get('loaded_records')} dropped_tail={r.get('dropped_corrupt_tail')} "
+      f"hits={r.get('total_hits')} live={r.get('total_live')} recorded={r.get('total_recorded')}")
 PY
   fi
   if [ -f "${OUT_DIR}/eval_run.log" ]; then
@@ -100,6 +109,7 @@ AGNES_KEY_ENV="AGNES_API_KEY"
 JUDGE_CONCURRENCY="12"
 EVAL_JUDGE_CONCURRENCY="4"
 PREPARE_ONLY="0"
+RESUME="0"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -120,6 +130,7 @@ while [ "$#" -gt 0 ]; do
     --eval-judge-concurrency) EVAL_JUDGE_CONCURRENCY="$2"; shift 2 ;;
     --test-parquet) TEST_PARQUET="$2"; shift 2 ;;
     --prepare-only) PREPARE_ONLY="1"; shift ;;
+    --resume) RESUME="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -235,9 +246,20 @@ if [ -z "${!AGNES_KEY_ENV:-}" ]; then
   echo "ERROR: Agnes key env var ${AGNES_KEY_ENV} is not set" >&2
   exit 2
 fi
-if [ -e "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null || true)" ]; then
-  echo "ERROR: output-dir ${OUTPUT_DIR} already exists and is non-empty; choose a new dir" >&2
-  exit 2
+if [ "${RESUME}" = "1" ]; then
+  if [ ! -f "${OUTPUT_DIR}/replay_cache/replay_manifest.json" ]; then
+    echo "ERROR: --resume requires existing ${OUTPUT_DIR}/replay_cache/replay_manifest.json" >&2
+    exit 2
+  fi
+  if ls "${OUTPUT_DIR}"/transfer_eval_*.json >/dev/null 2>&1; then
+    echo "ERROR: ${OUTPUT_DIR} already has completed transfer_eval_*.json; refusing rerun" >&2
+    exit 2
+  fi
+else
+  if [ -e "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null || true)" ]; then
+    echo "ERROR: output-dir ${OUTPUT_DIR} already exists and is non-empty; pass --resume or choose a new dir" >&2
+    exit 2
+  fi
 fi
 mkdir -p "${OUTPUT_DIR}"
 echo "$$" > "${OUTPUT_DIR}/runner.pid"
@@ -630,12 +652,23 @@ while True:
 PY
 MONITOR_PID=$!
 
-echo "[author494_27b] Starting run_eval_27b_author494.py (num_problems=${NUM_PROBLEMS}, tutor_gpus=${TUTOR_GPUS} TP=${TUTOR_TP}, student_gpus=${STUDENT_GPUS} DP=${STUDENT_DP}, judge_conc=${JUDGE_CONCURRENCY}+${EVAL_JUDGE_CONCURRENCY})..."
+RESUME_FLAG=()
+if [ "${RESUME}" = "1" ]; then
+  RESUME_FLAG=(--resume)
+  echo "=== RESUME $(date '+%Y-%m-%d %H:%M:%S') ===" >> "${OUTPUT_DIR}/eval_run.log"
+else
+  : > "${OUTPUT_DIR}/eval_run.log"
+fi
+
+echo "[author494_27b] Starting run_eval_27b_author494.py (num_problems=${NUM_PROBLEMS}, resume=${RESUME}, tutor_gpus=${TUTOR_GPUS} TP=${TUTOR_TP}, student_gpus=${STUDENT_GPUS} DP=${STUDENT_DP}, judge_conc=${JUDGE_CONCURRENCY}+${EVAL_JUDGE_CONCURRENCY})..."
 START_TS=$(date +%s)
 set +e
 CUDA_VISIBLE_DEVICES="${TUTOR_GPUS}" PYTHONPATH="${REPO}" \
   "${PYTHON_BIN}" -B "${HERE_DIR}/run_eval_27b_author494.py" \
   --agnes-stats-out "${OUTPUT_DIR}/agnes_window_stats.json" \
+  --replay-stats-out "${OUTPUT_DIR}/replay_stats.json" \
+  --student-model-dir "${STUDENT_MODEL}" \
+  "${RESUME_FLAG[@]}" \
   --model "${TUTOR_MODEL}" \
   --tensor-parallel-size "${TUTOR_TP}" \
   --test-parquet "${TEST_PARQUET}" \
@@ -652,7 +685,7 @@ CUDA_VISIBLE_DEVICES="${TUTOR_GPUS}" PYTHONPATH="${REPO}" \
   --eval-judge-concurrency "${EVAL_JUDGE_CONCURRENCY}" \
   --output-dir "${OUTPUT_DIR}" \
   --tag "${TAG}" \
-  > "${OUTPUT_DIR}/eval_run.log" 2>&1
+  >> "${OUTPUT_DIR}/eval_run.log" 2>&1
 EVAL_RC=$?
 set -e
 END_TS=$(date +%s)
