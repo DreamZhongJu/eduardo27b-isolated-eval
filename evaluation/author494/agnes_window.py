@@ -6,7 +6,7 @@ Wraps the async OpenAI client returned by author's ``make_judge_client`` /
 sampling parameters, or verdict parsing logic.
 
 Hardcoded bounds:
-- Window: starts at 1, grows +1 per aligned success, capped at 3.
+- Window: starts at 1, grows +1 per aligned success, capped at 16.
 - Congestion (408/429/5xx/network/timeout/ambiguous response): halves window
   (floor 1) and applies jittered exponential backoff capped at 60.0s.
 - Inner retries: up to 2 retries (3 HTTP attempts) per create() call.
@@ -29,7 +29,7 @@ import openai
 logger = logging.getLogger("eduardo27b.agnes_window")
 
 WINDOW_INIT = 1
-WINDOW_MAX = 3
+WINDOW_MAX = 16
 INNER_MAX_RETRIES = 2
 BACKOFF_BASE_SECONDS = 2.0
 BACKOFF_CAP_SECONDS = 60.0
@@ -88,7 +88,7 @@ class AsyncCongestionWindow:
         sleep_fn: Callable[[float], Any] = asyncio.sleep,
         rand_fn: Callable[[float, float], float] = random.uniform,
     ) -> None:
-        if not (1 <= initial <= maximum <= 3):
+        if not (1 <= initial <= maximum <= 16):
             raise ValueError(f"Invalid window bounds: initial={initial}, maximum={maximum}")
         if backoff_base < 0 or backoff_cap < backoff_base:
             raise ValueError("Invalid backoff bounds")
@@ -112,6 +112,7 @@ class AsyncCongestionWindow:
         self.max_limit_reached = initial
         self.window_drops = 0
         self.congestion_events = 0
+        self.http_429_events = 0
         self.logical_calls = 0
         self.http_attempts = 0
         self.success_calls = 0
@@ -180,6 +181,7 @@ class AsyncCongestionWindow:
             "max_limit_reached": self.max_limit_reached,
             "window_drops": self.window_drops,
             "congestion_events": self.congestion_events,
+            "http_429_events": self.http_429_events,
             "logical_calls": self.logical_calls,
             "http_attempts": self.http_attempts,
             "success_calls": self.success_calls,
@@ -295,6 +297,8 @@ class AgnesWindowClient:
                 if not retriable:
                     self.window.non_retriable_failures += 1
                     raise
+                if getattr(exc, "status_code", None) == 429:
+                    self.window.http_429_events += 1
                 delay = await self.window.report_congestion()
                 logger.warning(
                     "Agnes transient status: category=%s attempt=%d/%d next_delay=%.1fs window=%d",

@@ -167,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             f"max_window_reached={stats['max_limit_reached']} "
             f"final_window={stats['final_limit']} "
             f"window_drops={stats['window_drops']} "
-            f"congestion_events={stats['congestion_events']}"
+            f"congestion_events={stats['congestion_events']} "
+            f"http_429_events={stats['http_429_events']}"
         )
         window_logger.info("%s", summary_line)
         print(summary_line, flush=True)

@@ -1101,6 +1101,7 @@ def build_summary(
                 "final_limit",
                 "window_drops",
                 "congestion_events",
+                "http_429_events",
             )
             if k in agnes_stats
         }
@@ -1180,6 +1181,7 @@ def format_report(summary: dict[str, Any]) -> str:
             f"  window=[init={ws.get('window_init')}, max={ws.get('window_max')}, "
             f"reached={ws.get('max_limit_reached')}, final={ws.get('final_limit')}] "
             f"drops={ws.get('window_drops')} congestion_events={ws.get('congestion_events')} "
+            f"http_429={ws.get('http_429_events', 0)} "
             f"max_reqs_per_vote={ws.get('max_http_requests_per_vote')}",
         ])
     lines.extend([

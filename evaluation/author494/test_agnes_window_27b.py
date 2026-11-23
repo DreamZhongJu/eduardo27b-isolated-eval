@@ -78,46 +78,108 @@ class TestAgnesWindow27B(unittest.TestCase):
         self.assertEqual(win.limit, 1)
 
         async def scenario():
-            # Two successes grow 1 -> 2 -> 3 and stay capped at 3
-            for _ in range(5):
+            # Consecutive successes grow 1 -> 2 -> ... -> 16 and stay capped at 16
+            for _ in range(25):
                 lease = await win.acquire()
                 await win.report_success(lease)
                 await win.release()
-            self.assertEqual(win.limit, 3)
-            self.assertEqual(win.max_limit_reached, 3)
+            self.assertEqual(win.limit, 16)
+            self.assertEqual(win.max_limit_reached, 16)
 
-            # 429 congestion halves 3 -> 1 and blocks for backoff_base=2.0s
+            # 429 congestion halves 16 -> 8 and blocks for backoff_base=2.0s
             lease = await win.acquire()
             delay = await win.report_congestion()
             await win.release()
-            self.assertEqual(win.limit, 1)
+            self.assertEqual(win.limit, 8)
             self.assertEqual(win.window_drops, 1)
             self.assertAlmostEqual(delay, 2.0)
 
-            # Next acquire waits out cooldown, then succeeds 1 -> 2 -> 3
+            # Next acquire waits out cooldown, then succeeds 8 -> 9 -> 10
             lease = await win.acquire()
             await win.report_success(lease)
             await win.release()
-            self.assertEqual(win.limit, 2)
+            self.assertEqual(win.limit, 9)
 
             lease = await win.acquire()
             await win.report_success(lease)
             await win.release()
-            self.assertEqual(win.limit, 3)
+            self.assertEqual(win.limit, 10)
 
-            # Second 429 drops 3 -> 1; exponential backoff grows 2 -> 4 -> 8 -> ... <= 60
-            lease = await win.acquire()
-            d1 = await win.report_congestion()
-            await win.release()
-            self.assertAlmostEqual(d1, 2.0)
+            # Consecutive congestions halve 10 -> 5 -> 2 -> 1 -> 1; backoff grows 2 -> 4 -> 8 -> 16
+            expected_limits = [5, 2, 1, 1]
+            expected_delays = [2.0, 4.0, 8.0, 16.0]
+            for exp_lim, exp_del in zip(expected_limits, expected_delays):
+                lease = await win.acquire()
+                d = await win.report_congestion()
+                await win.release()
+                self.assertEqual(win.limit, exp_lim)
+                self.assertAlmostEqual(d, exp_del)
 
-            lease = await win.acquire()
-            d2 = await win.report_congestion()
-            await win.release()
-            self.assertAlmostEqual(d2, 4.0)
+            # After consecutive 429s drove window down to 1, successes grow it back to 16
+            for _ in range(20):
+                lease = await win.acquire()
+                await win.report_success(lease)
+                await win.release()
+            self.assertEqual(win.limit, 16)
 
         asyncio.run(scenario())
         self.assertTrue(all(dt <= aw.BACKOFF_CAP_SECONDS for dt in sleeps))
+
+    def test_consecutive_429_collapses_to_1_and_recovers_to_16(self):
+        now = [0.0]
+
+        async def fake_sleep(dt: float) -> None:
+            now[0] += dt
+
+        win = aw.AsyncCongestionWindow(
+            monotonic_fn=lambda: now[0],
+            sleep_fn=fake_sleep,
+            rand_fn=lambda _lo, _hi: 1.0,
+        )
+        # Grow up to 16 first
+        async def grow_to_16():
+            for _ in range(15):
+                lease = await win.acquire()
+                await win.report_success(lease)
+                await win.release()
+
+        asyncio.run(grow_to_16())
+        self.assertEqual(win.limit, 16)
+
+        # Feed 429 errors via client calls until window hits 1, then recover via 200 OKs
+        phase = {"fail_429": 4}
+
+        class _Burst429Completions:
+            async def create(self, **_kwargs):
+                if phase["fail_429"] > 0:
+                    phase["fail_429"] -= 1
+                    raise openai.RateLimitError(
+                        "rate limited",
+                        response=_make_http_response(429),
+                        body=None,
+                    )
+                return _fake_completion('{"reasoning": "ok", "decision": "OK"}')
+
+        client = aw.AgnesWindowClient(
+            SimpleNamespace(chat=SimpleNamespace(completions=_Burst429Completions())),
+            window=win,
+            inner_max_retries=5,
+        )
+        # First call fails 4 times with 429 (16 -> 8 -> 4 -> 2 -> 1), then succeeds (1 -> 2)
+        resp = asyncio.run(client.chat.completions.create(model="m", messages=[]))
+        self.assertIn("OK", resp.choices[0].message.content)
+        self.assertEqual(win.http_429_events, 4)
+        self.assertEqual(win.window_drops, 4)
+        self.assertEqual(win.limit, 2)
+
+        # 14 more successes bring it back up to 16 and cap there
+        async def recover():
+            for _ in range(16):
+                await client.chat.completions.create(model="m", messages=[])
+
+        asyncio.run(recover())
+        self.assertEqual(win.limit, 16)
+        self.assertEqual(win.max_limit_reached, 16)
 
     def test_concurrency_respects_window_bounds(self):
         now = [0.0]
@@ -149,12 +211,12 @@ class TestAgnesWindow27B(unittest.TestCase):
         )
 
         async def run_batch():
-            await asyncio.gather(*(client.chat.completions.create(model="m", messages=[]) for _ in range(10)))
+            await asyncio.gather(*(client.chat.completions.create(model="m", messages=[]) for _ in range(40)))
 
         asyncio.run(run_batch())
-        self.assertLessEqual(observed_max, 3)
-        self.assertEqual(win.max_limit_reached, 3)
-        self.assertEqual(win.limit, 3)
+        self.assertLessEqual(observed_max, 16)
+        self.assertEqual(win.max_limit_reached, 16)
+        self.assertEqual(win.limit, 16)
 
     def test_technical_vs_semantic_and_ambiguous_failures(self):
         now = [0.0]

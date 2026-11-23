@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch student vLLM server (bfloat16) + Eduardo-27B Tutor eval (unmodified author code)
-# using Agnes via --gemini interface wrapped by AgnesWindowClient (max 3 concurrent).
+# using Agnes via --gemini interface wrapped by AgnesWindowClient (max 16 concurrent).
 # Supports Tutor TP=1 + Student DP=3 (default) or Tutor TP=2 + Student DP=2 (4 GPUs total).
 set -euo pipefail
 
@@ -13,7 +13,7 @@ Usage:
     [--poll-seconds 60] [--tag eduardo_27b_author494] \
     [--agnes-api-base https://api.agnes-ai.cn/v1] \
     [--agnes-model agnes-3.0-flash] [--agnes-key-env AGNES_API_KEY] \
-    [--judge-concurrency 2] [--eval-judge-concurrency 1] \
+    [--judge-concurrency 12] [--eval-judge-concurrency 4] \
     [--test-parquet <path>] [--prepare-only]
 
   run_27b_author494.sh --status <output_dir>
@@ -47,7 +47,8 @@ from pathlib import Path
 w = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(f"agnes_window logical_calls={w.get('logical_calls')} http_attempts={w.get('http_attempts')} "
       f"max_window={w.get('max_limit_reached')} drops={w.get('window_drops')} "
-      f"congestion={w.get('congestion_events')} ambiguous={w.get('ambiguous_failures')}")
+      f"congestion={w.get('congestion_events')} http_429={w.get('http_429_events', 0)} "
+      f"ambiguous={w.get('ambiguous_failures')}")
 PY
   fi
   if [ -f "${OUT_DIR}/eval_run.log" ]; then
@@ -96,8 +97,8 @@ TAG="eduardo_27b_author494"
 AGNES_API_BASE="https://api.agnes-ai.cn/v1"
 AGNES_MODEL="agnes-3.0-flash"
 AGNES_KEY_ENV="AGNES_API_KEY"
-JUDGE_CONCURRENCY="2"
-EVAL_JUDGE_CONCURRENCY="1"
+JUDGE_CONCURRENCY="12"
+EVAL_JUDGE_CONCURRENCY="4"
 PREPARE_ONLY="0"
 
 while [ "$#" -gt 0 ]; do
@@ -207,8 +208,8 @@ if [ "${TUTOR_TP}" != "1" ] && [ "${TUTOR_TP}" != "2" ]; then
 fi
 STUDENT_DP=$((4 - TUTOR_TP))
 
-if [ $((JUDGE_CONCURRENCY + EVAL_JUDGE_CONCURRENCY)) -gt 3 ]; then
-  echo "ERROR: judge_concurrency (${JUDGE_CONCURRENCY}) + eval_judge_concurrency (${EVAL_JUDGE_CONCURRENCY}) exceeds 3" >&2
+if [ $((JUDGE_CONCURRENCY + EVAL_JUDGE_CONCURRENCY)) -gt 16 ]; then
+  echo "ERROR: judge_concurrency (${JUDGE_CONCURRENCY}) + eval_judge_concurrency (${EVAL_JUDGE_CONCURRENCY}) exceeds 16" >&2
   exit 2
 fi
 
