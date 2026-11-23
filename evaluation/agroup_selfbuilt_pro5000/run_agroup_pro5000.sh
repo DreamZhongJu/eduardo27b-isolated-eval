@@ -2,7 +2,7 @@
 # Launch T-021 evaluation on RTX PRO 5000 (existing pro5000-fast env for both Tutor and Student):
 # - --stack-check: 1-GPU Student (strict --dtype float16; fail closed if unsupported) for 90x32 pre-test vs A100 27B
 # - --mode pilot|full: 1-GPU Tutor (A-group step_100, bfloat16, --max-num-seqs 8) +
-#   1-GPU Student (strict --dtype float16); optional head-16 gate & <=3-worker Agnes after T-020.
+#   1-GPU Student (strict --dtype float16); optional head-16 gate & AIMD (1..16) Agnes after T-020.
 # - --grade-only <dir> / --status <dir>
 set -euo pipefail
 
@@ -14,11 +14,11 @@ Usage:
 
   run_agroup_pro5000.sh (--tutor-gpu <id> --student-gpu <id> | --auto-wait) \
     --output-dir <dir> [--bundle-dir <dir>] [--mode pilot|full] [--pilot-per-tier 3] \
-    [--concurrency 8] [--agnes-workers 3] [--gate-first-n <auto>] [--max-est-days 3.0] [--resume] \
+    [--concurrency 8] [--agnes-workers 16] [--gate-first-n <auto>] [--max-est-days 3.0] [--resume] \
     [--teacher-port 18701] [--student-port 18702] [--poll-seconds 60] \
     [--skip-grading] [--skip-author-rule] [--stack-check-json <path>]
 
-  run_agroup_pro5000.sh --grade-only <output_dir> [--bundle-dir <dir>] [--mode pilot|full] [--agnes-workers 3]
+  run_agroup_pro5000.sh --grade-only <output_dir> [--bundle-dir <dir>] [--mode pilot|full] [--agnes-workers 16]
   run_agroup_pro5000.sh --status <output_dir>
 EOF
 }
@@ -53,6 +53,19 @@ import json, sys
 from pathlib import Path
 r = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(f"student_runtime dtype={r.get('student_dtype')} tutor_dtype={r.get('tutor_dtype')} vllm={r.get('vllm')} torch={r.get('torch')} transformers={r.get('transformers')} math_verify={r.get('math_verify')}")
+PY
+  fi
+  if [ -f "${OUT_DIR}/AGNES/AGNES_GRADING_REPORT.json" ]; then
+    python3 -B - "${OUT_DIR}/AGNES/AGNES_GRADING_REPORT.json" <<'PY'
+import json, sys
+from pathlib import Path
+g = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+w = g.get("window") or {}
+print(
+    f"agnes_report primary_status={g.get('primary_status')} aborted={g.get('aborted_over_1pct')} "
+    f"total={g.get('total_calls')} tech_fail={g.get('technical_failures')} sem_null={g.get('semantic_unknown')} "
+    f"max_win={w.get('max_limit_reached')} drops={w.get('window_drops')} http429={w.get('http_429_events')}"
+)
 PY
   fi
   if [ -f "${OUT_DIR}/wait_status.json" ]; then
@@ -124,7 +137,7 @@ OUTPUT_DIR=""
 MODE="pilot"
 PILOT_PER_TIER="3"
 CONCURRENCY="8"
-AGNES_WORKERS="${AGNES_WORKERS:-3}"
+AGNES_WORKERS="${AGNES_WORKERS:-16}"
 GATE_FIRST_N="-1"
 MAX_EST_DAYS="3.0"
 RESUME="0"
@@ -187,12 +200,19 @@ fi
 
 if [ -n "${GRADE_ONLY_DIR}" ]; then
   test -s "${AGNES_KEY_FILE}"
+  set +e
   "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" \
     --out-root "${GRADE_ONLY_DIR}" --key-file "${AGNES_KEY_FILE}" \
     --t020-base "${BASE}" $( [ -n "${T020_DIR}" ] && echo "--t020-dir ${T020_DIR}" ) \
     --pilot-per-tier "${PILOT_PER_TIER}" --workers "${AGNES_WORKERS}" --run-grading \
     $( [ "${SKIP_AUTHOR_RULE}" = "0" ] && echo "--run-author-rule" )
+  GRADE_ONLY_RC=$?
+  set -e
+  if [ "${GRADE_ONLY_RC}" != "0" ]; then
+    echo "ERROR: grade-only Agnes run failed or aborted (rc=${GRADE_ONLY_RC}); primary metric unavailable." >&2
+    exit "${GRADE_ONLY_RC}"
+  fi
   "${TUTOR_PY}" -B "${HERE_DIR}/summarize_agroup_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" \
     --out-root "${GRADE_ONLY_DIR}" --json-out "${GRADE_ONLY_DIR}/summary_agnes.json" \

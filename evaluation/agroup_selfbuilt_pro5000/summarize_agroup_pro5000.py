@@ -164,6 +164,17 @@ def main() -> int:
             "orig_inconsistent_sources": paired_info.get("orig_inconsistent_sources"),
         },
     }
+    agnes_rep_p = args.out_root / "AGNES" / "AGNES_GRADING_REPORT.json"
+    if args.grade_subdir == "AGNES" and agnes_rep_p.is_file():
+        ag_rep = json.loads(agnes_rep_p.read_text(encoding="utf-8"))
+        payload["agnes_grading_report"] = ag_rep
+        w = ag_rep.get("window") or {}
+        print(
+            f"[base4b_summary] agnes_window: max_limit={w.get('max_limit_reached')} "
+            f"drops={w.get('window_drops')} http429={w.get('http_429_events')} "
+            f"tech_fail={ag_rep.get('technical_failures')} sem_null={ag_rep.get('semantic_unknown')} "
+            f"primary_status={ag_rep.get('primary_status')}"
+        )
     if records:
         cc_27b = cross_check_paired_diff(
             csv_rows,

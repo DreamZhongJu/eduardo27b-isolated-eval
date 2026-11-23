@@ -23,6 +23,7 @@ for _p in (str(HERE), str(BASE4B_DIR), str(PAIRED_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import agnes_window as aw  # noqa: E402
 import export_27b_selfbuilt as exp27  # noqa: E402
 import import_bundle as ib  # noqa: E402
 import make_selfbuilt_paired_csv as mcsv  # noqa: E402
@@ -155,7 +156,7 @@ class TestT021AGroupPro5000(unittest.TestCase):
         self.assertNotIn("SC_SID_", rep)
         self.assertIn("dtype=float16", rep)
 
-    def test_t020_agnes_guard_and_max_3_workers(self):
+    def test_t020_agnes_guard_and_max_16_workers(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "a_group_pro5000"
             runs = base / "runs"
@@ -164,13 +165,13 @@ class TestT021AGroupPro5000(unittest.TestCase):
             fake_proc = Path(td) / "proc"
             fake_proc.mkdir()
 
-            # Workers > 3 forbidden
+            # Workers > 16 forbidden
             with self.assertRaises(ValueError):
-                rpp.check_t020_finished(t020_base=base, workers=4, proc_dir=fake_proc)
+                rpp.check_t020_finished(t020_base=base, workers=17, proc_dir=fake_proc)
 
             # Missing result JSON -> fails closed
             with self.assertRaises(RuntimeError):
-                rpp.check_t020_finished(t020_base=base, workers=3, proc_dir=fake_proc)
+                rpp.check_t020_finished(t020_base=base, workers=16, proc_dir=fake_proc)
 
             # Complete JSON written, but runner.pid alive in fake_proc -> fails closed
             (t020 / "transfer_eval_a.json").write_text(
@@ -181,14 +182,14 @@ class TestT021AGroupPro5000(unittest.TestCase):
             (fake_proc / "999999").mkdir()
             (fake_proc / "999999" / "cmdline").write_bytes(b"bash\0run_author494_pro5000.sh\0")
             with self.assertRaises(RuntimeError):
-                rpp.check_t020_finished(t020_base=base, workers=3, proc_dir=fake_proc)
+                rpp.check_t020_finished(t020_base=base, workers=16, proc_dir=fake_proc)
 
-            # Once PID exited -> passes cleanly
+            # Once PID exited -> passes cleanly up to workers=16
             (fake_proc / "999999" / "cmdline").unlink()
             (fake_proc / "999999").rmdir()
-            info = rpp.check_t020_finished(t020_base=base, workers=3, proc_dir=fake_proc)
+            info = rpp.check_t020_finished(t020_base=base, workers=16, proc_dir=fake_proc)
             self.assertEqual(info["records"], 494)
-            self.assertEqual(info["workers"], 3)
+            self.assertEqual(info["workers"], 16)
 
     def test_paired_csv_crosscheck_and_sanitized_outputs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -343,6 +344,184 @@ class TestT021AGroupPro5000(unittest.TestCase):
         self.assertEqual(len(hashes), 14)
         for h in hashes:
             self.assertEqual(len(h), 64, f"Expected 64-char sha256, got {len(h)}: {h}")
+
+    def test_agnes_window_aimd_cap_and_429_recovery(self):
+        clock = [100.0]
+
+        def now():
+            return clock[0]
+
+        def advance(s):
+            clock[0] += float(s)
+
+        win = aw.SyncCongestionWindow(
+            initial=1,
+            maximum=16,
+            backoff_base=2.0,
+            backoff_cap=60.0,
+            jitter_low=1.0,
+            jitter_high=1.0,
+            monotonic_fn=now,
+            sleep_fn=advance,
+            rand_fn=lambda a, b: a,
+        )
+        # Window grows 1 -> 16 and caps cleanly at 16
+        for _ in range(25):
+            lease = win.acquire()
+            win.report_success(lease)
+            win.release()
+        self.assertEqual(win.limit, 16)
+        self.assertEqual(win.max_limit_reached, 16)
+
+        # Consecutive 429s drop 16 -> 8 -> 4 -> 2 -> 1 -> 1 with capped exponential backoff
+        delays = []
+        for _ in range(5):
+            lease = win.acquire()
+            delays.append(win.report_congestion(event="http_429"))
+            win.release()
+        self.assertEqual(win.limit, 1)
+        self.assertEqual(delays, [2.0, 4.0, 8.0, 16.0, 32.0])
+        self.assertEqual(win.http_429_events, 5)
+        self.assertEqual(win.window_drops, 4)
+
+        # One more 429 hits 60s cap and stays floored at 1
+        lease = win.acquire()
+        d6 = win.report_congestion(event="http_429")
+        win.release()
+        self.assertEqual(d6, 60.0)
+        self.assertEqual(win.limit, 1)
+
+        # Next acquire honors backoff cooldown via fake sleep, then valid successes climb back up
+        for expected in (2, 3, 4, 5):
+            lease = win.acquire()
+            win.report_success(lease)
+            win.release()
+            self.assertEqual(win.limit, expected)
+
+        # Verify caller treats semantic null as neutral while ambiguous HTTP 200 triggers congestion
+        judge = rpp.load_verified_agnes_judge(REPO_ROOT / "evaluation" / "agnes_eval_v3" / "agnes_judge.py")
+        responses = iter([
+            (200, {"model": judge.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": '{"correct": null}'}}]}),
+            (200, {"model": judge.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": "NOT_JSON"}}]}),
+        ])
+        caller = aw.AgnesWindowCaller(judge_mod=judge, inner_caller=lambda b, k: next(responses), window=win)
+        caller({}, "k")
+        self.assertEqual(win.limit, 5)
+        self.assertEqual(win.semantic_neutral_calls, 1)
+        self.assertEqual(win.ambiguous_events, 0)
+
+        caller({}, "k")
+        self.assertEqual(win.limit, 2)  # 5 // 2 = 2
+        self.assertEqual(win.ambiguous_events, 1)
+
+    def test_grade_agnes_pro5000_counts_and_1pct_abort(self):
+        judge = rpp.load_verified_agnes_judge(REPO_ROOT / "evaluation" / "agnes_eval_v3" / "agnes_judge.py")
+
+        def _make_source_env(tmp_dir: Path):
+            sid = "WIN_SID_0"
+            key = hashlib.sha256(f"easy:{sid}".encode()).hexdigest()[:24]
+            out_root = tmp_dir / "out"
+            src_dir = out_root / "EASY" / "sources" / key
+            src_dir.mkdir(parents=True)
+            rows = []
+            for idx in range(32):
+                tgt = "source" if idx < 16 else "ours_easy"
+                rows.append(
+                    {
+                        "source_id": sid,
+                        "target": tgt,
+                        "phase": "post",
+                        "index": idx % 16,
+                        "problem": "P",
+                        "reference_answer": "2",
+                        "student_response": f"resp-{idx}",
+                    }
+                )
+            (src_dir / "RAW_COMPLETE.json").write_text('{"samples":32}', encoding="utf-8")
+            (src_dir / "SCORE_INPUT.json").write_text(json.dumps(rows), encoding="utf-8")
+            key_file = tmp_dir / "agnes.key"
+            key_file.write_text("dummy-key\n", encoding="utf-8")
+            entries = [
+                {
+                    "difficulty": "easy",
+                    "source_id": sid,
+                    "source_key": key,
+                    "row": {"transfer_target": "ours_easy"},
+                }
+            ]
+            return out_root, key_file, entries
+
+        # Case A: 31 valid + 1 semantic null -> tech_fail=0, primary_status=可用
+        with tempfile.TemporaryDirectory() as td:
+            out_root, key_file, entries = _make_source_env(Path(td))
+            clock = [0.0]
+            win = aw.SyncCongestionWindow(
+                initial=1,
+                maximum=16,
+                monotonic_fn=lambda: clock[0],
+                sleep_fn=lambda s: clock.__setitem__(0, clock[0] + s),
+                rand_fn=lambda a, b: a,
+            )
+
+            def ok_caller(body, k):
+                content = body["messages"][1]["content"]
+                is_null = "resp-0" in content
+                ans = '{"correct": null}' if is_null else '{"correct": true}'
+                return 200, {"model": judge.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": ans}}]}
+
+            rep = rpp.grade_agnes_pro5000(
+                entries,
+                out_root=out_root,
+                repo_root=REPO_ROOT,
+                key_file=key_file,
+                workers=16,
+                caller=ok_caller,
+                window=win,
+                sleep_fn=lambda _s: None,
+            )
+            self.assertEqual(rep["primary_status"], "可用")
+            self.assertFalse(rep["aborted_over_1pct"])
+            self.assertEqual(rep["total_calls"], 32)
+            self.assertEqual(rep["correct"], 31)
+            self.assertEqual(rep["semantic_unknown"], 1)
+            self.assertEqual(rep["technical_failures"], 0)
+            self.assertGreater(rep["window"]["max_limit_reached"], 1)
+            self.assertTrue((out_root / "AGNES" / "AGNES_GRADING_REPORT.json").is_file())
+
+        # Case B: 2/32 permanent 429 (> 1%) -> stops with AgnesTechnicalFailureLimitError & 不可用
+        with tempfile.TemporaryDirectory() as td:
+            out_root, key_file, entries = _make_source_env(Path(td))
+            clock = [0.0]
+            win = aw.SyncCongestionWindow(
+                initial=1,
+                maximum=16,
+                monotonic_fn=lambda: clock[0],
+                sleep_fn=lambda s: clock.__setitem__(0, clock[0] + s),
+                rand_fn=lambda a, b: a,
+            )
+
+            def fail_caller(body, k):
+                sr = json.loads(body["messages"][1]["content"])["student_response"]
+                if sr in ("resp-0", "resp-1"):
+                    return 429, None
+                return 200, {"model": judge.MODEL, "choices": [{"finish_reason": "stop", "message": {"content": '{"correct": true}'}}]}
+
+            with self.assertRaises(rpp.AgnesTechnicalFailureLimitError):
+                rpp.grade_agnes_pro5000(
+                    entries,
+                    out_root=out_root,
+                    repo_root=REPO_ROOT,
+                    key_file=key_file,
+                    workers=16,
+                    caller=fail_caller,
+                    window=win,
+                    sleep_fn=lambda _s: None,
+                )
+            rep = json.loads((out_root / "AGNES" / "AGNES_GRADING_REPORT.json").read_text(encoding="utf-8"))
+            self.assertEqual(rep["primary_status"], "不可用")
+            self.assertTrue(rep["aborted_over_1pct"])
+            self.assertEqual(rep["technical_failures"], 2)
+            self.assertEqual(rep["window"]["http_429_events"], 8)  # 2 samples * 4 MAX_ATTEMPTS each
 
 
 if __name__ == "__main__":
