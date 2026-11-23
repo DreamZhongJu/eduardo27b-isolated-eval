@@ -89,7 +89,7 @@ if [ ! -x "${STUDENT_PY}" ]; then
   echo "ERROR: student python missing: ${STUDENT_PY}" >&2
   exit 2
 fi
-LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${LD_LIBRARY_PATH}" "${STUDENT_PY}" -B - <<'PY'
+LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib:${LD_LIBRARY_PATH}" "${STUDENT_PY}" -B - <<'PY'
 import importlib.metadata as md, sys
 import torch, transformers, vllm, openai
 mv = md.version("math-verify")

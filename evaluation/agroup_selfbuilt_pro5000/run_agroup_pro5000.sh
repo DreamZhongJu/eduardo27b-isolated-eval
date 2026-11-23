@@ -291,7 +291,7 @@ if [ "${STACK_CHECK}" = "1" ]; then
       --ports "${STUDENT_PORT}" --num-gpus 1 --min-free-mib 70000 --poll-seconds "${POLL_SECONDS}")"
     STUDENT_GPU="${READ_GPU}"
   fi
-  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
+  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
     "${STUDENT_VLLM}" serve "${RESOLVED_STUDENT}" \
     --host 127.0.0.1 --port "${STUDENT_PORT}" --served-model-name "Llama-3.1-8B-Instruct" \
     --api-key "${SERVING_API_KEY}" --dtype float16 --max-model-len 20000 \
@@ -315,7 +315,7 @@ while time.monotonic() < deadline:
     time.sleep(5)
 raise SystemExit("ERROR: student server health check timed out")
 PY
-  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/stack_check_selfbuilt.py" \
+  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/stack_check_selfbuilt.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-dir "${OUTPUT_DIR}" \
     --student-url "http://127.0.0.1:${STUDENT_PORT}/v1" --per-tier 30 --seed 42
   exit $?
@@ -357,7 +357,7 @@ PY
     exit 1
   fi
 
-  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
+  CUDA_VISIBLE_DEVICES="${STUDENT_GPU}" LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" VLLM_API_KEY="${SERVING_API_KEY}" \
     "${STUDENT_VLLM}" serve "${RESOLVED_STUDENT}" \
     --host 127.0.0.1 --port "${STUDENT_PORT}" --served-model-name "Llama-3.1-8B-Instruct" \
     --api-key "${SERVING_API_KEY}" --dtype float16 --max-model-len 20000 \
@@ -487,7 +487,7 @@ if [ -n "${MONITOR_PID}" ] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
 fi
 
 if [ "${GEN_RC}" = "0" ] && [ "${SKIP_AUTHOR_RULE}" = "0" ]; then
-  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
+  LD_LIBRARY_PATH="${STUDENT_ENV_DIR}/lib:${TUTOR_ENV_DIR}/lib" "${STUDENT_PY}" -B "${HERE_DIR}/run_post_eval_pro5000.py" \
     --repo "${REPO_ROOT}" --bundle-dir "${BUNDLE_DIR}" --out-root "${OUTPUT_DIR}" \
     --pilot-per-tier "${PILOT_PER_TIER}" --run-author-rule \
     >> "${OUTPUT_DIR}/eval_run.log" 2>&1
