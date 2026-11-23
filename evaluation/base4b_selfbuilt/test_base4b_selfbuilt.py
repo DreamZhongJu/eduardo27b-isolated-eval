@@ -489,6 +489,8 @@ class TestBase4BSelfBuilt(unittest.TestCase):
                         teacher_path="/fake/Qwen3.5-4B",
                         teacher_url="http://127.0.0.1:18701/v1",
                         student_url="http://127.0.0.1:18702/v1",
+                        concurrency=1,
+                        in_process=True,
                     )
                 )
             self.assertEqual(gen_stats["complete"], 3)
@@ -520,7 +522,20 @@ class TestBase4BSelfBuilt(unittest.TestCase):
 
             records, diag = sb.collect_base4b_records(manifest, out_root, REPO_ROOT)
             summary = sb.compute_summary(records, seed=42, draws=100)
-            report = sb.format_report(manifest, diag, summary, elapsed_seconds=30.0)
+            report = sb.format_report(
+                manifest,
+                diag,
+                summary,
+                elapsed_seconds=30.0,
+                gen_elapsed_seconds=25.0,
+                grade_elapsed_seconds=5.0,
+            )
+            self.assertTrue(all(ln.startswith("[base4b_summary] ") for ln in report.splitlines()))
+            for expected_tok in ("[未决按错]", "[排除未决]", "原题合并", "原题-简单对话", "简单迁移题", "Timing(gen):", "Timing(agnes):"):
+                self.assertIn(expected_tok, report)
+            extracted = "\n".join(sb.extract_safe_log_lines(report))
+            self.assertIn("原题合并", extracted)
+            self.assertIn("[排除未决]", extracted)
             for sid in sids:
                 self.assertNotIn(sid, report)
             self.assertNotIn("SYNTHETIC_ORIG_PROBLEM", report)
@@ -550,6 +565,135 @@ class TestBase4BSelfBuilt(unittest.TestCase):
             )
             self.assertEqual(t_gpu, 1)
             self.assertEqual(s_gpus, [2])
+
+    def test_head_gate_blocks_on_slow_or_error_and_spawn_pool_resumes(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from tokenizers import Tokenizer, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            tok_dir = tmp / "fake_tok"
+            tok_obj = Tokenizer(models.WordLevel(vocab={"<unk>": 0, "a": 1}, unk_token="<unk>"))
+            tok_obj.pre_tokenizer = pre_tokenizers.Whitespace()
+            ft = PreTrainedTokenizerFast(tokenizer_object=tok_obj, unk_token="<unk>")
+            ft.chat_template = (
+                "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n"
+                "{% endfor %}{% if add_generation_prompt %}assistant\n<think>\n{% endif %}"
+            )
+            ft.save_pretrained(str(tok_dir))
+
+            class _Handler(BaseHTTPRequestHandler):
+                def log_message(self, format, *args):
+                    return
+
+                def do_POST(self):
+                    length = int(self.headers.get("Content-Length", "0"))
+                    req = json.loads(self.rfile.read(length).decode("utf-8"))
+                    model = req.get("model", "")
+                    if "Qwen" in model:
+                        content = "private</think>Step 1<end_of_conversation>"
+                    else:
+                        content = r"Answer \boxed{10}"
+                    body = json.dumps(
+                        {
+                            "id": "mock",
+                            "model": model,
+                            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+            port = srv.server_address[1]
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                sids = ["GATE_SID_0", "GATE_SID_1"]
+                data_path, ref_root, overlay_root, decisions_root = _build_synthetic_27b_env(tmp, sids, set())
+                manifest = mf.build_manifest(
+                    data_path, ref_root, overlay_root, decisions_root, repo_root=REPO_ROOT, require_exact_totals=False
+                )
+                entries = manifest["eligible"][:4]  # across tiers
+
+                # 1. Impossible max_est_days forces head gate to halt after 2 sources.
+                slow_out = tmp / "slow_out"
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(
+                        rpe.generate_entries(
+                            entries,
+                            out_root=slow_out,
+                            repo_root=REPO_ROOT,
+                            teacher_model_name="Qwen3.5-4B",
+                            teacher_path=str(tok_dir),
+                            teacher_url=f"http://127.0.0.1:{port}/v1",
+                            student_url=f"http://127.0.0.1:{port}/v1",
+                            concurrency=2,
+                            gate_first_n=2,
+                            max_est_days=0.000001,
+                        )
+                    )
+                gate_doc = json.loads((slow_out / "HEAD16_GATE.json").read_text(encoding="utf-8"))
+                self.assertFalse(gate_doc["passed"])
+                # Third entry must NOT have started.
+                e3 = entries[2]
+                self.assertFalse((slow_out / sb.STAGE_BY_DIFF[e3["difficulty"]] / "sources" / e3["source_key"]).exists())
+
+                # 2. Evaluate stu_fail > 0 fails gate even with fast timing.
+                err_dir = slow_out / sb.STAGE_BY_DIFF[entries[0]["difficulty"]] / "sources" / entries[0]["source_key"] / "samples" / "source" / "post" / "00"
+                (err_dir / "ERROR.json").write_text('{"status":"unknown"}', encoding="utf-8")
+                bad_gate = rpe.evaluate_head_gate(
+                    entries[:2], out_root=slow_out, total_sources=1489, newly_ran=2, elapsed_seconds=1.0, max_est_days=3.0
+                )
+                self.assertFalse(bad_gate["passed"])
+                self.assertEqual(bad_gate["student_calls_failed"], 1)
+
+                # 3. Normal 4-worker spawn pool with head gate passes, completes all 4, and resumes cleanly.
+                fast_out = tmp / "fast_out"
+                st1 = asyncio.run(
+                    rpe.generate_entries(
+                        entries,
+                        out_root=fast_out,
+                        repo_root=REPO_ROOT,
+                        teacher_model_name="Qwen3.5-4B",
+                        teacher_path=str(tok_dir),
+                        teacher_url=f"http://127.0.0.1:{port}/v1",
+                        student_url=f"http://127.0.0.1:{port}/v1",
+                        concurrency=4,
+                        gate_first_n=2,
+                        max_est_days=3.0,
+                    )
+                )
+                self.assertEqual(st1["complete"], 4)
+                self.assertEqual(st1["held"], 0)
+                self.assertEqual(st1["stu_fail"], 0)
+                self.assertTrue(json.loads((fast_out / "HEAD16_GATE.json").read_text(encoding="utf-8"))["passed"])
+
+                # Resume must skip all 4 existing sources and reuse HEAD16_GATE.json.
+                st2 = asyncio.run(
+                    rpe.generate_entries(
+                        entries,
+                        out_root=fast_out,
+                        repo_root=REPO_ROOT,
+                        teacher_model_name="Qwen3.5-4B",
+                        teacher_path=str(tok_dir),
+                        teacher_url=f"http://127.0.0.1:{port}/v1",
+                        student_url=f"http://127.0.0.1:{port}/v1",
+                        concurrency=4,
+                        gate_first_n=2,
+                        max_est_days=3.0,
+                    )
+                )
+                self.assertEqual(st2["complete"], 0)
+                self.assertEqual(st2["skipped_existing"], 4)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":

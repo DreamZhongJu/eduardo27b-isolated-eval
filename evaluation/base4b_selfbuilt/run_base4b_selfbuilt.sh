@@ -7,7 +7,8 @@ usage() {
   cat <<'EOF'
 Usage:
   run_base4b_selfbuilt.sh (--tutor-gpu <id> --student-gpu <id> | --auto-wait) \
-    --output-dir <new_dir> [--mode pilot|full] [--pilot-per-tier 3] \
+    --output-dir <dir> [--mode pilot|full] [--pilot-per-tier 3] \
+    [--concurrency 8] [--gate-first-n <auto>] [--max-est-days 3.0] [--resume] \
     [--teacher-port 18701] [--student-port 18702] [--poll-seconds 60] \
     [--skip-grading] [--skip-author-rule]
 
@@ -56,10 +57,18 @@ PY
 import json, sys
 from pathlib import Path
 out = Path(sys.argv[1])
+gate_p = out / "HEAD16_GATE.json"
+if gate_p.is_file():
+    g = json.loads(gate_p.read_text(encoding="utf-8"))
+    print(
+        f"head_gate passed={g.get('passed')} complete={g.get('complete')}/{g.get('gate_n')} "
+        f"held={g.get('held')} stu_fail={g.get('student_calls_failed')} "
+        f"sec_per_source={g.get('sec_per_source')} est_full_days={g.get('est_full_days')}"
+    )
 for stage in ("EASY", "MEDIUM", "HARD"):
     base = out / stage / "sources"
     if not base.is_dir():
-        print(f"stage={stage} gen_complete=0 held=0 partial=0 agnes_graded=0")
+        print(f"stage={stage} gen_complete=0 held=0 partial=0 | agnes_graded=0 | author_rule=0")
         continue
     dirs = [p for p in base.iterdir() if p.is_dir()]
     comp = sum(1 for p in dirs if (p / "RAW_COMPLETE.json").is_file())
@@ -67,7 +76,9 @@ for stage in ("EASY", "MEDIUM", "HARD"):
     part = len(dirs) - comp - held
     g_dir = out / "AGNES" / stage / "sources"
     graded = len(list(g_dir.glob("*/RESULTS.json"))) if g_dir.is_dir() else 0
-    print(f"stage={stage} gen_complete={comp} held={held} partial={part} agnes_graded={graded}")
+    ar_dir = out / "AUTHOR_RULE" / stage / "sources"
+    ar_graded = len(list(ar_dir.glob("*/RESULTS.json"))) if ar_dir.is_dir() else 0
+    print(f"stage={stage} gen_complete={comp} held={held} partial={part} | agnes_graded={graded} | author_rule={ar_graded}")
 PY
   if [ -f "${OUT_DIR}/eval_run.log" ]; then
     python3 -B - "${HERE_DIR}" "${OUT_DIR}/eval_run.log" <<'PY'
@@ -77,9 +88,12 @@ sys.path.insert(0, sys.argv[1])
 from summarize_base4b import extract_safe_log_lines
 lines = extract_safe_log_lines(Path(sys.argv[2]).read_text(encoding="utf-8", errors="replace"))
 print(f"status_lines_matched={len(lines)}")
-for ln in lines[-10:]:
+for ln in lines[-20:]:
     print(" ", ln)
 PY
+  fi
+  if [ -f "${OUT_DIR}/summary_agnes_report.txt" ]; then
+    grep -E "^\[base4b_summary\] " "${OUT_DIR}/summary_agnes_report.txt" || true
   fi
   if [ -f "${OUT_DIR}/gpu_watch.log" ]; then
     ALERTS=$(grep -c "NEW_HOST_PID_ALERT" "${OUT_DIR}/gpu_watch.log" || true)
@@ -95,6 +109,10 @@ POLL_SECONDS="60"
 OUTPUT_DIR=""
 MODE="pilot"
 PILOT_PER_TIER="3"
+CONCURRENCY="8"
+GATE_FIRST_N="-1"
+MAX_EST_DAYS="3.0"
+RESUME="0"
 TEACHER_PORT="18701"
 STUDENT_PORT="18702"
 SKIP_GRADING="0"
@@ -110,6 +128,10 @@ while [ "$#" -gt 0 ]; do
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --pilot-per-tier) PILOT_PER_TIER="$2"; shift 2 ;;
+    --concurrency) CONCURRENCY="$2"; shift 2 ;;
+    --gate-first-n) GATE_FIRST_N="$2"; shift 2 ;;
+    --max-est-days) MAX_EST_DAYS="$2"; shift 2 ;;
+    --resume) RESUME="1"; shift ;;
     --teacher-port) TEACHER_PORT="$2"; shift 2 ;;
     --student-port) STUDENT_PORT="$2"; shift 2 ;;
     --skip-grading) SKIP_GRADING="1"; shift ;;
@@ -128,7 +150,10 @@ export PYTHONUNBUFFERED=1
 
 if [ "${MODE}" = "full" ]; then
   PILOT_PER_TIER="0"
-elif [ "${MODE}" != "pilot" ]; then
+  if [ "${GATE_FIRST_N}" = "-1" ]; then GATE_FIRST_N="16"; fi
+elif [ "${MODE}" = "pilot" ]; then
+  if [ "${GATE_FIRST_N}" = "-1" ]; then GATE_FIRST_N="0"; fi
+else
   echo "ERROR: --mode must be pilot or full" >&2
   exit 2
 fi
@@ -139,12 +164,13 @@ if [ -n "${GRADE_ONLY_DIR}" ]; then
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
     --out-root "${GRADE_ONLY_DIR}" --key-file "${AGNES_KEY_FILE}" \
-    --pilot-per-tier "${PILOT_PER_TIER}" --run-grading \
+    --pilot-per-tier "${PILOT_PER_TIER}" --workers 5 --run-grading \
     $( [ "${SKIP_AUTHOR_RULE}" = "0" ] && echo "--run-author-rule" )
   "${TUTOR_PY}" -B "${HERE_DIR}/summarize_base4b.py" \
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
-    --out-root "${GRADE_ONLY_DIR}" --json-out "${GRADE_ONLY_DIR}/summary_agnes.json"
+    --out-root "${GRADE_ONLY_DIR}" --json-out "${GRADE_ONLY_DIR}/summary_agnes.json" \
+    | tee "${GRADE_ONLY_DIR}/summary_agnes_report.txt"
   exit 0
 fi
 
@@ -160,8 +186,8 @@ if [ "${SKIP_GRADING}" = "0" ] && [ ! -s "${AGNES_KEY_FILE}" ]; then
   echo "ERROR: Agnes key file missing or empty: ${AGNES_KEY_FILE}" >&2
   exit 2
 fi
-if [ -e "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null || true)" ]; then
-  echo "ERROR: output-dir ${OUTPUT_DIR} already exists and is non-empty; choose a new dir" >&2
+if [ "${RESUME}" = "0" ] && [ -e "${OUTPUT_DIR}" ] && [ -n "$(ls -A "${OUTPUT_DIR}" 2>/dev/null || true)" ]; then
+  echo "ERROR: output-dir ${OUTPUT_DIR} already exists and is non-empty; pass --resume or choose a new dir" >&2
   exit 2
 fi
 mkdir -p "${OUTPUT_DIR}"
@@ -329,7 +355,7 @@ PY
     --tensor-parallel-size 1 \
     --max-model-len 20000 \
     --gpu-memory-utilization 0.85 \
-    --max-num-seqs 1 \
+    --max-num-seqs 8 \
     --enforce-eager \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --seed 42 \
@@ -403,7 +429,7 @@ while True:
 PY
 MONITOR_PID=$!
 
-echo "[base4b] Starting generation (mode=${MODE}, pilot_per_tier=${PILOT_PER_TIER}, tutor_gpu=${TUTOR_GPU}, student_gpu=${STUDENT_GPU})..."
+echo "[base4b] Starting generation (mode=${MODE}, pilot_per_tier=${PILOT_PER_TIER}, concurrency=${CONCURRENCY}, gate_first_n=${GATE_FIRST_N}, max_est_days=${MAX_EST_DAYS}, tutor_gpu=${TUTOR_GPU}, student_gpu=${STUDENT_GPU})..."
 START_TS=$(date +%s)
 set +e
 "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval.py" \
@@ -414,13 +440,17 @@ set +e
   --teacher-url "http://127.0.0.1:${TEACHER_PORT}/v1" \
   --student-url "http://127.0.0.1:${STUDENT_PORT}/v1" \
   --pilot-per-tier "${PILOT_PER_TIER}" \
+  --concurrency "${CONCURRENCY}" \
+  --gate-first-n "${GATE_FIRST_N}" \
+  --max-est-days "${MAX_EST_DAYS}" \
   --run-generation \
   $( [ "${SKIP_AUTHOR_RULE}" = "0" ] && echo "--run-author-rule" ) \
-  > "${OUTPUT_DIR}/eval_run.log" 2>&1
+  >> "${OUTPUT_DIR}/eval_run.log" 2>&1
 GEN_RC=$?
 set -e
 GEN_END_TS=$(date +%s)
-echo "[base4b] generation_finished rc=${GEN_RC} gen_elapsed=$((GEN_END_TS - START_TS))s"
+GEN_ELAPSED=$((GEN_END_TS - START_TS))
+echo "[base4b] generation_finished rc=${GEN_RC} gen_elapsed=${GEN_ELAPSED}s"
 
 # Stop GPU servers before Agnes grading so GPUs are immediately freed!
 kill_descendants "${TEACHER_PID}"; TEACHER_PID=""
@@ -432,19 +462,22 @@ if [ -n "${MONITOR_PID}" ] && kill -0 "${MONITOR_PID}" 2>/dev/null; then
 fi
 
 GRADE_RC=0
+GRADE_ELAPSED=0
 if [ "${GEN_RC}" = "0" ] && [ "${SKIP_GRADING}" = "0" ]; then
+  echo "[base4b] Starting Agnes grading (1 process, workers=5)..."
   GRADE_START_TS=$(date +%s)
   set +e
   "${TUTOR_PY}" -B "${HERE_DIR}/run_post_eval.py" \
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
     --out-root "${OUTPUT_DIR}" --key-file "${AGNES_KEY_FILE}" \
-    --pilot-per-tier "${PILOT_PER_TIER}" --run-grading \
+    --pilot-per-tier "${PILOT_PER_TIER}" --workers 5 --run-grading \
     >> "${OUTPUT_DIR}/eval_run.log" 2>&1
   GRADE_RC=$?
   set -e
   GRADE_END_TS=$(date +%s)
-  echo "[base4b] grading_finished rc=${GRADE_RC} grade_elapsed=$((GRADE_END_TS - GRADE_START_TS))s"
+  GRADE_ELAPSED=$((GRADE_END_TS - GRADE_START_TS))
+  echo "[base4b] grading_finished rc=${GRADE_RC} grade_elapsed=${GRADE_ELAPSED}s"
 fi
 
 TOTAL_ELAPSED=$(( $(date +%s) - START_TS ))
@@ -470,13 +503,16 @@ if [ "${GEN_RC}" = "0" ] && [ "${GRADE_RC}" = "0" ] && [ "${SKIP_GRADING}" = "0"
     --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
     --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
     --out-root "${OUTPUT_DIR}" --elapsed-seconds "${TOTAL_ELAPSED}" \
-    --json-out "${OUTPUT_DIR}/summary_agnes.json"
+    --gen-elapsed-seconds "${GEN_ELAPSED}" --grade-elapsed-seconds "${GRADE_ELAPSED}" \
+    --json-out "${OUTPUT_DIR}/summary_agnes.json" \
+    | tee "${OUTPUT_DIR}/summary_agnes_report.txt"
   if [ "${SKIP_AUTHOR_RULE}" = "0" ]; then
     "${TUTOR_PY}" -B "${HERE_DIR}/summarize_base4b.py" \
       --repo "${REPO_ROOT}" --data "${DATA_FILE}" \
       --ref-root "${REF_ROOT}" --overlay "${OVERLAY_ROOT}" --decisions "${DECISIONS_ROOT}" \
       --out-root "${OUTPUT_DIR}" --grade-subdir AUTHOR_RULE \
-      --json-out "${OUTPUT_DIR}/summary_author_rule.json"
+      --json-out "${OUTPUT_DIR}/summary_author_rule.json" \
+      | tee "${OUTPUT_DIR}/summary_author_rule_report.txt"
   fi
 fi
 

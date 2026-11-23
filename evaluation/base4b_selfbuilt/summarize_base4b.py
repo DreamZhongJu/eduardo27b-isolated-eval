@@ -31,7 +31,7 @@ STAGE_BY_DIFF = {"easy": "EASY", "medium": "MEDIUM", "hard": "HARD"}
 
 _TRACEBACK_FRAME_RE = re.compile(r'^\s+File ".*", line \d+, in ')
 _EXC_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|SystemExit)\b")
-_SAFE_STATUS_RE = re.compile(r"^\[base4b(?:_eval)?\]\s+")
+_SAFE_STATUS_RE = re.compile(r"^\[base4b(?:_eval|_summary)?\]\s+")
 
 
 def extract_safe_log_lines(text: str) -> list[str]:
@@ -490,6 +490,8 @@ def format_report(
     summary: dict[str, Any],
     *,
     elapsed_seconds: float = 0.0,
+    gen_elapsed_seconds: float = 0.0,
+    grade_elapsed_seconds: float = 0.0,
 ) -> str:
     lines: list[str] = []
     lines.append("=" * 84)
@@ -505,6 +507,7 @@ def format_report(
     tot_unterm = 0
     tot_failed_stu = 0
     tot_graded_src = 0
+    tot_gen_complete = 0
     tot_agnes = Counter()
     for d in DIFFICULTY_ORDER:
         dc = diagnostics["per_tier"][d]
@@ -516,6 +519,7 @@ def format_report(
         tot_unterm += unterm
         tot_failed_stu += dc.get("student_calls_failed", 0)
         tot_graded_src += dc.get("graded_sources", 0)
+        tot_gen_complete += dc.get("gen_complete", 0)
         for k in ("grade_correct", "grade_incorrect", "grade_unknown", "semantic_unknown", "technical_unknown", "auth_failure"):
             tot_agnes[k] += dc.get(k, 0)
         b_pct = (100.0 * blanked / turns) if turns else 0.0
@@ -539,6 +543,20 @@ def format_report(
         f"Tutor assume_thinking={diagnostics['assume_thinking_values']} end_reasons={diagnostics['end_reasons']} "
         f"blanked_total={tot_blanked}/{tot_turns} unterminated_total={tot_unterm}/{tot_turns} stu_fail_total={tot_failed_stu}"
     )
+    if gen_elapsed_seconds > 0 and tot_gen_complete > 0:
+        g_sec = gen_elapsed_seconds / tot_gen_complete
+        g_h = (g_sec * 1489.0) / 3600.0
+        lines.append(
+            f"Timing(gen): elapsed={gen_elapsed_seconds:.1f}s sources={tot_gen_complete} sec_per_source={g_sec:.1f}s "
+            f"est_1489_hours={g_h:.1f}h ({g_h/24.0:.2f}d)"
+        )
+    if grade_elapsed_seconds > 0 and tot_graded_src > 0:
+        a_sec = grade_elapsed_seconds / tot_graded_src
+        a_h = (a_sec * 1489.0) / 3600.0
+        lines.append(
+            f"Timing(agnes): elapsed={grade_elapsed_seconds:.1f}s sources={tot_graded_src} sec_per_source={a_sec:.1f}s "
+            f"est_1489_hours={a_h:.1f}h ({a_h/24.0:.2f}d)"
+        )
     if elapsed_seconds > 0 and tot_graded_src > 0:
         sec_per = elapsed_seconds / tot_graded_src
         est_hours = (sec_per * 1489.0) / 3600.0
@@ -565,7 +583,7 @@ def format_report(
             r3 = f"{r['r3_cohens_d']:+6.3f}" if r["r3_cohens_d"] is not None else "   N/A"
             lines.append(f"{r['label']:<28} | {r['n_4b']:>4} | {rb} | {ro} | {r1_s:<23} | {r2} | {r3} | {pd_s}")
     lines.append("=" * 84)
-    return "\n".join(lines)
+    return "\n".join(f"[base4b_summary] {ln}" for ln in lines)
 
 
 def main() -> int:
@@ -580,6 +598,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--draws", type=int, default=10000)
     ap.add_argument("--elapsed-seconds", type=float, default=0.0)
+    ap.add_argument("--gen-elapsed-seconds", type=float, default=0.0)
+    ap.add_argument("--grade-elapsed-seconds", type=float, default=0.0)
     ap.add_argument("--json-out", type=Path, default=None)
     args = ap.parse_args()
 
@@ -599,7 +619,16 @@ def main() -> int:
         for e in manifest["eligible"]
     ]
     summary = compute_summary(records, all_27b_records=all_27b, seed=args.seed, draws=args.draws)
-    print(format_report(manifest, diagnostics, summary, elapsed_seconds=args.elapsed_seconds))
+    print(
+        format_report(
+            manifest,
+            diagnostics,
+            summary,
+            elapsed_seconds=args.elapsed_seconds,
+            gen_elapsed_seconds=args.gen_elapsed_seconds,
+            grade_elapsed_seconds=args.grade_elapsed_seconds,
+        )
+    )
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         payload = {

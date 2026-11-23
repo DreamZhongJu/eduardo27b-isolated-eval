@@ -15,8 +15,10 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import multiprocessing
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -196,6 +198,272 @@ async def run_one_post_only(
         )
 
 
+def _count_source_issues(folder: Path) -> tuple[bool, bool, int]:
+    """Return (is_complete, is_held, stu_fail_count) strictly from disk markers/receipts."""
+    is_complete = (folder / "RAW_COMPLETE.json").is_file()
+    is_held = (folder / "SOURCE_HELD.json").is_file()
+    stu_fail = len(list((folder / "samples").glob("*/*/*/ERROR.json")))
+    roll_p = folder / "dialogue" / "ROLLOUT_RESULT.json"
+    if roll_p.is_file():
+        try:
+            roll = json.loads(roll_p.read_bytes())
+            if roll.get("end_reason") == "student_failed":
+                stu_fail += 1
+        except Exception:
+            pass
+    stu_dir = folder / "dialogue" / "student"
+    if stu_dir.is_dir():
+        for res_p in stu_dir.glob("*/RESULT.json"):
+            try:
+                if json.loads(res_p.read_bytes()).get("status") != "completed":
+                    stu_fail += 1
+            except Exception:
+                stu_fail += 1
+    return is_complete, is_held, stu_fail
+
+
+def _process_one_entry_sync(
+    entry: dict[str, Any],
+    *,
+    out_root: Path,
+    repo_root: Path,
+    teacher_model_name: str,
+    teacher_path: str,
+    teacher_url: str,
+    student_url: str,
+) -> dict[str, Any]:
+    """Run one source in complete OS process isolation (env RESULTS_DIR + app globals safe)."""
+    offline_eval, dialogue_mod, protocol_mod, scoring_mod = _load_frozen_app(repo_root)
+    os.environ["LOCAL_ONLY_KEY"] = "loopback-only"
+    student_url = offline_eval.local_url(student_url)
+    teacher_url = offline_eval.local_url(teacher_url)
+    stage = STAGE_BY_DIFF[entry["difficulty"]]
+    stage_dir = out_root / stage
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["RESULTS_DIR"] = str(stage_dir)
+    row = entry["row"]
+    folder = scoring_mod.source_dir(row)
+    if (folder / "RAW_COMPLETE.json").is_file():
+        _, _, stu_fail = _count_source_issues(folder)
+        return {"status": "skipped_existing", "error_type": None, "stu_fail": stu_fail}
+    if (folder / "SOURCE_HELD.json").is_file():
+        _, _, stu_fail = _count_source_issues(folder)
+        return {"status": "held", "error_type": "prior_held", "stu_fail": stu_fail}
+
+    async def _run() -> None:
+        student_client = offline_eval.openai.AsyncClient(
+            api_key="loopback-only", base_url=student_url, timeout=300, max_retries=0
+        )
+        try:
+            await run_one_post_only(
+                row,
+                teacher_model_name=teacher_model_name,
+                teacher_path=teacher_path,
+                teacher_url=teacher_url,
+                student_url=student_url,
+                student_client=student_client,
+                offline_eval=offline_eval,
+                dialogue_mod=dialogue_mod,
+                protocol_mod=protocol_mod,
+                scoring_mod=scoring_mod,
+            )
+        finally:
+            close_fn = getattr(student_client, "close", None)
+            if callable(close_fn):
+                res = close_fn()
+                if inspect.isawaitable(res):
+                    await res
+
+    try:
+        asyncio.run(_run())
+        _, _, stu_fail = _count_source_issues(folder)
+        return {"status": "complete", "error_type": None, "stu_fail": stu_fail}
+    except Exception as exc:
+        marker = folder / "SOURCE_HELD.json"
+        if not marker.exists() and not (folder / "RAW_COMPLETE.json").exists():
+            scoring_mod.put_once(
+                marker,
+                {"source_id": row["source_id"], "status": "held", "error_type": type(exc).__name__},
+            )
+        _, _, stu_fail = _count_source_issues(folder)
+        return {"status": "held", "error_type": type(exc).__name__, "stu_fail": stu_fail}
+
+
+def evaluate_head_gate(
+    head_entries: list[dict[str, Any]],
+    *,
+    out_root: Path,
+    total_sources: int,
+    newly_ran: int,
+    elapsed_seconds: float,
+    max_est_days: float,
+) -> dict[str, Any]:
+    """Evaluate mechanical gate: 0 student failures, 0 errors/held, est full <= max_est_days."""
+    complete = 0
+    held = 0
+    stu_fail = 0
+    for entry in head_entries:
+        folder = out_root / STAGE_BY_DIFF[entry["difficulty"]] / "sources" / entry["source_key"]
+        comp, is_held, sf = _count_source_issues(folder)
+        if comp and not is_held:
+            complete += 1
+        else:
+            held += 1
+        stu_fail += sf
+
+    denom = newly_ran if newly_ran > 0 else max(1, len(head_entries))
+    sec_per_source = elapsed_seconds / denom
+    est_full_hours = (sec_per_source * total_sources) / 3600.0
+    est_full_days = est_full_hours / 24.0
+    passed = (
+        complete == len(head_entries)
+        and held == 0
+        and stu_fail == 0
+        and est_full_days <= max_est_days
+    )
+    return {
+        "gate_n": len(head_entries),
+        "newly_ran": newly_ran,
+        "complete": complete,
+        "held": held,
+        "student_calls_failed": stu_fail,
+        "elapsed_seconds": round(elapsed_seconds, 2),
+        "sec_per_source": round(sec_per_source, 2),
+        "est_full_hours": round(est_full_hours, 2),
+        "est_full_days": round(est_full_days, 3),
+        "max_est_days": max_est_days,
+        "passed": passed,
+    }
+
+
+async def _run_batch_in_process(
+    batch: list[dict[str, Any]],
+    *,
+    out_root: Path,
+    repo_root: Path,
+    teacher_model_name: str,
+    teacher_path: str,
+    teacher_url: str,
+    student_url: str,
+    stats: dict[str, int],
+    total_count: int,
+    completed_so_far: int,
+    batch_start_ts: float,
+) -> int:
+    offline_eval, dialogue_mod, protocol_mod, scoring_mod = _load_frozen_app(repo_root)
+    os.environ["LOCAL_ONLY_KEY"] = "loopback-only"
+    student_url = offline_eval.local_url(student_url)
+    teacher_url = offline_eval.local_url(teacher_url)
+    student_client = offline_eval.openai.AsyncClient(
+        api_key="loopback-only", base_url=student_url, timeout=300, max_retries=0
+    )
+    done = completed_so_far
+    try:
+        for entry in batch:
+            stage = STAGE_BY_DIFF[entry["difficulty"]]
+            stage_dir = out_root / stage
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["RESULTS_DIR"] = str(stage_dir)
+            row = entry["row"]
+            folder = scoring_mod.source_dir(row)
+            if (folder / "RAW_COMPLETE.json").is_file():
+                stats["skipped_existing"] += 1
+            elif (folder / "SOURCE_HELD.json").is_file():
+                stats["held"] += 1
+            else:
+                try:
+                    await run_one_post_only(
+                        row,
+                        teacher_model_name=teacher_model_name,
+                        teacher_path=teacher_path,
+                        teacher_url=teacher_url,
+                        student_url=student_url,
+                        student_client=student_client,
+                        offline_eval=offline_eval,
+                        dialogue_mod=dialogue_mod,
+                        protocol_mod=protocol_mod,
+                        scoring_mod=scoring_mod,
+                    )
+                    stats["complete"] += 1
+                except Exception as exc:
+                    marker = folder / "SOURCE_HELD.json"
+                    if not marker.exists() and not (folder / "RAW_COMPLETE.json").exists():
+                        scoring_mod.put_once(
+                            marker,
+                            {"source_id": row["source_id"], "status": "held", "error_type": type(exc).__name__},
+                        )
+                    stats["held"] += 1
+                _, _, sf = _count_source_issues(folder)
+                stats["stu_fail"] += sf
+            done += 1
+            if done % 10 == 0 or done == total_count:
+                el = time.monotonic() - batch_start_ts
+                print(
+                    f"[base4b] gen_progress={done}/{total_count} complete={stats['complete']} "
+                    f"skipped={stats['skipped_existing']} held={stats['held']} stu_fail={stats['stu_fail']} "
+                    f"elapsed_s={el:.1f}",
+                    flush=True,
+                )
+    finally:
+        close_fn = getattr(student_client, "close", None)
+        if callable(close_fn):
+            res = close_fn()
+            if inspect.isawaitable(res):
+                await res
+    return done
+
+
+def _run_batch_spawn_pool(
+    batch: list[dict[str, Any]],
+    *,
+    concurrency: int,
+    out_root: Path,
+    repo_root: Path,
+    teacher_model_name: str,
+    teacher_path: str,
+    teacher_url: str,
+    student_url: str,
+    stats: dict[str, int],
+    total_count: int,
+    completed_so_far: int,
+    batch_start_ts: float,
+) -> int:
+    if not batch:
+        return completed_so_far
+    done = completed_so_far
+    ctx = multiprocessing.get_context("spawn")
+    workers = max(1, min(concurrency, len(batch)))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        futs = [
+            pool.submit(
+                _process_one_entry_sync,
+                entry,
+                out_root=out_root,
+                repo_root=repo_root,
+                teacher_model_name=teacher_model_name,
+                teacher_path=teacher_path,
+                teacher_url=teacher_url,
+                student_url=student_url,
+            )
+            for entry in batch
+        ]
+        for fut in concurrent.futures.as_completed(futs):
+            res = fut.result()
+            st = res["status"]
+            stats[st] = stats.get(st, 0) + 1
+            stats["stu_fail"] += int(res.get("stu_fail", 0))
+            done += 1
+            if done % 16 == 0 or done == total_count:
+                el = time.monotonic() - batch_start_ts
+                print(
+                    f"[base4b] gen_progress={done}/{total_count} complete={stats['complete']} "
+                    f"skipped={stats['skipped_existing']} held={stats['held']} stu_fail={stats['stu_fail']} "
+                    f"elapsed_s={el:.1f}",
+                    flush=True,
+                )
+    return done
+
+
 async def generate_entries(
     entries: list[dict[str, Any]],
     *,
@@ -205,64 +473,113 @@ async def generate_entries(
     teacher_path: str,
     teacher_url: str,
     student_url: str,
-) -> dict[str, int]:
-    """Generate dialogue + post samples for selected eligible entries across tiers."""
-    offline_eval, dialogue_mod, protocol_mod, scoring_mod = _load_frozen_app(repo_root)
-    os.environ["LOCAL_ONLY_KEY"] = "loopback-only"
-    student_url = offline_eval.local_url(student_url)
-    teacher_url = offline_eval.local_url(teacher_url)
-    student_client = offline_eval.openai.AsyncClient(
-        api_key="loopback-only", base_url=student_url, timeout=300, max_retries=0
-    )
-    stats = {"complete": 0, "skipped_existing": 0, "held": 0}
-    try:
-        for idx, entry in enumerate(entries, 1):
-            stage = STAGE_BY_DIFF[entry["difficulty"]]
-            stage_dir = out_root / stage
-            stage_dir.mkdir(parents=True, exist_ok=True)
-            os.environ["RESULTS_DIR"] = str(stage_dir)
-            row = entry["row"]
-            folder = scoring_mod.source_dir(row)
-            if (folder / "RAW_COMPLETE.json").is_file():
-                stats["skipped_existing"] += 1
-                continue
-            if (folder / "SOURCE_HELD.json").is_file():
-                stats["held"] += 1
-                continue
-            try:
-                await run_one_post_only(
-                    row,
-                    teacher_model_name=teacher_model_name,
-                    teacher_path=teacher_path,
-                    teacher_url=teacher_url,
-                    student_url=student_url,
-                    student_client=student_client,
-                    offline_eval=offline_eval,
-                    dialogue_mod=dialogue_mod,
-                    protocol_mod=protocol_mod,
-                    scoring_mod=scoring_mod,
-                )
-                stats["complete"] += 1
-            except Exception as exc:
-                marker = folder / "SOURCE_HELD.json"
-                if not marker.exists() and not (folder / "RAW_COMPLETE.json").exists():
-                    scoring_mod.put_once(
-                        marker,
-                        {"source_id": row["source_id"], "status": "held", "error_type": type(exc).__name__},
-                    )
-                stats["held"] += 1
-            if idx % 10 == 0 or idx == len(entries):
-                print(
-                    f"[base4b] gen_progress={idx}/{len(entries)} complete={stats['complete']} "
-                    f"skipped={stats['skipped_existing']} held={stats['held']}",
-                    flush=True,
-                )
-    finally:
-        close_fn = getattr(student_client, "close", None)
-        if callable(close_fn):
-            res = close_fn()
-            if inspect.isawaitable(res):
-                await res
+    concurrency: int = 8,
+    gate_first_n: int = 0,
+    max_est_days: float = 3.0,
+    in_process: bool = False,
+) -> dict[str, Any]:
+    """Generate dialogue + post samples with concurrent source workers and optional head-N gate."""
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    _, _, _, scoring_mod = _load_frozen_app(repo_root)
+    stats: dict[str, Any] = {"complete": 0, "skipped_existing": 0, "held": 0, "stu_fail": 0}
+
+    pending: list[dict[str, Any]] = []
+    already_complete: list[dict[str, Any]] = []
+    already_held: list[dict[str, Any]] = []
+    for entry in entries:
+        folder = out_root / STAGE_BY_DIFF[entry["difficulty"]] / "sources" / entry["source_key"]
+        if (folder / "RAW_COMPLETE.json").is_file():
+            already_complete.append(entry)
+            stats["skipped_existing"] += 1
+        elif (folder / "SOURCE_HELD.json").is_file():
+            already_held.append(entry)
+            stats["held"] += 1
+        else:
+            pending.append(entry)
+
+    total_count = len(entries)
+    done_count = len(already_complete) + len(already_held)
+    start_ts = time.monotonic()
+
+    async def _exec(sub_batch: list[dict[str, Any]], t_ref: float) -> None:
+        nonlocal done_count
+        if concurrency == 1 or in_process:
+            done_count = await _run_batch_in_process(
+                sub_batch,
+                out_root=out_root,
+                repo_root=repo_root,
+                teacher_model_name=teacher_model_name,
+                teacher_path=teacher_path,
+                teacher_url=teacher_url,
+                student_url=student_url,
+                stats=stats,
+                total_count=total_count,
+                completed_so_far=done_count,
+                batch_start_ts=t_ref,
+            )
+        else:
+            done_count = _run_batch_spawn_pool(
+                sub_batch,
+                concurrency=concurrency,
+                out_root=out_root,
+                repo_root=repo_root,
+                teacher_model_name=teacher_model_name,
+                teacher_path=teacher_path,
+                teacher_url=teacher_url,
+                student_url=student_url,
+                stats=stats,
+                total_count=total_count,
+                completed_so_far=done_count,
+                batch_start_ts=t_ref,
+            )
+
+    if gate_first_n > 0:
+        gate_path = out_root / "HEAD16_GATE.json"
+        if gate_path.is_file():
+            gate_doc = json.loads(gate_path.read_bytes())
+            if not gate_doc.get("passed"):
+                raise RuntimeError("Prior head-N gate failed; inspect output dir before resuming")
+            print(
+                f"[base4b] head_gate_reused passed=True gate_n={gate_doc.get('gate_n')} "
+                f"est_full_days={gate_doc.get('est_full_days')}",
+                flush=True,
+            )
+        elif len(entries) >= gate_first_n:
+            need = max(0, gate_first_n - len(already_complete))
+            head_batch = pending[:need]
+            pending = pending[need:]
+            head_start = time.monotonic()
+            await _exec(head_batch, head_start)
+            head_elapsed = time.monotonic() - head_start
+            gate_entries = (already_complete + already_held + head_batch)[:gate_first_n]
+            gate_doc = evaluate_head_gate(
+                gate_entries,
+                out_root=out_root,
+                total_sources=len(entries),
+                newly_ran=len(head_batch),
+                elapsed_seconds=head_elapsed,
+                max_est_days=max_est_days,
+            )
+            scoring_mod.put_once(gate_path, gate_doc)
+            print(
+                f"[base4b] head_gate passed={gate_doc['passed']} gate_n={gate_doc['gate_n']} "
+                f"complete={gate_doc['complete']} held={gate_doc['held']} "
+                f"stu_fail={gate_doc['student_calls_failed']} elapsed_s={gate_doc['elapsed_seconds']} "
+                f"sec_per_source={gate_doc['sec_per_source']} est_full_hours={gate_doc['est_full_hours']} "
+                f"est_full_days={gate_doc['est_full_days']} max_est_days={max_est_days}",
+                flush=True,
+            )
+            if not gate_doc["passed"]:
+                raise RuntimeError("Head-16 gate check failed")
+
+    await _exec(pending, start_ts)
+    if total_count > 0 and done_count == total_count and (stats["skipped_existing"] == total_count):
+        print(
+            f"[base4b] gen_progress={done_count}/{total_count} complete={stats['complete']} "
+            f"skipped={stats['skipped_existing']} held={stats['held']} stu_fail={stats['stu_fail']}",
+            flush=True,
+        )
     return stats
 
 
@@ -290,34 +607,41 @@ def grade_agnes_entries(
     window = judge.AdaptiveWindow(workers)
     stats = {"graded_sources": 0, "skipped_existing": 0, "correct": 0, "incorrect": 0, "unknown": 0}
 
-    for idx, entry in enumerate(entries, 1):
-        stage = STAGE_BY_DIFF[entry["difficulty"]]
-        skey = entry["source_key"]
-        src_dir = out_root / stage / "sources" / skey
-        marker_path = src_dir / "RAW_COMPLETE.json"
-        input_path = src_dir / "SCORE_INPUT.json"
-        if not marker_path.is_file() or not input_path.is_file():
-            continue
-        raw = input_path.read_bytes()
-        rows = json.loads(raw)
-        if not isinstance(rows, list) or len(rows) != 32:
-            raise ValueError("Expected 32 rows in post-only SCORE_INPUT.json")
-        input_hash = _sha256_bytes(raw)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for idx, entry in enumerate(entries, 1):
+            stage = STAGE_BY_DIFF[entry["difficulty"]]
+            skey = entry["source_key"]
+            src_dir = out_root / stage / "sources" / skey
+            marker_path = src_dir / "RAW_COMPLETE.json"
+            input_path = src_dir / "SCORE_INPUT.json"
+            if not marker_path.is_file() or not input_path.is_file():
+                continue
+            raw = input_path.read_bytes()
+            rows = json.loads(raw)
+            if not isinstance(rows, list) or len(rows) != 32:
+                raise ValueError("Expected 32 rows in post-only SCORE_INPUT.json")
+            input_hash = _sha256_bytes(raw)
 
-        out_dir = out_root / "AGNES" / stage / "sources" / skey
-        out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        out_path = out_dir / "RESULTS.json"
-        if out_path.exists():
-            prev = judge.read_json(out_path)
-            if prev.get("input_sha256") != input_hash or prev.get("source_id") != entry["source_id"]:
-                raise ValueError("Existing RESULTS.json identity mismatch")
-            stats["skipped_existing"] += 1
-            for r in prev["results"]:
-                stats[r["status"]] += 1
-            continue
+            out_dir = out_root / "AGNES" / stage / "sources" / skey
+            out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            out_path = out_dir / "RESULTS.json"
+            if out_path.exists():
+                prev = judge.read_json(out_path)
+                if prev.get("input_sha256") != input_hash or prev.get("source_id") != entry["source_id"]:
+                    raise ValueError("Existing RESULTS.json identity mismatch")
+                stats["skipped_existing"] += 1
+                for r in prev["results"]:
+                    stats[r["status"]] += 1
+                if idx % 100 == 0 or idx == len(entries):
+                    print(
+                        f"[base4b] grade_progress={idx}/{len(entries)} graded={stats['graded_sources']} "
+                        f"skipped={stats['skipped_existing']} correct={stats['correct']} "
+                        f"incorrect={stats['incorrect']} unknown={stats['unknown']}",
+                        flush=True,
+                    )
+                continue
 
-        rec_dir = out_root / "AGNES" / "receipts" / stage / skey
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            rec_dir = out_root / "AGNES" / "receipts" / stage / skey
             if caller is None:
                 results = list(
                     pool.map(lambda r: judge.grade_one(r, key, rec_dir, locks, window=window), rows)
@@ -330,24 +654,25 @@ def grade_agnes_entries(
                     )
                 )
 
-        doc = {
-            "source_id": entry["source_id"],
-            "input_sha256": input_hash,
-            "grader": "agnes_full_response_v2",
-            "completion_parser_version": judge.PARSER_VERSION,
-            "model": judge.MODEL,
-            "results": results,
-        }
-        judge.put_once(out_path, doc)
-        stats["graded_sources"] += 1
-        for r in results:
-            stats[r["status"]] += 1
-        if idx % 10 == 0 or idx == len(entries):
-            print(
-                f"[base4b] grade_progress={idx}/{len(entries)} graded={stats['graded_sources']} "
-                f"correct={stats['correct']} incorrect={stats['incorrect']} unknown={stats['unknown']}",
-                flush=True,
-            )
+            doc = {
+                "source_id": entry["source_id"],
+                "input_sha256": input_hash,
+                "grader": "agnes_full_response_v2",
+                "completion_parser_version": judge.PARSER_VERSION,
+                "model": judge.MODEL,
+                "results": results,
+            }
+            judge.put_once(out_path, doc)
+            stats["graded_sources"] += 1
+            for r in results:
+                stats[r["status"]] += 1
+            if idx % 10 == 0 or idx == len(entries):
+                print(
+                    f"[base4b] grade_progress={idx}/{len(entries)} graded={stats['graded_sources']} "
+                    f"skipped={stats['skipped_existing']} correct={stats['correct']} "
+                    f"incorrect={stats['incorrect']} unknown={stats['unknown']}",
+                    flush=True,
+                )
     return stats
 
 
@@ -429,6 +754,9 @@ def main() -> int:
     ap.add_argument("--student-url", default="http://127.0.0.1:18702/v1")
     ap.add_argument("--key-file", type=Path, default=Path("/workspace/.secrets/agnes_api_key"))
     ap.add_argument("--workers", type=int, default=5)
+    ap.add_argument("--concurrency", type=int, default=8, help="Concurrent generation sources (processes)")
+    ap.add_argument("--gate-first-n", type=int, default=0, help="Run head-N mechanical speed/error check first")
+    ap.add_argument("--max-est-days", type=float, default=3.0, help="Max allowed full generation days at gate")
     ap.add_argument("--pilot-per-tier", type=int, default=3, help="0 means all 1,489 eligible sources")
     ap.add_argument("--check-manifest", action="store_true")
     ap.add_argument("--run-generation", action="store_true")
@@ -471,6 +799,9 @@ def main() -> int:
                 teacher_path=args.teacher_model,
                 teacher_url=args.teacher_url,
                 student_url=args.student_url,
+                concurrency=args.concurrency,
+                gate_first_n=args.gate_first_n,
+                max_est_days=args.max_est_days,
             )
         )
         print(f"[base4b] generation_done {json.dumps(gen_stats, sort_keys=True)}", flush=True)
