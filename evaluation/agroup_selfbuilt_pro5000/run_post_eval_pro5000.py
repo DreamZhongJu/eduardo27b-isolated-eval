@@ -63,22 +63,24 @@ def check_t020_finished(
         if not runs_dir.is_dir():
             raise RuntimeError("T-020 runs directory missing; cannot verify T-020 completion")
         candidates = sorted(
-            p for p in runs_dir.glob("eval_author494_full*") if p.is_dir()
+            p for p in runs_dir.glob("eval_author494_*full*") if p.is_dir()
         )
         if not candidates:
-            raise RuntimeError("No T-020 full run directory (eval_author494_full*) found")
+            raise RuntimeError("No T-020 full run directory (eval_author494_*full*) found")
         t020_dir = candidates[-1]
 
     if not t020_dir.is_dir():
         raise RuntimeError(f"T-020 run directory does not exist: {t020_dir}")
 
-    # Check runner/student PID files in T-020 directory.
-    for pid_name in ("runner.pid", "student.pid"):
-        pid_file = t020_dir / pid_name
-        if pid_file.is_file():
-            raw = pid_file.read_text(encoding="utf-8", errors="replace").strip()
-            if raw.isdigit() and _pid_alive(int(raw), proc_dir=proc_dir):
-                raise RuntimeError(f"T-020 process ({pid_name}={raw}) is still running")
+    # Check runner/student PID files in T-020 directory (and parent if a sub-run dir was passed).
+    pid_dirs = [t020_dir] if t020_dir.parent == t020_dir else [t020_dir, t020_dir.parent]
+    for d in pid_dirs:
+        for pid_name in ("runner.pid", "student.pid"):
+            pid_file = d / pid_name
+            if pid_file.is_file():
+                raw = pid_file.read_text(encoding="utf-8", errors="replace").strip()
+                if raw.isdigit() and _pid_alive(int(raw), proc_dir=proc_dir):
+                    raise RuntimeError(f"T-020 process ({pid_name}={raw}) is still running")
 
     # Scan /proc cmdlines for active T-020 or Agnes callers on Pro 5000.
     if proc_dir.is_dir():
@@ -101,15 +103,17 @@ def check_t020_finished(
             ):
                 raise RuntimeError("Active T-020/Agnes process detected on host; cannot call Agnes")
 
-    # Check full 494-problem result JSON exists and has 494 records.
-    json_files = sorted(t020_dir.glob("transfer_eval_*.json"))
+    # Check full 494-problem result JSON exists and has 494 conversations/records.
+    json_files = sorted(t020_dir.rglob("transfer_eval_*.json"), key=str)
     if not json_files:
         raise RuntimeError("T-020 full transfer_eval_*.json not written yet")
     doc = json.loads(json_files[-1].read_bytes())
-    records = doc.get("records")
+    convs = doc.get("conversations")
+    recs = doc.get("records")
+    records = convs if isinstance(convs, list) else recs
     metrics = doc.get("metrics")
     if not isinstance(records, list) or len(records) != 494 or not isinstance(metrics, dict):
-        raise RuntimeError("T-020 full result JSON incomplete (expected 494 records + metrics)")
+        raise RuntimeError("T-020 full result JSON incomplete (expected 494 conversations/records + metrics)")
 
     return {
         "t020_dir": str(t020_dir),

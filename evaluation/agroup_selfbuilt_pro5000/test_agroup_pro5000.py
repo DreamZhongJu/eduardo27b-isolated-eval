@@ -160,8 +160,9 @@ class TestT021AGroupPro5000(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "a_group_pro5000"
             runs = base / "runs"
-            t020 = runs / "eval_author494_full_20261123"
-            t020.mkdir(parents=True)
+            t020 = runs / "eval_author494_agroup_full_20261123"
+            t020_sub = t020 / "a_group_step100"
+            t020_sub.mkdir(parents=True)
             fake_proc = Path(td) / "proc"
             fake_proc.mkdir()
 
@@ -173,9 +174,9 @@ class TestT021AGroupPro5000(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 rpp.check_t020_finished(t020_base=base, workers=16, proc_dir=fake_proc)
 
-            # Complete JSON written, but runner.pid alive in fake_proc -> fails closed
-            (t020 / "transfer_eval_a.json").write_text(
-                json.dumps({"records": [{"i": i} for i in range(494)], "metrics": {"delta_transfer": 0.25}}),
+            # Complete JSON written under subdirectory with conversations key, but runner.pid alive -> fails closed
+            (t020_sub / "transfer_eval_a.json").write_text(
+                json.dumps({"conversations": [{"i": i} for i in range(494)], "metrics": {"delta_transfer": 0.25}}),
                 encoding="utf-8",
             )
             (t020 / "runner.pid").write_text("999999\n", encoding="utf-8")
