@@ -30,7 +30,10 @@ def _locate_author_repo() -> Path:
     candidates = []
     if os.environ.get("EDUARDO_REPO"):
         candidates.append(Path(os.environ["EDUARDO_REPO"]))
+    if os.environ.get("PRO5000_BASE"):
+        candidates.append(Path(os.environ["PRO5000_BASE"]) / "source" / "EduardoRL")
     candidates.extend([
+        Path.home() / "bzhang" / "a_group_pro5000" / "source" / "EduardoRL",
         Path("/workspace/A_group_repro_20261117/source/EduardoRL"),
         Path(__file__).resolve().parents[2] / "EduardoRL_A组源码_20261117",
     ])

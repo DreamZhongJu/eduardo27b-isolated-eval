@@ -1134,7 +1134,7 @@ def _fmt_stat_ci(val: dict[str, Any] | None, *, pct: bool = False, signed: bool 
     return f"{format(mean_v, fmt)} [{format(ci[0], fmt)}, {format(ci[1], fmt)}]"
 
 
-def format_report(summary: dict[str, Any]) -> str:
+def format_report(summary: dict[str, Any], *, ours_label: str = "Ours (A100 + Agnes)") -> str:
     """Format a human-readable aggregate summary table (no sensitive fields)."""
     m = summary["metrics"]
     diag = summary["agnes_diagnostics"]
@@ -1186,7 +1186,7 @@ def format_report(summary: dict[str, Any]) -> str:
         ])
     lines.extend([
         "-" * 78,
-        f"{'Metric':<30} | {'Ours (A100 + Agnes)':<30} | {ref_label:<22}",
+        f"{'Metric':<30} | {ours_label:<30} | {ref_label:<22}",
         "-" * 78,
         f"{'Δ_transfer (primary)':<30} | {_fmt_stat_ci(m['delta_transfer']):<30} | {ref['delta_transfer']:+.4f} [{ref_dt_lo:+.4f}, {ref_dt_hi:+.4f}]",
         f"{'Δ_same (primary)':<30} | {_fmt_stat_ci(m['delta_same']):<30} | {ref['delta_same']:+.4f} [{ref_ds_lo:+.4f}, {ref_ds_hi:+.4f}]",
@@ -1279,6 +1279,56 @@ def format_report(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def evaluate_smoke_gate(
+    summary: dict[str, Any],
+    *,
+    expected_problems: int = 20,
+    max_retry_fail_rate: float = 0.01,
+    max_blanked_rate: float = 0.05,
+) -> dict[str, Any]:
+    """Evaluate T-022 20-problem smoke gate criteria before launching full 494."""
+    diag = summary["agnes_diagnostics"]
+    m = summary["metrics"]
+    reasons: list[str] = []
+
+    num_problems = int(summary.get("num_problems", 0))
+    num_convs = int(summary.get("num_conversations", 0))
+    student_failed = int(summary.get("n_student_calls_failed", -1))
+    transfer_rate = float(summary.get("transfer_tested_rate", 0.0))
+    retry_fail_rate = float(diag.get("retry_fail_rate", 1.0))
+    judge_ok = bool(diag.get("judge_available", False))
+    blanked_rate = float(m.get("blanked_teacher_turn_rate", 1.0))
+
+    if num_problems != expected_problems or num_convs != expected_problems:
+        reasons.append(
+            f"expected {expected_problems} problems/convs, got problems={num_problems}, convs={num_convs}"
+        )
+    if student_failed != 0:
+        reasons.append(f"n_student_calls_failed={student_failed} != 0")
+    if transfer_rate < 1.0 - 1e-12:
+        reasons.append(f"transfer_tested_rate={transfer_rate:.4f} < 1.0")
+    if not judge_ok or retry_fail_rate > max_retry_fail_rate:
+        reasons.append(f"agnes_retry_fail_rate={retry_fail_rate:.4%} > {max_retry_fail_rate:.2%}")
+    if blanked_rate > max_blanked_rate:
+        reasons.append(f"blanked_teacher_turn_rate={blanked_rate:.4%} > {max_blanked_rate:.2%}")
+
+    return {
+        "passed": len(reasons) == 0,
+        "reasons": reasons,
+        "checks": {
+            "num_problems": num_problems,
+            "num_conversations": num_convs,
+            "n_student_calls_failed": student_failed,
+            "transfer_tested_rate": transfer_rate,
+            "agnes_retry_fail_rate": retry_fail_rate,
+            "agnes_judge_available": judge_ok,
+            "blanked_teacher_turn_rate": blanked_rate,
+            "max_retry_fail_rate": max_retry_fail_rate,
+            "max_blanked_rate": max_blanked_rate,
+        },
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize Eduardo author-494 eval JSON safely.")
     ap.add_argument("result_json", type=Path, help="Path to transfer_eval_*.json")
@@ -1290,6 +1340,8 @@ def main() -> int:
         default="base-4b",
         help="Paper reference baseline for verdict and comparison table",
     )
+    ap.add_argument("--ours-label", default="Ours (A100 + Agnes)", help="Column label for our results")
+    ap.add_argument("--smoke-gate", action="store_true", help="Enforce 20-problem smoke pass criteria (exit 4 on fail)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--draws", type=int, default=10000)
     ap.add_argument("--json-out", type=Path, default=None, help="Optional path to write aggregate summary JSON")
@@ -1311,10 +1363,28 @@ def main() -> int:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    print(format_report(summary))
+    gate = evaluate_smoke_gate(summary) if args.smoke_gate else None
+    if gate is not None:
+        summary["smoke_gate"] = gate
+
+    print(format_report(summary, ours_label=args.ours_label))
+    if gate is not None:
+        if gate["passed"]:
+            c = gate["checks"]
+            print(
+                f"SMOKE_GATE=PASS problems={c['num_problems']} student_failed={c['n_student_calls_failed']} "
+                f"transfer_tested={c['transfer_tested_rate']:.2%} "
+                f"agnes_retry_fail={c['agnes_retry_fail_rate']:.2%} "
+                f"empty_rate={c['blanked_teacher_turn_rate']:.2%}"
+            )
+        else:
+            print(f"SMOKE_GATE=FAIL reasons={'; '.join(gate['reasons'])}")
+
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if gate is not None and not gate["passed"]:
+        return 4
     return 0
 
 
