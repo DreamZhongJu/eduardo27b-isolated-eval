@@ -181,6 +181,43 @@ class TestPro5000DownloadAndVerify(unittest.TestCase):
             finally:
                 dl27b.MODEL_FILES = orig_files
 
+    def test_clean_env_strips_ld_library_path_and_rc4_falls_back_to_urllib(self):
+        orig_env = dict(os.environ)
+        orig_run = dl27b.subprocess.run
+        orig_find = dl27b._find_system_curl
+        orig_url = dl27b._download_with_urllib
+        try:
+            os.environ["LD_LIBRARY_PATH"] = "/tmp/conda/lib"
+            os.environ["HTTPS_PROXY"] = "http://127.0.0.1:9999"
+            os.environ["HF_TOKEN"] = "secret"
+            cleaned = dl27b._clean_env()
+            self.assertNotIn("LD_LIBRARY_PATH", cleaned)
+            self.assertNotIn("HTTPS_PROXY", cleaned)
+            self.assertNotIn("HF_TOKEN", cleaned)
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                payload = b'{"torch_dtype": "bfloat16"}'
+                sha = hashlib.sha256(payload).hexdigest()
+                called = {"urllib": 0}
+                dl27b._find_system_curl = lambda: "/usr/bin/curl"
+                dl27b.subprocess.run = lambda *a, **kw: SimpleNamespace(returncode=4, stderr="curl: (4) unsupported")
+
+                def fake_urllib(_url, part_path: Path):
+                    called["urllib"] += 1
+                    part_path.write_bytes(payload)
+
+                dl27b._download_with_urllib = fake_urllib
+                st = dl27b.download_one_file("https://hf-mirror.com/x", td / "config.json", len(payload), sha)
+                self.assertEqual(st, "DOWNLOADED_VERIFIED")
+                self.assertEqual(called["urllib"], 1)
+        finally:
+            os.environ.clear()
+            os.environ.update(orig_env)
+            dl27b.subprocess.run = orig_run
+            dl27b._find_system_curl = orig_find
+            dl27b._download_with_urllib = orig_url
+
 
 class TestPro5000SmokeGateAndTP2Resume(unittest.TestCase):
     def test_smoke_gate_criteria_and_ours_label(self):

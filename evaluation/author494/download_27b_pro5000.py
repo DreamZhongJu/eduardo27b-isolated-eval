@@ -81,12 +81,20 @@ def verify_model_dir(dest: Path) -> dict[str, str]:
 def _clean_env() -> dict[str, str]:
     env = dict(os.environ)
     for k in (
+        "LD_LIBRARY_PATH",
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
         "http_proxy", "https_proxy", "all_proxy",
         "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN",
     ):
         env.pop(k, None)
     return env
+
+
+def _find_system_curl() -> str | None:
+    for cand in ("/usr/bin/curl", "/bin/curl"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return shutil.which("curl")
 
 
 def _probe_public_access(url: str) -> None:
@@ -105,20 +113,22 @@ def _probe_public_access(url: str) -> None:
 def _download_with_urllib(url: str, part_path: Path) -> None:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     headers = {"User-Agent": "eduardo-27b-eval/1.0"}
-    mode = "wb"
+    sent_range = False
     if part_path.is_file() and part_path.stat().st_size > 0:
         headers["Range"] = f"bytes={part_path.stat().st_size}-"
-        mode = "ab"
+        sent_range = True
     req = urllib.request.Request(url, headers=headers)
     try:
-        with opener.open(req, timeout=180) as resp, part_path.open(mode) as out:
+        with opener.open(req, timeout=180) as resp:
             if resp.status in (401, 403):
                 raise PermissionError(f"Public access denied (HTTP {resp.status}); login/token required")
-            while True:
-                buf = resp.read(4 * 1024 * 1024)
-                if not buf:
-                    break
-                out.write(buf)
+            mode = "ab" if (sent_range and resp.status == 206) else "wb"
+            with part_path.open(mode) as out:
+                while True:
+                    buf = resp.read(4 * 1024 * 1024)
+                    if not buf:
+                        break
+                    out.write(buf)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             raise PermissionError(f"Public access denied (HTTP {exc.code}); login/token required") from exc
@@ -136,7 +146,8 @@ def download_one_file(url: str, dest_path: Path, expected_size: int, expected_sh
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     part_path = dest_path.with_name(f".{dest_path.name}.part")
 
-    curl_bin = shutil.which("curl")
+    curl_bin = _find_system_curl()
+    used_urllib = False
     if curl_bin:
         cmd = [
             curl_bin,
@@ -155,17 +166,26 @@ def download_one_file(url: str, dest_path: Path, expected_size: int, expected_sh
             if "401" in err_tail or "403" in err_tail:
                 part_path.unlink(missing_ok=True)
                 raise PermissionError(f"curl rejected public download ({err_tail}); login/token required")
-            # Retry without -C - if server rejected byte range (curl exit 33).
-            if proc.returncode == 33:
+            if proc.returncode == 4:
+                # Feature/protocol unsupported in curl build -> fall back to Python urllib.
+                _download_with_urllib(url, part_path)
+                used_urllib = True
+            elif proc.returncode == 33:
+                # Retry without -C - if server rejected byte range (curl exit 33).
                 part_path.unlink(missing_ok=True)
                 cmd_no_resume = [c for c in cmd if c not in ("-C", "-")]
                 proc2 = subprocess.run(cmd_no_resume, env=_clean_env(), capture_output=True, text=True)
-                if proc2.returncode != 0:
+                if proc2.returncode == 4:
+                    _download_with_urllib(url, part_path)
+                    used_urllib = True
+                elif proc2.returncode != 0:
                     raise RuntimeError(f"curl failed for {dest_path.name} rc={proc2.returncode}: {(proc2.stderr or '').strip()[-300:]}")
             else:
                 raise RuntimeError(f"curl failed for {dest_path.name} rc={proc.returncode}: {err_tail}")
     else:
         _download_with_urllib(url, part_path)
+        used_urllib = True
+    _ = used_urllib
 
     ok_part, status_part = verify_file(part_path, expected_size, expected_sha256)
     if not ok_part:
