@@ -1,21 +1,23 @@
-# Author-494 Eduardo-27B Evaluation on A100
+# Author-494 Eduardo-27B Evaluation (Pro 5000 & A100)
 
-本目录用于在 A100 上以最多 4 张卡（Tutor 1 卡 TP=1 + 学生 3 卡 DP=3；若单卡显存/KV 不足则 Tutor 2 卡 TP=2 + 学生 2 卡 DP=2）复跑作者上游 `e8c89b7` 的 `eval/run_env_test_eval.py`，评测 `Eduardo-27b-3bbf17e`。
+本目录用于复跑作者上游 `e8c89b7` 的 `eval/run_env_test_eval.py`，评测 `Eduardo-27b-3bbf17e`（`bfloat16`）与学生 `Meta-Llama-3.1-8B-Instruct`（`bfloat16`）。
 
-## 文件说明
+## Pro 5000 版本（T-022 第 3 版，TP=2 + DP=3/2，5 张卡优先，不足 5 张降为 4 张）
 
-- `preflight_27b_author494.sh`：只读预检（不占卡、不调 Agnes），检查卡与进程归属、端口、磁盘、作者上游 `e8c89b7` 22 文件 SHA-256、严格版本钉死（`vllm==0.19.1`、`math-verify==0.8.0`、`latex2sympy2_extended==1.10.2`）、`Eduardo-27b-3bbf17e`（6 文件 + 与 `own-test-499-v1/PILOT/RUN_CONFIGURATION.json` 的 `teacher_config_sha256` 比对）、`Llama-3.1-8B-Instruct`（7 文件）及官方数据集 SHA-256。
-- `eval_hardening.py`：可复用的作者评测幂等续跑加固层（`ReplayStore`、`ReplayOpenAIClient`、`ReplayTeacherWrapper`、`build_replay_manifest`），在不改动作者源码/流程的前提下：
-  - 将 Tutor（`LocalVLLMTeacher`，支持续跑命中时延迟加载 vLLM）、学生与 Agnes 门控/1–5 分评审的每次完整合法调用按 `request_hash + seq_idx` 原子落盘到 `<output_dir>/replay_cache/replay_records.jsonl`（带单条 SHA-256 校验，最后一条写坏时自动截断丢弃并重发；技术失败/结果不明绝不落盘）；
-  - 通过 `replay_manifest.json` 严格绑定上游提交/文件 SHA-256、包装层 SHA-256、Tutor/学生权重 SHA-256、`test.parquet` SHA-256 与全部评测参数；支持 `--resume` 精确回放已落盘调用、补跑剩余调用。
-- `agnes_window.py`：面向 Agnes 接口的进程内 AIMD 拥塞窗口（初值 `1`、成功 `+1`、上限 `16`、遇到 408/429/5xx/超时/网络/结果不明时减半至不低于 `1` 并做指数退避加抖动上限 `60s`）与内层最多 `2` 次传输重传（叠加作者外层 `num_retries=3`，每票最多 `12` 次 HTTP 请求）。HTTP 200 且具备合法 completion 结构时原样交回作者解析，不额外重传；结果不明记成技术失败。
-- `run_eval_27b_author494.py`：不修改作者任何文件，在内存中串联 `eval_hardening` 与 `AgnesWindowClient` 包装 `make_teacher`、`make_judge_client` 与 `get_async_openai_client`，确认 Tutor `config.json` 为 `bfloat16`，支持 `--resume` 并写出脱敏汇总 `agnes_window_stats.json` 与 `replay_stats.json`。
-- `probe_27b_load.py`：只读等 1 张空闲整卡，验证 `Eduardo-27b-3bbf17e` 在 `env-candidate-vllm0191` 下能否以 `tensor_parallel_size=1, gpu_memory_utilization=0.85, max_model_len=20000` 加载（可选 `--allow-tp2-fallback` 在 OOM/KV 不足时探测 TP=2）。
-- `run_27b_author494.sh`：阶段 1–2 启动器（支持 `--tutor-tp 1|2|auto`、`--auto-wait`、Tutor 占位防抢卡、`--judge-concurrency 12 --eval-judge-concurrency 4`、`--status` 及自动调用 `summarize_author494.py --paper-baseline eduardo-27b`）。
-- `agnes_ping_author494.py`：用 1 条合成假对话走作者 `make_judge_client` + `AgnesWindowClient` 调 1 次 Agnes，只打印 HTTP 状态、返回模型名、JSON 解析结果与窗口计数。
-- `wait_gpus_author494.py`：只读等卡器与 Tutor 卡占位器（两次快照一致且 `>=78000MiB`、`util=0`、`0` 进程才选卡）。
-- `summarize_author494.py`：脱敏汇总脚本，支持 `--paper-baseline eduardo-27b`（对照论文 Eduardo-27B：$\Delta_{\text{transfer}}=+0.29\ [+0.25,+0.32]$、$\Delta_{\text{same}}=+0.46\ [+0.42,+0.51]$）与 `--agnes-stats`。
-- `test_agnes_window_27b.py` / `test_summarize_author494.py`：标准库 `unittest` 测试（纯假数据 / 假客户端）。
+- `download_27b_pro5000.py`：从公开渠道 `hf-mirror.com`（无 token、无代理）断点下载 `eth-nlped/Eduardo-27b`（`3bbf17e44287eadbfda1fa09bb73a1bade407ff2`）到 `/dev/shm/zhujie_a_group/Eduardo-27b-3bbf17e`，校验全部 9 个模型文件（含 `TUTOR_LOCK` 6 文件及 `model.safetensors.index.json` 等）精确字节数与 SHA-256；遇 401/403 立即报错停下。
+- `preflight_27b_pro5000.sh`：Pro 5000 只读预检（`envs/pro5000-fast`、`$BASE` 缓存），核对 `vllm==0.19.1`、`math-verify==0.8.0`、`latex2sympy2_extended==1.10.2`、上游 `e8c89b7` 22 文件、Tutor 9 文件及 `bfloat16`、学生 7 文件、T-020 `test.parquet`（`338dc73b...`）与 70,000 MiB / GPU 6 空卡状态。
+- `wait_gpus_27b_pro5000.py`：Pro 5000 只读等卡与占位器（70,000 MiB 门槛、GPU 6 `used_mib < 500` 规则、优先 `util < 10` 卡），支持 `--num-gpus 5 --fallback-min-gpus 4`（优先 5 卡 TP=2+DP=3，不足 5 卡自动降 4 卡 TP=2+DP=2）。
+- `run_27b_pro5000.sh`：Pro 5000 启动器（强制 `--tutor-tp 2`、`--student-dp auto|2|3`、`--auto-wait`、`--resume`、`--status`、`bfloat16` 学生、Agnes 并发 `12+4=16`）。
+- `run_27b_pipeline_pro5000.sh`：Pro 5000 一体化入口（下载核对权重 → 预检 + Agnes ping → 20 题冒烟 → 冒烟闸门校验 → 自动全量 494 题与汇总；支持 `--resume` 与 `--status`）。
+
+## 共享加固层与 A100 原版文件
+
+- `eval_hardening.py`：幂等落盘与 `--resume` 回放层（覆盖 Tutor `LocalVLLMTeacher`、学生与 Agnes；逐条 SHA-256 + `replay_manifest.json` 严格绑定）。
+- `agnes_window.py`：Agnes AIMD 拥塞窗口（`1..16`，内层重传 `2` 次叠外层 `3` 次最多 `12` 次/票，技术失败 `>1%` 不可用）。
+- `run_eval_27b_author494.py`：内存包装入口（零修改作者源码，强制验证 Tutor `config.json` 为 `bfloat16`）。
+- `agnes_ping_author494.py`：单次合成对话 Agnes 连通测试。
+- `summarize_author494.py`：脱敏汇总脚本（`--paper-baseline eduardo-27b`、`--ours-label`、`--smoke-gate`）。
+- `preflight_27b_author494.sh` / `run_27b_author494.sh` / `wait_gpus_author494.py` / `probe_27b_load.py`：A100 原版脚本（保留以兼容既有单测）。
 
 ## cu04 单元测试
 
