@@ -321,6 +321,49 @@ class TestT021AGroupPro5000(unittest.TestCase):
                 places=4,
             )
 
+            # Synthetic T-019 base4b_counts.csv (omitting PAIR_SID_1 on hard to simulate 1 held source)
+            b_csv = tmp / "base4b_counts.csv"
+            with b_csv.open("w", encoding="utf-8", newline="") as bf:
+                bw = csv.DictWriter(bf, fieldnames=list(exp27.BASE4B_COUNT_COLUMNS))
+                bw.writeheader()
+                for e in loaded_pre_unk["eligible"]:
+                    if int(e["source_id"].split("_")[-1]) >= 2:
+                        continue
+                    if e["difficulty"] == "hard" and e["source_id"] == "PAIR_SID_1":
+                        continue
+                    row_d = {
+                        "difficulty": e["difficulty"],
+                        "tier_zh": e["tier_zh"],
+                        "source_key": e["source_key"],
+                        "source_id": e["source_id"],
+                        "row_index": e["row_index"],
+                    }
+                    for g in ("agnes", "ar"):
+                        for t in ("orig", "trans"):
+                            row_d[f"{g}_{t}_post_correct"] = 6
+                            row_d[f"{g}_{t}_post_incorrect"] = 9 if g == "agnes" else 10
+                            row_d[f"{g}_{t}_post_unknown"] = 1 if g == "agnes" else 0
+                    bw.writerow(row_d)
+            out_csv_vs_base = tmp / "paired_vs_base.csv"
+            mcsv.build_selfbuilt_paired_csv(
+                loaded_bundle=loaded_pre_unk,
+                a_group_root=ag_root,
+                base4b_counts_csv=b_csv,
+                out_csv=out_csv_vs_base,
+                grade_subdir="AGNES",
+            )
+            vs_base_rows = pg.load_csv(out_csv_vs_base)
+            base_recs = sap.build_base_records_from_csv(loaded_pre_unk, b_csv, grade_subdir="AGNES")
+            cc_base = sap.cross_check_agroup_vs_base(
+                vs_base_rows, recs_unk, base_recs, draws=1000, seed=42
+            )
+            self.assertEqual(cc_base["orig_combined"]["未决按错"]["n_paired"], 2)
+            self.assertEqual(cc_base["comparisons"]["未决按错.easy"]["n_paired_pg"], 2)
+            self.assertEqual(cc_base["comparisons"]["未决按错.hard"]["n_paired_pg"], 1)
+            self.assertLessEqual(cc_base["comparisons"]["排除未决.easy"]["pt_diff"], 1e-12)
+            ext_ag = sap.compute_extended_agroup_table(recs_unk, seed=42, draws=200)
+            self.assertEqual(len(ext_ag["未决按错"]), 8)
+
             # Check sanitization on markdown report & safe logs/exceptions
             md = pg.render_markdown(cc["pg_report"])
             for sid in sids:

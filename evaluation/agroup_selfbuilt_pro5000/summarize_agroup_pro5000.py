@@ -20,12 +20,21 @@ for _p in (str(HERE), str(BASE4B_DIR), str(PAIRED_DIR)):
 
 import paired_gain as pg  # noqa: E402
 from import_bundle import load_and_verify_bundle  # noqa: E402
-from make_selfbuilt_paired_csv import build_selfbuilt_paired_csv  # noqa: E402
+from make_selfbuilt_paired_csv import (  # noqa: E402
+    _load_base4b_csv_counts,
+    build_selfbuilt_paired_csv,
+)
 from summarize_base4b import (  # noqa: E402
+    _cohens_d,
+    _derived_seed,
+    _estimate_arm,
+    _hake_g,
+    bootstrap_mean_ci,
     collect_base4b_records,
     compute_summary,
     extract_safe_failure_summary,
     format_report,
+    paired_bootstrap_diff,
 )
 
 GROUP_TO_SUMMARY_LABEL = {
@@ -140,6 +149,231 @@ def cross_check_paired_diff(
     return {"pg_report": pg_res, "sb_summary": sb_sum, "comparisons": comparisons}
 
 
+def _count_inconsistent_orig_pre(loaded: dict[str, Any]) -> dict[str, int]:
+    """Count sources whose 27B orig pre differs across tiers under Agnes vs Author-Rule."""
+    out: dict[str, int] = {}
+    for label, ref_key in (("agnes", "ref_counts"), ("ar", "ref_counts_ar")):
+        by_sid: dict[str, list[float]] = {}
+        for e in loaded["eligible"]:
+            rc = e.get(ref_key)
+            if not isinstance(rc, dict):
+                continue
+            by_sid.setdefault(e["source_id"], []).append(rc["原题"]["pre"]["correct"] / 16.0)
+        out[label] = sum(1 for vals in by_sid.values() if max(vals) - min(vals) > pg.PRE_CONSISTENCY_TOL)
+    return out
+
+
+def build_base_records_from_csv(
+    loaded_view: dict[str, Any],
+    base4b_counts_csv: Path,
+    *,
+    grade_subdir: str = "AGNES",
+) -> list[dict[str, Any]]:
+    """Build summarize_base4b-compatible records for T-019 base from base4b_counts.csv."""
+    prefix = "agnes" if grade_subdir == "AGNES" else "ar"
+    counts_map = _load_base4b_csv_counts(base4b_counts_csv, prefix)
+    out: list[dict[str, Any]] = []
+    for e in loaded_view["eligible"]:
+        k = (e["difficulty"], e["source_id"])
+        if k not in counts_map:
+            continue
+        bc = counts_map[k]
+        counts_by_target = {
+            "原题": {
+                "pre": dict(e["ref_counts"]["原题"]["pre"]),
+                "control": dict(e["ref_counts"]["原题"]["control"]),
+                "post": dict(bc["orig"]),
+            },
+            "迁移题": {
+                "pre": dict(e["ref_counts"]["迁移题"]["pre"]),
+                "control": dict(e["ref_counts"]["迁移题"]["control"]),
+                "post": dict(bc["trans"]),
+            },
+        }
+        out.append(
+            {
+                "difficulty": e["difficulty"],
+                "tier_zh": e["tier_zh"],
+                "source_id": e["source_id"],
+                "source_key": e["source_key"],
+                "counts": counts_by_target,
+                "ref_counts_27b": e["ref_counts"],
+            }
+        )
+    return out
+
+
+def compute_extended_agroup_table(
+    records: list[dict[str, Any]],
+    *,
+    seed: int = 42,
+    draws: int = 10000,
+) -> dict[str, Any]:
+    """Compute R0(pre/ctl/post), raw diffs, R1(pre/ctl), R2, R3, R4 for a_group."""
+    rows_spec = [
+        ("原题合并", "汇总", "原题", False),
+        ("原题-简单对话", "简单", "原题", False),
+        ("原题-中等对话", "中等", "原题", False),
+        ("原题-困难对话", "困难", "原题", False),
+        ("简单迁移题", "简单", "迁移题", False),
+        ("中等迁移题", "中等", "迁移题", False),
+        ("困难迁移题", "困难", "迁移题", False),
+        ("简单迁移题-剔除高分", "简单", "迁移题", True),
+    ]
+    out: dict[str, Any] = {}
+    for unknown_as_wrong, policy in ((True, "未决按错"), (False, "排除未决")):
+        table: list[dict[str, Any]] = []
+        for label, tier_zh, tgt_zh, filtered in rows_spec:
+            p_pre, b_pre, o_post, n_filt, n_excl = _estimate_arm(
+                records,
+                tier_filter=tier_zh,
+                target_zh=tgt_zh,
+                baseline="pre",
+                outcome_phase="post",
+                unknown_as_wrong=unknown_as_wrong,
+                easy_filtered=filtered,
+                counts_key="counts",
+            )
+            p_ctl, b_ctl, o_post_ctl, _, _ = _estimate_arm(
+                records,
+                tier_filter=tier_zh,
+                target_zh=tgt_zh,
+                baseline="control",
+                outcome_phase="post",
+                unknown_as_wrong=unknown_as_wrong,
+                easy_filtered=filtered,
+                counts_key="counts",
+            )
+            p_r4, b_r4, o_r4, _, _ = _estimate_arm(
+                records,
+                tier_filter=tier_zh,
+                target_zh=tgt_zh,
+                baseline="pre",
+                outcome_phase="control",
+                unknown_as_wrong=unknown_as_wrong,
+                easy_filtered=filtered,
+                counts_key="counts",
+            )
+            m_pre = (sum(b_pre) / len(b_pre)) if b_pre else None
+            m_ctl = (sum(b_ctl) / len(b_ctl)) if b_ctl else None
+            m_post = (sum(o_post) / len(o_post)) if o_post else None
+            m_post_ctl = (sum(o_post_ctl) / len(o_post_ctl)) if o_post_ctl else None
+            table.append(
+                {
+                    "label": label,
+                    "n": len(p_pre),
+                    "n_filtered": n_filt,
+                    "n_excluded_unknown": n_excl,
+                    "r0_pre": m_pre,
+                    "r0_ctl": m_ctl,
+                    "r0_post": m_post,
+                    "raw_diff_pre": (m_post - m_pre) if (m_post is not None and m_pre is not None) else None,
+                    "raw_diff_ctl": (m_post_ctl - m_ctl) if (m_post_ctl is not None and m_ctl is not None) else None,
+                    "r1_pre": bootstrap_mean_ci([v for _, v in p_pre], seed=_derived_seed(seed, f"{policy}|{label}|ag_pre"), draws=draws),
+                    "r1_ctl": bootstrap_mean_ci([v for _, v in p_ctl], seed=_derived_seed(seed, f"{policy}|{label}|ag_ctl"), draws=draws),
+                    "r2_g": _hake_g(b_pre, o_post),
+                    "r3_d": _cohens_d(b_pre, o_post),
+                    "r4_pre_to_ctl": bootstrap_mean_ci([v for _, v in p_r4], seed=_derived_seed(seed, f"{policy}|{label}|ag_r4"), draws=draws),
+                    "r4_r2_g": _hake_g(b_r4, o_r4),
+                    "r4_r3_d": _cohens_d(b_r4, o_r4),
+                }
+            )
+        out[policy] = table
+    return out
+
+
+def cross_check_agroup_vs_base(
+    paired_csv_rows: list[dict[str, Any]],
+    a_records: list[dict[str, Any]],
+    base_records: list[dict[str, Any]],
+    *,
+    draws: int = 10000,
+    seed: int = 42,
+    ci_tol: float = 0.01,
+) -> dict[str, Any]:
+    """Compute paired (a_group - base) incl. 原题合并 via summarize_base4b and cross-check paired_gain.py."""
+    pg_base = pg.evaluate_dataset(
+        paired_csv_rows,
+        base_condition="base",
+        target_condition="a_group",
+        draws=draws,
+        seed=seed,
+        include_high_pre_filtered=True,
+    )
+    pg_index = {
+        (r["unknown_policy_label"], r["group"]): r
+        for r in pg_base.get("results", [])
+        if r.get("source_filter") == "all"
+    }
+    a_aln = _with_scalar_pre(a_records)
+    b_aln = _with_scalar_pre(base_records)
+
+    orig_combined: dict[str, Any] = {}
+    comparisons: dict[str, Any] = {}
+    mismatches: list[str] = []
+    specs = [
+        ("orig", "原题合并", "汇总", "原题"),
+        ("orig_easy", "原题-简单对话", "简单", "原题"),
+        ("orig_medium", "原题-中等对话", "中等", "原题"),
+        ("orig_hard", "原题-困难对话", "困难", "原题"),
+        ("easy", "简单迁移题", "简单", "迁移题"),
+        ("medium", "中等迁移题", "中等", "迁移题"),
+        ("hard", "困难迁移题", "困难", "迁移题"),
+    ]
+    for unknown_as_wrong, policy in ((True, "未决按错"), (False, "排除未决")):
+        for grp, lbl, tier_zh, tgt_zh in specs:
+            p_ag_raw, _, _, _, _ = _estimate_arm(
+                a_records, tier_filter=tier_zh, target_zh=tgt_zh, baseline="pre",
+                outcome_phase="post", unknown_as_wrong=unknown_as_wrong, easy_filtered=False,
+            )
+            p_bs_raw, _, _, _, _ = _estimate_arm(
+                base_records, tier_filter=tier_zh, target_zh=tgt_zh, baseline="pre",
+                outcome_phase="post", unknown_as_wrong=unknown_as_wrong, easy_filtered=False,
+            )
+            sb_raw = paired_bootstrap_diff(
+                p_ag_raw, p_bs_raw, seed=_derived_seed(seed, f"{policy}|{lbl}|ag_vs_base_raw"), draws=draws
+            )
+            # Note: paired_bootstrap_diff computes (first - second) = (a_group - base)
+            if grp == "orig":
+                orig_combined[policy] = sb_raw
+                continue
+
+            p_ag_aln, _, _, _, _ = _estimate_arm(
+                a_aln, tier_filter=tier_zh, target_zh=tgt_zh, baseline="pre",
+                outcome_phase="post", unknown_as_wrong=unknown_as_wrong, easy_filtered=False,
+            )
+            p_bs_aln, _, _, _, _ = _estimate_arm(
+                b_aln, tier_filter=tier_zh, target_zh=tgt_zh, baseline="pre",
+                outcome_phase="post", unknown_as_wrong=unknown_as_wrong, easy_filtered=False,
+            )
+            sb_aln = paired_bootstrap_diff(
+                p_ag_aln, p_bs_aln, seed=_derived_seed(seed, f"{policy}|{lbl}|ag_vs_base_aln"), draws=draws
+            )
+            pg_entry = pg_index.get((policy, grp))
+            if not pg_entry or not pg_entry.get("stats") or sb_aln.get("mean_diff") is None:
+                continue
+            pg_st = pg_entry["stats"]
+            pt_diff = abs(float(pg_st["diff_mean"]) - float(sb_aln["mean_diff"]))
+            lo_diff = abs(float(pg_st["diff_ci_low"]) - float(sb_aln["ci"][0]))
+            hi_diff = abs(float(pg_st["diff_ci_high"]) - float(sb_aln["ci"][1]))
+            comparisons[f"{policy}.{grp}"] = {
+                "n_paired_pg": pg_entry["n_paired"],
+                "n_paired_sb": sb_aln["n_paired"],
+                "pg_diff": pg_st["diff_mean"],
+                "sb_diff_scalar_pre": sb_aln["mean_diff"],
+                "sb_diff_source_gain": sb_raw["mean_diff"],
+                "pt_diff": pt_diff,
+                "ci_lo_diff": lo_diff,
+                "ci_hi_diff": hi_diff,
+            }
+            if pg_entry["n_paired"] != sb_aln["n_paired"] or pt_diff > 1e-12 or lo_diff > ci_tol or hi_diff > ci_tol:
+                mismatches.append(f"{policy}.{grp}")
+
+    if mismatches:
+        raise ValueError(f"a_group vs base paired_gain vs summarize_base4b mismatch: {mismatches}")
+    return {"pg_report": pg_base, "orig_combined": orig_combined, "comparisons": comparisons}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sanitized summary + paired comparison for T-021.")
     ap.add_argument("--repo", type=Path, required=True)
@@ -191,20 +425,41 @@ def main() -> int:
         grade_subdir=args.grade_subdir,
     )
     csv_rows = pg.load_csv(paired_csv)
+    incons = _count_inconsistent_orig_pre(loaded)
     if not paired_info.get("emit_combined_orig", True):
         print(
             "[base4b_summary] note: group=orig omitted from paired_gain CSV "
-            f"(27B orig_pre differs across tiers for {paired_info['orig_inconsistent_sources']} sources; "
+            f"(27B orig_pre differs across tiers for {paired_info['orig_inconsistent_sources']} sources "
+            f"[agnes={incons['agnes']}, author_rule={incons['ar']}]; "
             "combined 原题合并 uses exact per-tier 27B aggregation in summary above, "
             "and orig_easy/orig_medium/orig_hard are included in paired_gain CSV)"
         )
 
+    ext_agroup = compute_extended_agroup_table(records, seed=args.seed, draws=args.draws)
+    print(f"[base4b_summary] === T-021 {args.grade_subdir} Extended Secondary (R0_pre/ctl/post, raw_diff, R1_ctl, R4) ===")
+    for policy in ("未决按错", "排除未决"):
+        for r in ext_agroup[policy]:
+            r1p = r["r1_pre"]
+            r1c = r["r1_ctl"]
+            r4c = r["r4_pre_to_ctl"]
+            r1p_s = f"{r1p['mean']:+.4f}[{r1p['ci'][0]:+.4f},{r1p['ci'][1]:+.4f}]" if r1p else "N/A"
+            r1c_s = f"{r1c['mean']:+.4f}[{r1c['ci'][0]:+.4f},{r1c['ci'][1]:+.4f}]" if r1c else "N/A"
+            r4c_s = f"{r4c['mean']:+.4f}[{r4c['ci'][0]:+.4f},{r4c['ci'][1]:+.4f}]" if r4c else "N/A"
+            print(
+                f"[base4b_summary] [{policy}] {r['label']} n={r['n']} pre={r['r0_pre']*100:.2f}% "
+                f"ctl={r['r0_ctl']*100:.2f}% post={r['r0_post']*100:.2f}% "
+                f"diff_pre={r['raw_diff_pre']:+.4f} diff_ctl={r['raw_diff_ctl']:+.4f} "
+                f"R1={r1p_s} R1_ctl={r1c_s} R2={r['r2_g']:+.3f} R3={r['r3_d']:+.3f} R4={r4c_s}"
+            )
+
     payload: dict[str, Any] = {
         "diagnostics": diagnostics,
         "summary_vs_27b": summary,
+        "extended_agroup": ext_agroup,
         "paired_csv_info": {
             "emit_combined_orig": paired_info.get("emit_combined_orig"),
             "orig_inconsistent_sources": paired_info.get("orig_inconsistent_sources"),
+            "orig_inconsistent_by_grader": incons,
         },
     }
     agnes_rep_p = args.out_root / "AGNES" / "AGNES_GRADING_REPORT.json"
@@ -235,16 +490,26 @@ def main() -> int:
         payload["cross_check_27b"] = cc_27b["comparisons"]
 
     if args.base4b_counts_csv is not None and records:
-        pg_base = pg.evaluate_dataset(
+        base_records = build_base_records_from_csv(
+            loaded_view, args.base4b_counts_csv, grade_subdir=args.grade_subdir
+        )
+        cc_base = cross_check_agroup_vs_base(
             csv_rows,
-            base_condition="base",
-            target_condition="a_group",
+            records,
+            base_records,
             draws=args.draws,
             seed=args.seed,
-            include_high_pre_filtered=True,
         )
-        payload["paired_vs_base"] = pg_base
-        for ln in pg.render_markdown(pg_base).splitlines():
+        payload["paired_vs_base"] = cc_base["pg_report"]
+        payload["orig_combined_vs_base"] = cc_base["orig_combined"]
+        payload["cross_check_base"] = cc_base["comparisons"]
+        for pol, oc in cc_base["orig_combined"].items():
+            if oc and oc.get("mean_diff") is not None:
+                print(
+                    f"[base4b_summary] orig_combined_vs_base[{pol}] n={oc['n_paired']} "
+                    f"diff={oc['mean_diff']:+.4f} [{oc['ci'][0]:+.4f},{oc['ci'][1]:+.4f}] p_gt_0={oc['p_gt_0']:.4f}"
+                )
+        for ln in pg.render_markdown(cc_base["pg_report"]).splitlines():
             print(f"[base4b_summary] {ln}")
 
     if args.json_out is not None:
