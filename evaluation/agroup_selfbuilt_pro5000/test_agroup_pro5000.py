@@ -292,6 +292,35 @@ class TestT021AGroupPro5000(unittest.TestCase):
             self.assertEqual(cc_diff["comparisons"]["未决按错.orig_easy"]["n_paired_pg"], 2)
             self.assertEqual(cc_diff["comparisons"]["未决按错.easy"]["n_paired_pg"], 2)
 
+            # When 27B pre itself has Agnes unknowns, summarize_base4b excludes pre_unknown under
+            # "排除未决" while paired_gain CSV keeps scalar pre=correct/16; cross_check aligns scalar pre
+            # without crashing while preserving strict equality on "未决按错".
+            loaded_pre_unk = json.loads(json.dumps(loaded))
+            for item in loaded_pre_unk["eligible"]:
+                if item["source_id"] == "PAIR_SID_0" and item["difficulty"] == "easy":
+                    item["ref_counts"]["迁移题"]["pre"] = {"correct": 8, "incorrect": 6, "unknown": 2}
+                    item["ref_counts"]["迁移题"]["post"] = {"correct": 12, "incorrect": 3, "unknown": 1}
+            out_csv_pre_unk = tmp / "paired_pre_unk.csv"
+            mcsv.build_selfbuilt_paired_csv(
+                loaded_bundle=loaded_pre_unk,
+                a_group_root=ag_root,
+                base4b_counts_csv=None,
+                out_csv=out_csv_pre_unk,
+                grade_subdir="AGNES",
+            )
+            unk_rows = pg.load_csv(out_csv_pre_unk)
+            all_27b_unk = [{"tier_zh": e["tier_zh"], "source_id": e["source_id"], "ref_counts": e["ref_counts"]} for e in loaded_pre_unk["eligible"]]
+            recs_unk, _ = sb.collect_base4b_records(loaded_pre_unk, ag_root, REPO_ROOT, grade_subdir="AGNES")
+            cc_unk = sap.cross_check_paired_diff(
+                unk_rows, recs_unk, all_27b_unk, base_name="eduardo27b", target_name="a_group", draws=2000, seed=42
+            )
+            self.assertLessEqual(cc_unk["comparisons"]["排除未决.easy"]["pt_diff"], 1e-12)
+            self.assertNotAlmostEqual(
+                cc_unk["comparisons"]["排除未决.easy"]["sb_diff"],
+                cc_unk["comparisons"]["排除未决.easy"]["sb_diff_pre_excl_unk"],
+                places=4,
+            )
+
             # Check sanitization on markdown report & safe logs/exceptions
             md = pg.render_markdown(cc["pg_report"])
             for sid in sids:

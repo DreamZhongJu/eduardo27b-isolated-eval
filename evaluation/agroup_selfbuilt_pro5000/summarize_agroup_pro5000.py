@@ -39,6 +39,34 @@ GROUP_TO_SUMMARY_LABEL = {
 }
 
 
+def _with_scalar_pre(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold pre unknown into pre incorrect to match paired_gain CSV scalar pre column."""
+    out: list[dict[str, Any]] = []
+    for rec in records:
+        new_rec = {**rec}
+        for ck in ("counts", "ref_counts", "ref_counts_27b", "ref_counts_ar"):
+            c_map = rec.get(ck)
+            if not isinstance(c_map, dict):
+                continue
+            new_c = {}
+            for tgt_k, phases in c_map.items():
+                if not isinstance(phases, dict):
+                    new_c[tgt_k] = phases
+                    continue
+                new_phases = {**phases}
+                if isinstance(phases.get("pre"), dict):
+                    pre_c = dict(phases["pre"])
+                    unk = int(pre_c.get("unknown", 0))
+                    if unk:
+                        pre_c["incorrect"] = int(pre_c.get("incorrect", 0)) + unk
+                        pre_c["unknown"] = 0
+                    new_phases["pre"] = pre_c
+                new_c[tgt_k] = new_phases
+            new_rec[ck] = new_c
+        out.append(new_rec)
+    return out
+
+
 def cross_check_paired_diff(
     paired_csv_rows: list[dict[str, Any]],
     summary_records: list[dict[str, Any]],
@@ -62,6 +90,12 @@ def cross_check_paired_diff(
     sb_sum = compute_summary(
         summary_records, all_27b_records=ref_records, seed=seed, draws=draws
     )
+    sb_sum_aligned = compute_summary(
+        _with_scalar_pre(summary_records),
+        all_27b_records=_with_scalar_pre(ref_records),
+        seed=seed,
+        draws=draws,
+    )
     pg_index = {
         (r["unknown_policy_label"], r["group"]): r
         for r in pg_res.get("results", [])
@@ -70,21 +104,30 @@ def cross_check_paired_diff(
     mismatches: list[str] = []
     comparisons: dict[str, Any] = {}
     for policy in ("未决按错", "排除未决"):
-        sb_rows = {r["label"]: r for r in sb_sum["analyses"][policy]}
+        sb_rows_raw = {r["label"]: r for r in sb_sum["analyses"][policy]}
+        sb_rows_aln = {r["label"]: r for r in sb_sum_aligned["analyses"][policy]}
         for grp in GROUP_TO_SUMMARY_LABEL:
             pg_entry = pg_index.get((policy, grp))
-            sb_entry = sb_rows.get(GROUP_TO_SUMMARY_LABEL[grp], {}).get("paired_4b_minus_27b")
+            lbl = GROUP_TO_SUMMARY_LABEL[grp]
+            sb_entry = sb_rows_aln.get(lbl, {}).get("paired_4b_minus_27b")
+            sb_raw_entry = sb_rows_raw.get(lbl, {}).get("paired_4b_minus_27b")
             if not pg_entry or not pg_entry.get("stats") or not sb_entry or sb_entry.get("mean_diff") is None:
                 continue
             pg_st = pg_entry["stats"]
             diff_pt = abs(float(pg_st["diff_mean"]) - float(sb_entry["mean_diff"]))
             diff_lo = abs(float(pg_st["diff_ci_low"]) - float(sb_entry["ci"][0]))
             diff_hi = abs(float(pg_st["diff_ci_high"]) - float(sb_entry["ci"][1]))
+            raw_diff = (
+                float(sb_raw_entry["mean_diff"])
+                if sb_raw_entry and sb_raw_entry.get("mean_diff") is not None
+                else None
+            )
             comparisons[f"{policy}.{grp}"] = {
                 "n_paired_pg": pg_entry["n_paired"],
                 "n_paired_sb": sb_entry["n_paired"],
                 "pg_diff": pg_st["diff_mean"],
                 "sb_diff": sb_entry["mean_diff"],
+                "sb_diff_pre_excl_unk": raw_diff,
                 "pt_diff": diff_pt,
                 "ci_lo_diff": diff_lo,
                 "ci_hi_diff": diff_hi,
