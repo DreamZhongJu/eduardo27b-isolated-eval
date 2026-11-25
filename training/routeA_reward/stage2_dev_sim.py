@@ -490,22 +490,26 @@ def run_preflight(
     if free_gb < 10.0:
         raise RuntimeError(f"/data 剩余空间过低: {free_gb} GB < 10 GB")
 
-    # 6. Re-run ALL unit tests in pro5000-fast (with real math-verify==0.8.0)
-    pytest_summary = "skipped"
+    # 6. Re-run ALL unit tests in pro5000-fast (with real math-verify==0.8.0) via stdlib unittest
+    unittest_summary = "skipped"
     if not skip_tests:
         test_env = dict(os.environ, PYTHONPATH=f"{WORKTREE_ROOT}:{eduardo_repo}", PYTHONDONTWRITEBYTECODE="1")
-        test_files = [
-            str(HERE / "test_routeA_reward.py"),
-            str(HERE / "test_stage2_dev_sim.py"),
+        cmd = [
+            sys.executable, "-B", "-m", "unittest", "discover",
+            "-s", str(HERE), "-p", "test_*.py", "-v",
         ]
-        cmd = [sys.executable, "-B", "-m", "pytest", "-v", *test_files]
         proc = subprocess.run(cmd, env=test_env, capture_output=True, text=True, timeout=300)
-        tail_lines = [ln for ln in proc.stdout.splitlines() if ln.strip()][-5:]
+        combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        tail_lines = [ln for ln in combined.splitlines() if ln.strip()][-6:]
         if proc.returncode != 0:
             raise RuntimeError(
-                f"pro5000-fast 单测失败 rc={proc.returncode}:\n" + "\n".join(tail_lines) + "\n" + proc.stderr[-500:]
+                f"pro5000-fast 单测失败 rc={proc.returncode}:\n" + "\n".join(tail_lines)
             )
-        pytest_summary = " | ".join(tail_lines[-2:])
+        if "skipped=" in "\n".join(tail_lines).lower():
+            raise RuntimeError(
+                f"pro5000-fast 单测不应有跳过项（math-verify==0.8.0 必须实跑）:\n" + "\n".join(tail_lines)
+            )
+        unittest_summary = " | ".join(tail_lines[-2:])
 
     return {
         "packages": versions,
@@ -516,7 +520,7 @@ def run_preflight(
         "author_commit": rev,
         "step100_verified_files": len(step100_hashes),
         "disk_free_gb": free_gb,
-        "pytest_summary": pytest_summary,
+        "unittest_summary": unittest_summary,
     }
 
 
