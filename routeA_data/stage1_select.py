@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 1 pipeline for T-023: inventory, test exclusion, stratified sampling, packaging.
+"""Stage 1 pipeline for T-023 (Card v3 / Inbox #3):
+inventory, test exclusion (self499 + author test + author all_test),
+multi-variant-all-in stratified sampling, and private packaging.
 
 PRIVACY & DATA PARTITIONING GUARANTEE:
 - Never prints or writes problem text, answers, or solutions to stdout or manifest files.
@@ -15,7 +17,7 @@ import json
 import random
 import tarfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -189,7 +191,11 @@ def deduplicate_sources(
             _, t = entry["cands"][cid]
             origin = str(t.get("origin", ""))
             raw_dir = t.get("direction")
-            gen_tag = str(raw_dir) if raw_dir else ("paper_transfer" if origin == "paper_transfer" else "unknown")
+            gen_tag = (
+                str(raw_dir)
+                if raw_dir
+                else ("paper_transfer" if origin == "paper_transfer" else "unknown")
+            )
             gen_tier = infer_generation_tier(origin, raw_dir)
             paper_meta = t.get("paper_metadata") or {}
             old_pre: Dict[str, Any] = {
@@ -231,7 +237,6 @@ def deduplicate_sources(
             }
         )
 
-    # Check uniqueness of normalized source text across distinct source_ids.
     norm_source_hashes = {g["source_text_sha256"] for g in groups}
     stats = {
         "raw_rows": len(raw_records),
@@ -257,8 +262,11 @@ def summarize_inventory(groups: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_strata = collections.Counter()
     by_station = collections.Counter()
 
+    n_multi = 0
     for g in groups:
         nv = len(g["variants"])
+        if nv >= 2:
+            n_multi += 1
         direction = g["direction"]
         by_vcount[str(nv)] += 1
         by_vcount_3plus["3+" if nv >= 3 else str(nv)] += 1
@@ -270,9 +278,13 @@ def summarize_inventory(groups: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             by_origin[v["origin"]] += 1
             by_gen_tier[v["generation_tier"]] += 1
 
+    n_sources = len(groups)
     return {
-        "n_sources": len(groups),
+        "n_sources": n_sources,
         "n_variants": sum(len(g["variants"]) for g in groups),
+        "n_multi_variant_sources": n_multi,
+        "n_single_variant_sources": n_sources - n_multi,
+        "multi_variant_ratio": round(n_multi / n_sources, 6) if n_sources else 0.0,
         "by_variant_count": dict(sorted(by_vcount.items(), key=lambda kv: int(kv[0]))),
         "by_variant_count_3plus": dict(sorted(by_vcount_3plus.items())),
         "by_direction": dict(sorted(by_direction.items())),
@@ -291,6 +303,8 @@ class TestHashIndex:
     self499_variant: Set[str]
     author_test_source: Set[str]
     author_test_variant: Set[str]
+    author_all_test_source: Set[str] = field(default_factory=set)
+    author_all_test_variant: Set[str] = field(default_factory=set)
 
     def summary(self) -> Dict[str, int]:
         return {
@@ -298,11 +312,15 @@ class TestHashIndex:
             "self499_variant_hashes": len(self.self499_variant),
             "author_test_source_hashes": len(self.author_test_source),
             "author_test_variant_hashes": len(self.author_test_variant),
+            "author_all_test_source_hashes": len(self.author_all_test_source),
+            "author_all_test_variant_hashes": len(self.author_all_test_variant),
             "union_all_test_hashes": len(
                 self.self499_source
                 | self.self499_variant
                 | self.author_test_source
                 | self.author_test_variant
+                | self.author_all_test_source
+                | self.author_all_test_variant
             ),
         }
 
@@ -310,6 +328,7 @@ class TestHashIndex:
 def build_test_hash_index(
     self_test_rows: Iterable[Dict[str, Any]],
     author_test_rows: Iterable[Dict[str, Any]],
+    author_all_test_rows: Iterable[Dict[str, Any]] = (),
 ) -> TestHashIndex:
     self_src: Set[str] = set()
     self_var: Set[str] = set()
@@ -332,11 +351,23 @@ def build_test_hash_index(
         if vp.strip():
             auth_var.add(problem_text_hash(vp))
 
+    all_src: Set[str] = set()
+    all_var: Set[str] = set()
+    for row in author_all_test_rows:
+        sp = str(row.get("problem") or "")
+        if sp.strip():
+            all_src.add(problem_text_hash(sp))
+        vp = str(row.get("transfer_problem") or "")
+        if vp.strip():
+            all_var.add(problem_text_hash(vp))
+
     return TestHashIndex(
         self499_source=self_src,
         self499_variant=self_var,
         author_test_source=auth_src,
         author_test_variant=auth_var,
+        author_all_test_source=all_src,
+        author_all_test_variant=all_var,
     )
 
 
@@ -366,6 +397,10 @@ def exclude_test_overlaps(
             reasons.append("train_source_hits_author_test_source")
         if sh in test_index.author_test_variant:
             reasons.append("train_source_hits_author_test_variant")
+        if sh in test_index.author_all_test_source:
+            reasons.append("train_source_hits_author_all_test_source")
+        if sh in test_index.author_all_test_variant:
+            reasons.append("train_source_hits_author_all_test_variant")
         if any(vh in test_index.self499_source for vh in vhs):
             reasons.append("train_variant_hits_self499_source")
         if any(vh in test_index.self499_variant for vh in vhs):
@@ -374,6 +409,10 @@ def exclude_test_overlaps(
             reasons.append("train_variant_hits_author_test_source")
         if any(vh in test_index.author_test_variant for vh in vhs):
             reasons.append("train_variant_hits_author_test_variant")
+        if any(vh in test_index.author_all_test_source for vh in vhs):
+            reasons.append("train_variant_hits_author_all_test_source")
+        if any(vh in test_index.author_all_test_variant for vh in vhs):
+            reasons.append("train_variant_hits_author_all_test_variant")
 
         if reasons:
             excluded_groups += 1
@@ -414,10 +453,11 @@ def allocate_stratified_counts(
     quotas: Dict[str, float] = {
         k: (stratum_sizes[k] * target_total) / total_avail for k in sorted(stratum_sizes)
     }
-    alloc: Dict[str, int] = {k: min(stratum_sizes[k], int(quotas[k])) for k in sorted(stratum_sizes)}
+    alloc: Dict[str, int] = {
+        k: min(stratum_sizes[k], int(quotas[k])) for k in sorted(stratum_sizes)
+    }
     remainder = target_total - sum(alloc.values())
 
-    # Distribute remaining seats to strata with largest fractional remainder and spare capacity.
     while remainder > 0:
         candidates = [k for k in sorted(stratum_sizes) if alloc[k] < stratum_sizes[k]]
         candidates.sort(key=lambda k: (-(quotas[k] - alloc[k]), k))
@@ -437,49 +477,142 @@ def stratified_train_dev_split(
     train_size: int = 2000,
     dev_size: int = 100,
     seed: int = 42,
+    multi_variant_all_in: bool = True,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    """Stratified train/dev sampling by (variant_count, direction) with zero overlap."""
-    if train_size + dev_size > len(clean_groups):
+    """Stratified train/dev sampling with zero overlap.
+
+    When `multi_variant_all_in=True` (T-023 Card v3 / Inbox #3):
+    1. Take ALL sources with >= 2 variants and split them between train and dev in
+       the exact `train_size : dev_size` ratio, stratified by `(variant_count, direction)`.
+    2. Fill the remaining slots in train and dev from the 1-variant sources,
+       stratified by `direction` (`easier`, `mixed`, `harder`), with zero overlap.
+    """
+    total_target = train_size + dev_size
+    if total_target > len(clean_groups):
         raise ValueError(
             f"Requested train ({train_size}) + dev ({dev_size}) exceeds pool ({len(clean_groups)})"
         )
 
-    strata: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
-    for g in sorted(clean_groups, key=lambda x: x["source_id"]):
-        key = f"{len(g['variants'])}|{g['direction']}"
-        strata[key].append(g)
-
     rng = random.Random(seed)
-
-    # 1. Stratified draw for train
-    train_alloc = allocate_stratified_counts(
-        {k: len(v) for k, v in strata.items()}, train_size
-    )
     train_groups: List[Dict[str, Any]] = []
-    remaining_strata: Dict[str, List[Dict[str, Any]]] = {}
-
-    for key in sorted(strata.keys()):
-        bucket = list(strata[key])
-        rng.shuffle(bucket)
-        k_train = train_alloc[key]
-        train_groups.extend(bucket[:k_train])
-        remaining_strata[key] = sorted(bucket[k_train:], key=lambda x: x["source_id"])
-
-    # 2. Stratified draw for dev from the remaining pool
-    dev_alloc = allocate_stratified_counts(
-        {k: len(v) for k, v in remaining_strata.items()}, dev_size
-    )
     dev_groups: List[Dict[str, Any]] = []
-    for key in sorted(remaining_strata.keys()):
-        bucket = list(remaining_strata[key])
-        rng.shuffle(bucket)
-        k_dev = dev_alloc[key]
-        dev_groups.extend(bucket[:k_dev])
+
+    if multi_variant_all_in:
+        multi_pool = [g for g in clean_groups if len(g["variants"]) >= 2]
+        single_pool = [g for g in clean_groups if len(g["variants"]) == 1]
+
+        if len(multi_pool) <= total_target:
+            # Split ALL multi-variant sources in exact train_size : dev_size ratio
+            n_multi = len(multi_pool)
+            split_multi = allocate_stratified_counts(
+                {"train": train_size, "dev": dev_size}, n_multi
+            )
+            # Note: compute proportional split of n_multi into train/dev via exact quota
+            q_train_multi = (n_multi * train_size) / total_target
+            n_train_multi = min(train_size, int(round(q_train_multi)))
+            n_dev_multi = n_multi - n_train_multi
+            if n_dev_multi > dev_size:
+                n_dev_multi = dev_size
+                n_train_multi = n_multi - n_dev_multi
+
+            multi_strata: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+            for g in sorted(multi_pool, key=lambda x: x["source_id"]):
+                multi_strata[f"{len(g['variants'])}|{g['direction']}"].append(g)
+
+            train_multi_alloc = allocate_stratified_counts(
+                {k: len(v) for k, v in multi_strata.items()}, n_train_multi
+            )
+            dev_multi_alloc: Dict[str, int] = {}
+            for key in sorted(multi_strata.keys()):
+                bucket = list(multi_strata[key])
+                rng.shuffle(bucket)
+                k_tr = train_multi_alloc[key]
+                train_groups.extend(bucket[:k_tr])
+                dev_groups.extend(bucket[k_tr:])
+                dev_multi_alloc[key] = len(bucket) - k_tr
+
+            # Fill remaining slots from 1-variant sources stratified by direction
+            rem_train = train_size - len(train_groups)
+            rem_dev = dev_size - len(dev_groups)
+            single_strata: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+            for g in sorted(single_pool, key=lambda x: x["source_id"]):
+                single_strata[f"1|{g['direction']}"].append(g)
+
+            train_single_alloc = allocate_stratified_counts(
+                {k: len(v) for k, v in single_strata.items()}, rem_train
+            )
+            rem_single_strata: Dict[str, List[Dict[str, Any]]] = {}
+            for key in sorted(single_strata.keys()):
+                bucket = list(single_strata[key])
+                rng.shuffle(bucket)
+                k_tr = train_single_alloc[key]
+                train_groups.extend(bucket[:k_tr])
+                rem_single_strata[key] = sorted(bucket[k_tr:], key=lambda x: x["source_id"])
+
+            dev_single_alloc = allocate_stratified_counts(
+                {k: len(v) for k, v in rem_single_strata.items()}, rem_dev
+            )
+            for key in sorted(rem_single_strata.keys()):
+                bucket = list(rem_single_strata[key])
+                rng.shuffle(bucket)
+                k_dv = dev_single_alloc[key]
+                dev_groups.extend(bucket[:k_dv])
+
+            train_alloc = {**train_single_alloc, **train_multi_alloc}
+            dev_alloc = {**dev_single_alloc, **dev_multi_alloc}
+            policy_name = "multi_variant_all_in_proportional_then_single_stratified_fill"
+        else:
+            # If multi_pool alone exceeds total_target, stratify purely within multi_pool
+            multi_strata = collections.defaultdict(list)
+            for g in sorted(multi_pool, key=lambda x: x["source_id"]):
+                multi_strata[f"{len(g['variants'])}|{g['direction']}"].append(g)
+            train_alloc = allocate_stratified_counts(
+                {k: len(v) for k, v in multi_strata.items()}, train_size
+            )
+            rem_strata: Dict[str, List[Dict[str, Any]]] = {}
+            for key in sorted(multi_strata.keys()):
+                bucket = list(multi_strata[key])
+                rng.shuffle(bucket)
+                k_tr = train_alloc[key]
+                train_groups.extend(bucket[:k_tr])
+                rem_strata[key] = sorted(bucket[k_tr:], key=lambda x: x["source_id"])
+            dev_alloc = allocate_stratified_counts(
+                {k: len(v) for k, v in rem_strata.items()}, dev_size
+            )
+            for key in sorted(rem_strata.keys()):
+                bucket = list(rem_strata[key])
+                rng.shuffle(bucket)
+                dev_groups.extend(bucket[: dev_alloc[key]])
+            policy_name = "multi_variant_only_stratified"
+    else:
+        strata: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
+        for g in sorted(clean_groups, key=lambda x: x["source_id"]):
+            strata[f"{len(g['variants'])}|{g['direction']}"].append(g)
+        train_alloc = allocate_stratified_counts(
+            {k: len(v) for k, v in strata.items()}, train_size
+        )
+        remaining_strata: Dict[str, List[Dict[str, Any]]] = {}
+        for key in sorted(strata.keys()):
+            bucket = list(strata[key])
+            rng.shuffle(bucket)
+            k_tr = train_alloc[key]
+            train_groups.extend(bucket[:k_tr])
+            remaining_strata[key] = sorted(bucket[k_tr:], key=lambda x: x["source_id"])
+        dev_alloc = allocate_stratified_counts(
+            {k: len(v) for k, v in remaining_strata.items()}, dev_size
+        )
+        for key in sorted(remaining_strata.keys()):
+            bucket = list(remaining_strata[key])
+            rng.shuffle(bucket)
+            dev_groups.extend(bucket[: dev_alloc[key]])
+        policy_name = "proportional_all_strata"
 
     train_groups.sort(key=lambda x: x["source_id"])
     dev_groups.sort(key=lambda x: x["source_id"])
 
-    # Strict disjointness assertions
+    assert len(train_groups) == train_size
+    assert len(dev_groups) == dev_size
+
     train_ids = {g["source_id"] for g in train_groups}
     dev_ids = {g["source_id"] for g in dev_groups}
     if not train_ids.isdisjoint(dev_ids):
@@ -498,12 +631,14 @@ def stratified_train_dev_split(
 
     split_meta = {
         "seed": seed,
+        "selection_policy": policy_name,
+        "multi_variant_all_in": multi_variant_all_in,
         "stratification_key": "variant_count|direction",
         "allocation_method": "largest_remainder_hamilton",
         "train_target": train_size,
         "dev_target": dev_size,
-        "train_allocation_by_stratum": train_alloc,
-        "dev_allocation_by_stratum": dev_alloc,
+        "train_allocation_by_stratum": dict(sorted(train_alloc.items())),
+        "dev_allocation_by_stratum": dict(sorted(dev_alloc.items())),
         "train_summary": summarize_inventory(train_groups),
         "dev_summary": summarize_inventory(dev_groups),
         "unselected_clean_sources": len(clean_groups) - len(train_groups) - len(dev_groups),
@@ -601,7 +736,7 @@ def _load_self_test_jsonl(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, A
 
 
 def _load_parquet_rows(path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    import pyarrow.parquet as pq  # local import so pure unit tests don't require pyarrow
+    import pyarrow.parquet as pq
 
     rows = pq.read_table(path).to_pylist()
     nonempty_prob = sum(1 for r in rows if str(r.get("problem") or "").strip())
@@ -624,13 +759,15 @@ def run_stage1(
     output_dir: Path,
     incomplete_sources_zip: Optional[Path] = None,
     author_all_test_parquet: Optional[Path] = None,
+    exclude_all_test: bool = True,
+    multi_variant_all_in: bool = True,
     train_size: int = 2000,
     dev_size: int = 100,
     seed: int = 42,
     private_repo_commit: Optional[str] = None,
     author_dataset_revision: str = "5d7529f06359f31b692c92634f5cc11c8b7953af",
 ) -> Dict[str, Any]:
-    """Execute full Stage 1 pipeline and write private JSONL + safe manifest."""
+    """Execute full Stage 1 pipeline (Card v3) and write private JSONL + safe manifest."""
     one_rows, one_meta = load_verified_export_tar(export_dir / "一号站.tar.gz", "one")
     two_rows, two_meta = load_verified_export_tar(export_dir / "二号站.tar.gz", "two")
     all_raw = one_rows + two_rows
@@ -647,36 +784,27 @@ def run_stage1(
     self_test_rows, self_test_meta = _load_self_test_jsonl(self_test_jsonl)
     author_test_rows, author_test_meta = _load_parquet_rows(author_test_parquet)
 
-    test_index = build_test_hash_index(self_test_rows, author_test_rows)
+    all_test_rows: List[Dict[str, Any]] = []
+    all_test_meta: Optional[Dict[str, Any]] = None
+    if author_all_test_parquet is not None and author_all_test_parquet.exists():
+        all_test_rows, all_test_meta = _load_parquet_rows(author_all_test_parquet)
+
+    test_index = build_test_hash_index(
+        self_test_rows,
+        author_test_rows,
+        all_test_rows if exclude_all_test else (),
+    )
     clean_groups, exclusion_summary = exclude_test_overlaps(groups, test_index)
     inventory_after_exclusion = summarize_inventory(clean_groups)
 
-    # Optional read-only diagnostic check against author's broader all_test split.
-    all_test_diagnostic = None
-    if author_all_test_parquet is not None and author_all_test_parquet.exists():
-        all_test_rows, all_test_meta = _load_parquet_rows(author_all_test_parquet)
-        at_index = build_test_hash_index([], all_test_rows)
-        _, at_excl = exclude_test_overlaps(clean_groups, at_index)
-        all_test_diagnostic = {
-            "note": "Diagnostic only; NOT excluded by T-023 Stage 1 scope (which specifies self499 + author test 494).",
-            "all_test_file": all_test_meta,
-            "clean_pool_hits_on_all_test": at_excl["excluded_groups"],
-            "reason_combo_counts": at_excl["reason_combo_counts"],
-        }
-
     train_groups, dev_groups, split_meta = stratified_train_dev_split(
-        clean_groups, train_size=train_size, dev_size=dev_size, seed=seed
+        clean_groups,
+        train_size=train_size,
+        dev_size=dev_size,
+        seed=seed,
+        multi_variant_all_in=multi_variant_all_in,
     )
 
-    if all_test_diagnostic is not None:
-        all_test_rows, _ = _load_parquet_rows(author_all_test_parquet)
-        at_index = build_test_hash_index([], all_test_rows)
-        _, at_train = exclude_test_overlaps(train_groups, at_index)
-        _, at_dev = exclude_test_overlaps(dev_groups, at_index)
-        all_test_diagnostic["selected_train_hits_on_all_test"] = at_train["excluded_groups"]
-        all_test_diagnostic["selected_dev_hits_on_all_test"] = at_dev["excluded_groups"]
-
-    # Write private dataset JSONL and safe manifest.
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "routeA_stage1_dataset.jsonl"
     manifest_path = output_dir / "stage1_manifest.json"
@@ -692,10 +820,12 @@ def run_stage1(
 
     manifest: Dict[str, Any] = {
         "task": "T-023",
-        "stage": "stage1",
-        "card_version": 2,
-        "inbox_read_up_to": 2,
+        "stage": "stage1_v2",
+        "card_version": 3,
+        "inbox_read_up_to": 3,
         "sampling_seed": seed,
+        "exclude_all_test": exclude_all_test,
+        "multi_variant_all_in": multi_variant_all_in,
         "private_repo_commit": private_repo_commit,
         "author_dataset_revision": author_dataset_revision,
         "inputs": {
@@ -704,6 +834,7 @@ def run_stage1(
             "incomplete_sources_audit": incomplete_audit,
             "self_built_test_499": self_test_meta,
             "author_test": author_test_meta,
+            "author_all_test": all_test_meta,
             "test_hash_index_counts": test_index.summary(),
         },
         "deduplication": dedup_stats,
@@ -711,7 +842,6 @@ def run_stage1(
         "test_exclusion": exclusion_summary,
         "inventory_after_exclusion": inventory_after_exclusion,
         "split": split_meta,
-        "all_test_diagnostic": all_test_diagnostic,
         "outputs": {
             "routeA_stage1_dataset.jsonl": {
                 "sha256": jsonl_sha256,
@@ -735,7 +865,7 @@ def run_stage1(
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="T-023 Stage 1: inventory, test exclusion, stratified sampling, packaging."
+        description="T-023 Stage 1 (v3): inventory, test+all_test exclusion, multi-variant-all-in selection."
     )
     parser.add_argument("--export-dir", type=Path, required=True)
     parser.add_argument("--self-test-jsonl", type=Path, required=True)
@@ -743,6 +873,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--incomplete-sources-zip", type=Path, default=None)
     parser.add_argument("--author-all-test-parquet", type=Path, default=None)
+    parser.add_argument("--no-exclude-all-test", action="store_true")
+    parser.add_argument("--no-multi-variant-all-in", action="store_true")
     parser.add_argument("--train-size", type=int, default=2000)
     parser.add_argument("--dev-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -759,12 +891,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir=args.output_dir,
         incomplete_sources_zip=args.incomplete_sources_zip,
         author_all_test_parquet=args.author_all_test_parquet,
+        exclude_all_test=not args.no_exclude_all_test,
+        multi_variant_all_in=not args.no_multi_variant_all_in,
         train_size=args.train_size,
         dev_size=args.dev_size,
         seed=args.seed,
         private_repo_commit=args.private_repo_commit,
     )
-    # Safe summary only (contains zero problem/answer text).
     print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
