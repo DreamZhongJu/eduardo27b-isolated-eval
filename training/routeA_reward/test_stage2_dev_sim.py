@@ -318,6 +318,90 @@ class TestStage2Infra(unittest.TestCase):
         self.assertEqual(loaded[0]["answer"], "42")
         self.assertEqual([v["variant_id"] for v in loaded[0]["variants"]], ["v_easy", "v_hard"])
 
+    def test_rollout_clamps_and_stops_at_8192_response_budget(self):
+        seen_max_tokens: list[int] = []
+
+        class FakeClient:
+            def __init__(self, fn):
+                self._fn = fn
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+            async def _create(self, **kwargs):
+                return self._fn(kwargs)
+
+        # Turn 1: tutor emits 7600 tokens, student emits 450 tokens -> 8050 used (<8192)
+        # Turn 2: remaining is 8192 - 8050 = 142 -> max_tokens MUST be clamped to 142 (< 662)
+        # Turn 2 finishes with 142 tokens -> total 8192 -> stops cleanly with truncated_seq=True
+        def tutor_fn(kw):
+            seen_max_tokens.append(int(kw["max_tokens"]))
+            if len(seen_max_tokens) == 1:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="t</think> " + ("a " * 7599)))],
+                    usage=SimpleNamespace(prompt_tokens=200, completion_tokens=7600, total_tokens=7800),
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="t</think> " + ("b " * 141)))],
+                usage=SimpleNamespace(prompt_tokens=8250, completion_tokens=142, total_tokens=8392),
+            )
+
+        def student_fn(_kw):
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="s " * 450))],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=450, total_tokens=550),
+            )
+
+        def count_tokens_stub(msgs):
+            # Initial [sys, opener] = 200; each appended msg adds word count.
+            return 200 + sum(len(m["content"].split()) for m in msgs[2:])
+
+        transcript, meta = asyncio.run(
+            rollout_one_dialogue(
+                problem="P",
+                tutor_client=FakeClient(tutor_fn),
+                tutor_model="t",
+                student_client=FakeClient(student_fn),
+                student_model="s",
+                teacher_system_prompt="Teach {problem}",
+                student_system_prompt="Solve {problem}",
+                strip_teacher_controls_fn=strip_teacher_controls,
+                tutor_semaphore=asyncio.Semaphore(4),
+                student_semaphore=asyncio.Semaphore(4),
+                count_chat_tokens_fn=count_tokens_stub,
+            )
+        )
+        self.assertEqual(seen_max_tokens, [662, 142])
+        self.assertTrue(meta["truncated_seq"])
+        self.assertEqual(meta["teacher_turns"], 2)
+        self.assertEqual(meta["student_turns"], 1)
+        self.assertEqual(len(transcript), 4)
+
+        # Also verify defensive handling of HTTP 400 maximum context length error
+        class ContextOverflow400(Exception):
+            def __init__(self):
+                super().__init__("This model's maximum context length is 10240 tokens.")
+                self.status_code = 400
+
+        def overflow_tutor_fn(_kw):
+            raise ContextOverflow400()
+
+        t2, m2 = asyncio.run(
+            rollout_one_dialogue(
+                problem="P",
+                tutor_client=FakeClient(overflow_tutor_fn),
+                tutor_model="t",
+                student_client=FakeClient(student_fn),
+                student_model="s",
+                teacher_system_prompt="Teach {problem}",
+                student_system_prompt="Solve {problem}",
+                strip_teacher_controls_fn=strip_teacher_controls,
+                tutor_semaphore=asyncio.Semaphore(4),
+                student_semaphore=asyncio.Semaphore(4),
+            )
+        )
+        self.assertTrue(m2["truncated_seq"])
+        self.assertEqual(m2["teacher_turns"], 0)
+        self.assertEqual(len(t2), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

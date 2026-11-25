@@ -41,7 +41,7 @@ import sys
 import tempfile
 import time
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 HERE = Path(__file__).resolve().parent
 WORKTREE_ROOT = HERE.parent.parent
@@ -75,8 +75,9 @@ DEFAULT_STEP100_SHA_FILE = Path(
 # Exact training rollout settings from eduardo/configs/user.yaml & eduardo_interaction_config.yaml
 TUTOR_TEMPERATURE = 1.15
 TUTOR_MAX_TOKENS_PER_TURN = 662  # 150 visible + 512 thinking
+TUTOR_MAX_RESPONSE_LENGTH = 8192  # eduardo/configs/user.yaml:20
 TUTOR_MAX_MODEL_LEN = 10240
-TUTOR_SEQ_STOP_BUFFER = 700
+TUTOR_VLLM_MAX_MODEL_LEN = 12288  # headroom above 2048 prompt + 8192 response
 STUDENT_INTERACTION_TEMP = 0.6
 STUDENT_INTERACTION_MAX_TOKENS = 500
 STUDENT_FINAL_TEMP = 0.6
@@ -588,9 +589,10 @@ async def rollout_one_dialogue(
     student_semaphore: asyncio.Semaphore,
     max_user_turns: int = MAX_USER_TURNS,
     min_teacher_turns_before_eoc: int = MIN_TEACHER_TURNS_BEFORE_EOC,
+    count_chat_tokens_fn: Optional[Callable[[list[dict[str, str]]], int]] = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Run one multi-turn dialogue matching training rollout config."""
-    from eduardo.utils import call_openai_with_retries
+    from eduardo.utils import _is_context_overflow, call_openai_with_retries
 
     teacher_sys = teacher_system_prompt.format(problem=problem)
     student_sys = student_system_prompt.format(problem=problem)
@@ -604,32 +606,71 @@ async def rollout_one_dialogue(
     student_turns = 0
     student_failed = False
 
-    async def _call_tutor(msgs: list[dict[str, str]]) -> tuple[str, int]:
-        resp = await tutor_client.chat.completions.create(
-            model=tutor_model,
-            messages=msgs,
-            temperature=TUTOR_TEMPERATURE,
-            max_tokens=TUTOR_MAX_TOKENS_PER_TURN,
-            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-        )
-        text = resp.choices[0].message.content or ""
-        total_tok = int(getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0)
-        return text, total_tok
+    initial_msgs = [{"role": "system", "content": teacher_sys}, *transcript]
+    initial_prompt_tokens: Optional[int] = (
+        count_chat_tokens_fn(initial_msgs) if count_chat_tokens_fn is not None else None
+    )
+    used_response_tokens = 0
 
-    async def _call_student(msgs: list[dict[str, str]]) -> str:
+    async def _call_tutor(
+        msgs: list[dict[str, str]], max_tokens: int
+    ) -> tuple[Optional[str], int, int]:
+        try:
+            resp = await tutor_client.chat.completions.create(
+                model=tutor_model,
+                messages=msgs,
+                temperature=TUTOR_TEMPERATURE,
+                max_tokens=max_tokens,
+                extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+            )
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 400 and _is_context_overflow(exc):
+                return None, 0, 0
+            raise
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        prompt_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+        comp_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+        total_tok = int(getattr(usage, "total_tokens", 0) or 0)
+        if comp_tok <= 0 and total_tok > prompt_tok:
+            comp_tok = total_tok - prompt_tok
+        return text, prompt_tok, comp_tok
+
+    async def _call_student(msgs: list[dict[str, str]]) -> tuple[str, int]:
         resp = await student_client.chat.completions.create(
             model=student_model,
             messages=msgs,
             temperature=STUDENT_INTERACTION_TEMP,
             max_tokens=STUDENT_INTERACTION_MAX_TOKENS,
         )
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        usage = getattr(resp, "usage", None)
+        comp_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+        if comp_tok <= 0:
+            total_tok = int(getattr(usage, "total_tokens", 0) or 0)
+            prompt_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+            if total_tok > prompt_tok:
+                comp_tok = total_tok - prompt_tok
+            elif text:
+                comp_tok = max(1, len(text) // 4)
+        return text, comp_tok
 
     for turn_idx in range(max_user_turns + 1):
         tutor_msgs = [{"role": "system", "content": teacher_sys}, *transcript]
-        tutor_text, total_tok = await call_openai_with_retries(
+        if count_chat_tokens_fn is not None and initial_prompt_tokens is not None:
+            used_response_tokens = max(
+                0, count_chat_tokens_fn(tutor_msgs) - initial_prompt_tokens
+            )
+        remaining = TUTOR_MAX_RESPONSE_LENGTH - used_response_tokens
+        if remaining <= 0:
+            truncated_seq = True
+            break
+        turn_max_tokens = min(TUTOR_MAX_TOKENS_PER_TURN, remaining)
+
+        tutor_text, prompt_tok, tutor_comp_tok = await call_openai_with_retries(
             _call_tutor,
             tutor_msgs,
+            turn_max_tokens,
             label="tutor_rollout",
             num_retries=3,
             backoff_base=2.0,
@@ -638,6 +679,14 @@ async def rollout_one_dialogue(
             use_fallback=False,
             semaphore=tutor_semaphore,
         )
+        if tutor_text is None:
+            truncated_seq = True
+            break
+
+        if initial_prompt_tokens is None and prompt_tok > 0:
+            initial_prompt_tokens = prompt_tok
+        used_response_tokens += tutor_comp_tok
+
         transcript.append({"role": "assistant", "content": tutor_text})
         teacher_turns += 1
 
@@ -649,7 +698,7 @@ async def rollout_one_dialogue(
 
         if turn_idx >= max_user_turns:
             break
-        if total_tok >= TUTOR_MAX_MODEL_LEN - TUTOR_SEQ_STOP_BUFFER:
+        if used_response_tokens >= TUTOR_MAX_RESPONSE_LENGTH:
             truncated_seq = True
             break
 
@@ -669,7 +718,7 @@ async def rollout_one_dialogue(
                 student_msgs.append({"role": "assistant", "content": m["content"]})
 
         try:
-            student_reply = await call_openai_with_retries(
+            student_reply, student_comp_tok = await call_openai_with_retries(
                 _call_student,
                 student_msgs,
                 label="student_interaction",
@@ -686,6 +735,16 @@ async def rollout_one_dialogue(
 
         transcript.append({"role": "user", "content": student_reply})
         student_turns += 1
+        if count_chat_tokens_fn is not None and initial_prompt_tokens is not None:
+            next_tutor_msgs = [{"role": "system", "content": teacher_sys}, *transcript]
+            used_response_tokens = max(
+                0, count_chat_tokens_fn(next_tutor_msgs) - initial_prompt_tokens
+            )
+        else:
+            used_response_tokens += student_comp_tok
+        if used_response_tokens >= TUTOR_MAX_RESPONSE_LENGTH:
+            truncated_seq = True
+            break
 
     return transcript, {
         "teacher_turns": teacher_turns,
@@ -877,6 +936,7 @@ async def run_tutor_phase(
     work_dir: Path,
     tutor_conc: int = 16,
     student_conc: int = 32,
+    tutor_path: Optional[Path] = None,
 ) -> list[dict[str, Any]]:
     """Run all 100 dev problems x 2 dialogues x 16 ladder climbs for one Tutor."""
     from eduardo.utils import load_prompt, strip_teacher_controls
@@ -884,6 +944,23 @@ async def run_tutor_phase(
 
     teacher_sys_prompt = load_prompt("teacher_prompt")
     student_sys_prompt = load_prompt("student_prompt")
+
+    count_chat_tokens_fn: Optional[Callable[[list[dict[str, str]]], int]] = None
+    if tutor_path is not None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(tutor_path), trust_remote_code=True)
+
+        def _count_chat_tokens(msgs: list[dict[str, str]]) -> int:
+            ids = tokenizer.apply_chat_template(
+                msgs,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+            return len(ids)
+
+        count_chat_tokens_fn = _count_chat_tokens
 
     ckpt_dir = work_dir / "checkpoints" / tutor_label
     ckpt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -924,6 +1001,7 @@ async def run_tutor_phase(
                 strip_teacher_controls_fn=strip_teacher_controls,
                 tutor_semaphore=tutor_sem,
                 student_semaphore=student_sem,
+                count_chat_tokens_fn=count_chat_tokens_fn,
             )
             # Save private transcript on Pro 5000 only (0700), never logged.
             priv_path = priv_dir / f"{safe_sid}_d{d_idx}.json"
@@ -1108,7 +1186,9 @@ def main() -> int:
             ("a_group", args.agroup_tutor),
         ]
 
-        async def _execute_tutor_phase(tutor_label: str) -> list[dict[str, Any]]:
+        async def _execute_tutor_phase(
+            tutor_label: str, tutor_path: Path
+        ) -> list[dict[str, Any]]:
             # Create fresh async clients and congestion window inside this event loop.
             t_client = openai.AsyncClient(
                 api_key=token,
@@ -1149,6 +1229,7 @@ def main() -> int:
                     work_dir=run_dir,
                     tutor_conc=args.tutor_conc,
                     student_conc=args.student_conc,
+                    tutor_path=tutor_path,
                 )
             finally:
                 await t_client.close()
@@ -1163,7 +1244,7 @@ def main() -> int:
                 "--served-model-name", f"tutor-{tutor_label}",
                 "--host", "127.0.0.1", "--port", str(tutor_port),
                 "--dtype", "bfloat16", "--gpu-memory-utilization", "0.88",
-                "--max-model-len", str(TUTOR_MAX_MODEL_LEN),
+                "--max-model-len", str(TUTOR_VLLM_MAX_MODEL_LEN),
                 "--max-num-seqs", "64",
                 "--tensor-parallel-size", "1",
                 "--enable-chunked-prefill", "--enable-prefix-caching",
@@ -1182,7 +1263,7 @@ def main() -> int:
                     timeout_s=420,
                 )
                 print(f"[serving] tutor={tutor_label} healthy on GPU {layout['tutor_gpu']}", flush=True)
-                recs = asyncio.run(_execute_tutor_phase(tutor_label))
+                recs = asyncio.run(_execute_tutor_phase(tutor_label, tutor_path))
                 all_records.extend(recs)
             finally:
                 terminate_procs([(f"tutor_{tutor_label}", t_proc)])
