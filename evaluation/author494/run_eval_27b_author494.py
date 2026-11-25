@@ -72,7 +72,9 @@ def _verify_tutor_bfloat16(model_path: str) -> str:
 
 
 def _strip_wrapper_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
-    ap = argparse.ArgumentParser(add_help=False)
+    # allow_abbrev=False prevents --student-model from being swallowed as an
+    # abbreviation of --student-model-dir.
+    ap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     ap.add_argument("--agnes-stats-out", default=None)
     ap.add_argument("--replay-dir", default=None)
     ap.add_argument("--replay-stats-out", default=None)
@@ -264,6 +266,11 @@ def main(argv: list[str] | None = None) -> int:
         parsed_eval_args = upstream_eval.parse_args()
     finally:
         sys.argv = old_argv
+
+    if wrapper_args.student_model_dir and not Path(wrapper_args.student_model_dir).is_dir():
+        raise SystemExit(
+            f"ERROR: --student-model-dir does not exist or is not a directory: {wrapper_args.student_model_dir}"
+        )
 
     out_dir = Path(
         parsed_eval_args.output_dir

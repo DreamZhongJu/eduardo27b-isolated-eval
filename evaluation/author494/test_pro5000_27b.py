@@ -303,8 +303,11 @@ class TestPro5000SmokeGateAndTP2Resume(unittest.TestCase):
                 def close(self):
                     pass
 
+            seen_models: list[str] = []
+
             class _FakeComp:
-                async def create(self, **_kw):
+                async def create(self, **kw):
+                    seen_models.append(str(kw.get("model", "")))
                     return SimpleNamespace(
                         id="1", model="m",
                         choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"reasoning":"ok","decision":"OK","score":4}\\boxed{5}\\boxed{6}'))],
@@ -357,6 +360,10 @@ class TestPro5000SmokeGateAndTP2Resume(unittest.TestCase):
                 runner27b.main(base_argv)
                 manifest = json.loads((out_dir / "replay_cache" / "replay_manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(manifest["eval_args"]["tensor_parallel_size"], 2)
+                self.assertEqual(manifest["eval_args"]["student_model"], "stu")
+                self.assertIsInstance(manifest["student_model_sha256"], dict)
+                self.assertIn("config.json", manifest["student_model_sha256"])
+                self.assertIn("stu", seen_models)
 
                 # Changing --tensor-parallel-size to 1 on --resume must fail manifest verification
                 bad_argv = ["--resume" if x == "--enable-thinking" else x for x in base_argv]
@@ -373,6 +380,21 @@ class TestPro5000SmokeGateAndTP2Resume(unittest.TestCase):
                 upstream_eval.make_judge_client = orig_mj
                 upstream_eval.get_async_openai_client = orig_gc
                 upstream_middleturn.get_async_openai_client = orig_mgc
+
+
+    def test_strip_wrapper_args_preserves_student_model(self):
+        wargs, pass_argv = runner27b._strip_wrapper_args([
+            "--student-model-dir", "/dev/shm/zhujie_a_group/Meta-Llama-3.1-8B-Instruct",
+            "--student-model", "Llama-3.1-8B-Instruct-zhujie-author494-27b",
+            "--resume",
+            "--tensor-parallel-size", "2",
+        ])
+        self.assertEqual(wargs.student_model_dir, "/dev/shm/zhujie_a_group/Meta-Llama-3.1-8B-Instruct")
+        self.assertTrue(wargs.resume)
+        self.assertEqual(
+            pass_argv,
+            ["--student-model", "Llama-3.1-8B-Instruct-zhujie-author494-27b", "--tensor-parallel-size", "2"],
+        )
 
 
 if __name__ == "__main__":
