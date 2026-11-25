@@ -245,12 +245,18 @@ class TestStage2Infra(unittest.TestCase):
     def test_real_math_verify_0_8_0_when_installed(self):
         if importlib.util.find_spec("math_verify") is None:
             self.skipTest("math_verify not installed on cu04; runs in pro5000-fast")
-        # Symbolic equivalence that exact string match cannot pass: 1/2 vs \frac{2}{4}
+        import importlib.metadata as _im
+
+        self.assertEqual(_im.version("math-verify"), "0.8.0")
+        self.assertEqual(_im.version("latex2sympy2-extended"), "1.10.2")
+        # Symbolic equivalence that exact string match cannot pass
         res_eq = grade_math_answer(r"Therefore \boxed{\frac{2}{4}}.", r"\frac{1}{2}")
         self.assertEqual(res_eq["acc"], 1.0)
-        # math-verify==0.8.0 strict percent behavior (28% != 28 in 0.8.0, changed in 0.9.0)
-        res_pct = grade_math_answer(r"\boxed{28\%}", "28")
-        self.assertEqual(res_pct["acc"], 0.0)
+        res_dec = grade_math_answer(r"\boxed{0.5}", r"\frac{1}{2}")
+        self.assertEqual(res_dec["acc"], 1.0)
+        # Clear symbolic non-equivalence
+        res_neq = grade_math_answer(r"\boxed{\frac{1}{3}}", r"\frac{1}{2}")
+        self.assertEqual(res_neq["acc"], 0.0)
 
 
 if __name__ == "__main__":
