@@ -18,7 +18,10 @@
 !/training/routeA_reward/
 /training/routeA_reward/*
 !/training/routeA_reward/*.py
+!/training/routeA_reward/*.sh
 !/training/routeA_reward/*.md
+!/training/routeA_reward/*.zip
+!/training/routeA_reward/*.sha256
 # Canonical evaluation tree; root names are tracked compatibility symlinks.
 !/evaluation/
 /evaluation/*
