@@ -54,6 +54,14 @@
 !/evaluation/agroup_selfbuilt_pro5000/SHA256SUMS
 !/evaluation/agroup_selfbuilt_pro5000/agroup-selfbuilt-pro5000-kit-v1.zip
 !/evaluation/agroup_selfbuilt_pro5000/agroup-selfbuilt-pro5000-kit-v1.zip.sha256
+!/evaluation/t025_gain_gap/
+/evaluation/t025_gain_gap/*
+!/evaluation/t025_gain_gap/*.py
+!/evaluation/t025_gain_gap/*.sh
+!/evaluation/t025_gain_gap/README.md
+!/evaluation/t025_gain_gap/SHA256SUMS
+!/evaluation/t025_gain_gap/t025-gain-gap-kit-v1.zip
+!/evaluation/t025_gain_gap/t025-gain-gap-kit-v1.zip.sha256
 !/parallel_eval_v3
 !/evaluation/parallel_eval_v3/
 /evaluation/parallel_eval_v3/*
