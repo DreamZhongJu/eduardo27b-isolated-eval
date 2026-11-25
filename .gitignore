@@ -15,6 +15,10 @@
 !/training/a_group_pro5000/*.py
 !/training/a_group_pro5000/*.sh
 !/training/a_group_pro5000/*.md
+!/training/routeA_reward/
+/training/routeA_reward/*
+!/training/routeA_reward/*.py
+!/training/routeA_reward/*.md
 # Canonical evaluation tree; root names are tracked compatibility symlinks.
 !/evaluation/
 /evaluation/*
