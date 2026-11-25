@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import json
 import os
@@ -694,6 +695,125 @@ class TestBase4BSelfBuilt(unittest.TestCase):
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+    def test_stage3_t019_export_extended_metrics_and_paired_gain(self):
+        import stage3_t019 as s3
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            sids = [f"S3_SID_{i}" for i in range(4)]
+            incomplete = {("hard", "S3_SID_3")}
+            data_path, ref_root, overlay_root, decisions_root = _build_synthetic_27b_env(
+                tmp, sids, incomplete
+            )
+            # Inject 1 pre_unknown in 27B EASY pre so scalar_pre alignment is exercised on 排除未决.
+            manifest = mf.build_manifest(
+                data_path, ref_root, overlay_root, decisions_root, repo_root=REPO_ROOT, require_exact_totals=False
+            )
+            e0 = manifest["eligible"][0]
+            e0["ref_counts"]["迁移题"]["pre"] = {"correct": 8, "incorrect": 6, "unknown": 2}
+
+            out_root = tmp / "base4b_out"
+            held_entry = next(e for e in manifest["eligible"] if e["difficulty"] == "hard" and e["source_id"] == "S3_SID_2")
+            for e in manifest["eligible"]:
+                stage = sb.STAGE_BY_DIFF[e["difficulty"]]
+                skey = e["source_key"]
+                s_dir = out_root / stage / "sources" / skey
+                s_dir.mkdir(parents=True)
+                if e is held_entry:
+                    (s_dir / "SOURCE_HELD.json").write_text('{"reason":"synthetic_held"}', encoding="utf-8")
+                    continue
+                (s_dir / "RAW_COMPLETE.json").write_text('{"samples":32}', encoding="utf-8")
+                for subdir in ("AGNES", "AUTHOR_RULE"):
+                    r_dir = out_root / subdir / stage / "sources" / skey
+                    r_dir.mkdir(parents=True)
+                    rows = []
+                    for tgt in ("source", e["row"]["transfer_target"]):
+                        for i in range(16):
+                            st = "correct" if i < 10 else ("unknown" if (subdir == "AGNES" and i == 15) else "incorrect")
+                            rows.append(
+                                {
+                                    "identity": {"source_id": e["source_id"], "target": tgt, "phase": "post", "index": i},
+                                    "status": st,
+                                }
+                            )
+                    (r_dir / "RESULTS.json").write_text(json.dumps({"source_id": e["source_id"], "results": rows}), encoding="utf-8")
+
+            stage3_dir = tmp / "stage3_out"
+            exp_info = s3.export_t019_base_counts(manifest=manifest, base4b_dir=out_root, out_dir=stage3_dir / "exp")
+            self.assertEqual(exp_info["exported_sources"], len(manifest["eligible"]) - 1)
+            self.assertEqual(exp_info["held_sources"], 1)
+            csv_txt = Path(exp_info["csv_path"]).read_text(encoding="utf-8")
+            self.assertNotIn("SYNTHETIC_ORIG_PROBLEM", csv_txt)
+            self.assertNotIn("SYNTHETIC_RESPONSE", csv_txt)
+            with Path(exp_info["csv_path"]).open("r", encoding="utf-8", newline="") as f:
+                hdr = next(csv.reader(f))
+            self.assertEqual(tuple(hdr), s3.BASE4B_COUNT_COLUMNS)
+
+            ag_recs, _ = sb.collect_base4b_records(manifest, out_root, REPO_ROOT, grade_subdir="AGNES")
+            all_27b = [{"tier_zh": e["tier_zh"], "source_id": e["source_id"], "ref_counts": e["ref_counts"]} for e in manifest["eligible"]]
+            ext = s3.compute_extended_stage3_table(ag_recs, all_27b, seed=42, draws=200)
+            easy_row = next(r for r in ext["未决按错"] if r["label"] == "简单迁移题")
+            self.assertIsNotNone(easy_row["raw_diff_ctl"])
+            self.assertIsNotNone(easy_row["r1_ctl"])
+            self.assertIsNotNone(easy_row["r4_pre_to_ctl"])
+
+            ag_csv = stage3_dir / "paired_agnes.csv"
+            s3.build_base_vs_27b_paired_csv(manifest=manifest, records=ag_recs, out_csv=ag_csv)
+            cc = s3.cross_check_base_vs_27b(
+                csv_path=ag_csv, records=ag_recs, all_27b_records=all_27b, draws=200, seed=42
+            )
+            self.assertEqual(cc["comparisons"]["未决按错.easy"]["n_paired_pg"], 4)
+            self.assertEqual(cc["comparisons"]["未决按错.hard"]["n_paired_pg"], 2)  # 1 incomplete + 1 held
+            self.assertLessEqual(cc["comparisons"]["排除未决.easy"]["pt_diff"], 1e-12)
+
+            # Synthetic ref27b_counts.csv for Author-Rule sensitivity
+            ar_ref_csv = tmp / "ref27b_counts.csv"
+            cols = (
+                "difficulty",
+                "tier_zh",
+                "ref_stage",
+                "source_key",
+                "source_id",
+                "row_index",
+                *(
+                    f"{g}_{t}_{p}_{s}"
+                    for g in ("agnes", "ar")
+                    for t in ("orig", "trans")
+                    for p in ("pre", "control", "post")
+                    for s in ("correct", "incorrect", "unknown")
+                ),
+            )
+            with ar_ref_csv.open("w", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(cols))
+                w.writeheader()
+                for e in manifest["eligible"]:
+                    row_d = {
+                        "difficulty": e["difficulty"],
+                        "tier_zh": e["tier_zh"],
+                        "ref_stage": e["ref_stage"],
+                        "source_key": e["source_key"],
+                        "source_id": e["source_id"],
+                        "row_index": e["row_index"],
+                    }
+                    for g in ("agnes", "ar"):
+                        for t in ("orig", "trans"):
+                            for p in ("pre", "control", "post"):
+                                row_d[f"{g}_{t}_{p}_correct"] = 8
+                                row_d[f"{g}_{t}_{p}_incorrect"] = 8
+                                row_d[f"{g}_{t}_{p}_unknown"] = 0
+                    w.writerow(row_d)
+            all_27b_ar, ref_ar_map = s3.load_ref27b_ar_overlay(ref27b_csv=ar_ref_csv, manifest=manifest)
+            ar_recs_raw, _ = sb.collect_base4b_records(manifest, out_root, REPO_ROOT, grade_subdir="AUTHOR_RULE")
+            ar_recs = s3.apply_27b_ar_ref_to_records(ar_recs_raw, ref_ar_map)
+            ar_csv = stage3_dir / "paired_ar.csv"
+            s3.build_base_vs_27b_paired_csv(
+                manifest=manifest, records=ar_recs, ref_counts_by_key=ref_ar_map, out_csv=ar_csv
+            )
+            ar_cc = s3.cross_check_base_vs_27b(
+                csv_path=ar_csv, records=ar_recs, all_27b_records=all_27b_ar, draws=200, seed=42
+            )
+            self.assertEqual(ar_cc["comparisons"]["未决按错.easy"]["n_paired_pg"], 4)
 
 
 if __name__ == "__main__":
