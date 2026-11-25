@@ -29,6 +29,7 @@ import asyncio
 import hashlib
 import importlib.metadata as importlib_metadata
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -443,7 +444,7 @@ def run_preflight(
             f"hybrid_grader.py SHA-256 不符: actual={hg_sha} expected={EXPECTED_HYBRID_GRADER_SHA256}"
         )
 
-    # 2. T-023 measured JSONL SHA-256 & dev split counts (no text printed)
+    # 2. T-023 measured JSONL SHA-256 & dev split schema/count validation (no text printed)
     if not t023_jsonl.is_file():
         raise RuntimeError(f"缺少 T-023 重测包: {t023_jsonl}")
     jsonl_sha = file_sha256(t023_jsonl)
@@ -451,16 +452,9 @@ def run_preflight(
         raise RuntimeError(
             f"T-023 重测包 SHA-256 不符: actual={jsonl_sha} expected={EXPECTED_T023_JSONL_SHA256}"
         )
-    dev_sources = 0
-    dev_variants = 0
-    with t023_jsonl.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("split") == "dev":
-                dev_sources += 1
-                dev_variants += len(row.get("variants", []))
+    parsed_dev = load_dev_problems(t023_jsonl)
+    dev_sources = len(parsed_dev)
+    dev_variants = sum(len(r["variants"]) for r in parsed_dev)
     if dev_sources != EXPECTED_DEV_SOURCES or dev_variants != EXPECTED_DEV_VARIANTS:
         raise RuntimeError(
             f"dev 题量不符: sources={dev_sources} (expect {EXPECTED_DEV_SOURCES}), "
@@ -534,15 +528,45 @@ def load_dev_problems(t023_jsonl: Path) -> list[dict[str, Any]]:
             row = json.loads(line)
             if row.get("split") != "dev":
                 continue
+            src_prob = (
+                row.get("source_problem")
+                if row.get("source_problem") is not None
+                else row.get("problem")
+            )
+            src_ans = (
+                row.get("source_answer")
+                if row.get("source_answer") is not None
+                else row.get("answer")
+            )
+            if not isinstance(src_prob, str) or not src_prob.strip():
+                raise ValueError(f"dev source_id={row.get('source_id')} missing source problem")
+            if not isinstance(src_ans, str) or not src_ans.strip():
+                raise ValueError(f"dev source_id={row.get('source_id')} missing source answer")
+            raw_vars = row.get("variants") or []
+            if not isinstance(raw_vars, list) or not raw_vars:
+                raise ValueError(f"dev source_id={row.get('source_id')} has no variants")
+            for v in raw_vars:
+                v_prob = v.get("problem")
+                v_ans = v.get("answer")
+                if not isinstance(v_prob, str) or not v_prob.strip():
+                    raise ValueError(f"dev variant={v.get('variant_id')} missing problem")
+                if not isinstance(v_ans, str) or not v_ans.strip():
+                    raise ValueError(f"dev variant={v.get('variant_id')} missing answer")
+                if not (math.isfinite(float(v["p_new"])) and math.isfinite(float(v["b"]))):
+                    raise ValueError(f"dev variant={v.get('variant_id')} has non-finite p_new/b")
+                if type(v.get("ladder_rank")) is not int:
+                    raise ValueError(f"dev variant={v.get('variant_id')} missing int ladder_rank")
+                if type(v.get("n_correct_hybrid")) is not int:
+                    raise ValueError(f"dev variant={v.get('variant_id')} missing int n_correct_hybrid")
             variants = sorted(
-                row["variants"],
+                raw_vars,
                 key=lambda v: (int(v["ladder_rank"]), str(v.get("variant_id", ""))),
             )
             rows.append(
                 {
                     "source_id": str(row["source_id"]),
-                    "problem": str(row["problem"]),
-                    "answer": str(row["answer"]),
+                    "problem": src_prob,
+                    "answer": src_ans,
                     "variants": variants,
                 }
             )

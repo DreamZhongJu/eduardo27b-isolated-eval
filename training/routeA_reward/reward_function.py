@@ -625,9 +625,9 @@ async def route_a_reward_func(
 
     if extra_info is None:
         extra_info = {}
-    problem: str = extra_info.get("problem", "")
+    problem: str = extra_info.get("problem") or extra_info.get("source_problem") or ""
     if ground_truth is None:
-        ground_truth = extra_info.get("answer", "") or ""
+        ground_truth = extra_info.get("answer") or extra_info.get("source_answer") or ""
 
     msgs: list[dict[str, Any]] = messages or extra_info.get("messages") or []
     if not msgs and isinstance(solution_str, list):

@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -28,6 +29,7 @@ from training.routeA_reward.stage2_dev_sim import (
     EXPECTED_HYBRID_GRADER_SHA256,
     allocate_gpu_layout,
     file_sha256,
+    load_dev_problems,
     parse_gpu_snapshot,
     rollout_one_dialogue,
     select_free_gpus,
@@ -257,6 +259,64 @@ class TestStage2Infra(unittest.TestCase):
         # Clear symbolic non-equivalence
         res_neq = grade_math_answer(r"\boxed{\frac{1}{3}}", r"\frac{1}{2}")
         self.assertEqual(res_neq["acc"], 0.0)
+
+    def test_load_dev_problems_t023_schema(self):
+        rows = [
+            {
+                "source_id": "src_train_0",
+                "split": "train",
+                "direction": "easier",
+                "source_problem": "TRAIN_P",
+                "source_answer": "1",
+                "variants": [
+                    {
+                        "variant_id": "vt",
+                        "problem": "VP",
+                        "answer": "1",
+                        "n_correct_hybrid": 8,
+                        "p_new": 8.5 / 17.0,
+                        "b": 0.0,
+                        "ladder_rank": 1,
+                    }
+                ],
+            },
+            {
+                "source_id": "src_dev_1",
+                "split": "dev",
+                "direction": "easier",
+                "source_problem": "DEV_P_1",
+                "source_answer": "42",
+                "variants": [
+                    {
+                        "variant_id": "v_hard",
+                        "problem": "VH",
+                        "answer": "43",
+                        "n_correct_hybrid": 3,
+                        "p_new": 3.5 / 17.0,
+                        "b": 1.35,
+                        "ladder_rank": 2,
+                    },
+                    {
+                        "variant_id": "v_easy",
+                        "problem": "VE",
+                        "answer": "41",
+                        "n_correct_hybrid": 12,
+                        "p_new": 12.5 / 17.0,
+                        "b": -1.02,
+                        "ladder_rank": 1,
+                    },
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "t023.jsonl"
+            p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            loaded = load_dev_problems(p)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["source_id"], "src_dev_1")
+        self.assertEqual(loaded[0]["problem"], "DEV_P_1")
+        self.assertEqual(loaded[0]["answer"], "42")
+        self.assertEqual([v["variant_id"] for v in loaded[0]["variants"]], ["v_easy", "v_hard"])
 
 
 if __name__ == "__main__":
