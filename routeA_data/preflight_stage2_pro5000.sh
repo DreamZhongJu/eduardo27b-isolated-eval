@@ -52,7 +52,6 @@ print("=== 1. Package Pins (Author e8c89b7 + vLLM) ===")
 PINS = {
     "math-verify": "0.8.0",
     "latex2sympy2_extended": "1.10.2",
-    "latex2sympy2": "1.5.4",
 }
 for pkg in ("vllm", "torch", "openai", "httpx", "math-verify", "latex2sympy2_extended", "latex2sympy2"):
     try:
@@ -62,6 +61,8 @@ for pkg in ("vllm", "torch", "openai", "httpx", "math-verify", "latex2sympy2_ext
     print(f"  {pkg}={ver}")
     if pkg in PINS and ver != PINS[pkg]:
         hard_errors.append(f"PIN_MISMATCH:{pkg}={ver}!={PINS[pkg]}")
+    elif pkg == "latex2sympy2" and ver not in ("NOT_INSTALLED", "1.5.4"):
+        hard_errors.append(f"PIN_MISMATCH:{pkg}={ver}!=1.5.4")
 
 print("=== 2. Canonical hybrid_grader.py & Agnes Prompt Reference ===")
 hg_path = code_root / "routeA_data" / "hybrid_grader.py"

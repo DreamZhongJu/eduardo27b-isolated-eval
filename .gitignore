@@ -150,6 +150,8 @@
 !/routeA_data/SHA256SUMS
 !/routeA_data/routeA-t023-stage2-kit-v1.zip
 !/routeA_data/routeA-t023-stage2-kit-v1.zip.sha256
+!/routeA_data/routeA-t023-stage2-kit-v2.zip
+!/routeA_data/routeA-t023-stage2-kit-v2.zip.sha256
 !/tests/
 /tests/*
 !/tests/test_routeA_data.py

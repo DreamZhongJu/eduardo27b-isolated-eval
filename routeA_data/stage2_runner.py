@@ -77,7 +77,6 @@ AGNES_MAX_ATTEMPTS = 4
 REQUIRED_GRADER_PINS: Dict[str, str] = {
     "math-verify": "0.8.0",
     "latex2sympy2_extended": "1.10.2",
-    "latex2sympy2": "1.5.4",
 }
 
 EXPECTED_STAGE1_V2_SHA256 = (
