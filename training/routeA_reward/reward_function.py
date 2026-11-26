@@ -25,6 +25,7 @@ Privacy guarantee:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import math
@@ -184,23 +185,33 @@ def _record_hybrid_grader_timing(**kwargs: Any) -> None:
         return
 
 
+_GRADER_SEM_TIMING: contextvars.ContextVar[tuple[int, int]] = contextvars.ContextVar(
+    "_GRADER_SEM_TIMING", default=(0, 0)
+)
+_GRADER_SEM_TOKEN: contextvars.ContextVar[Optional[contextvars.Token]] = contextvars.ContextVar(
+    "_GRADER_SEM_TOKEN", default=None
+)
+
+
 class _TimedGraderSemaphore:
-    """Wrap an asyncio.Semaphore to capture queue wait and held duration."""
+    """Wrap an asyncio.Semaphore to capture per-task queue wait and acquired time."""
 
     def __init__(self, inner: asyncio.Semaphore) -> None:
         self._inner = inner
-        self.queued_ns = 0
-        self.acquired_ns = 0
 
     async def __aenter__(self) -> Any:
         t0 = time.monotonic_ns()
         res = await self._inner.__aenter__()
         now = time.monotonic_ns()
-        self.queued_ns = max(0, now - t0)
-        self.acquired_ns = now
+        tok = _GRADER_SEM_TIMING.set((max(0, now - t0), now))
+        _GRADER_SEM_TOKEN.set(tok)
         return res
 
     async def __aexit__(self, *exc: Any) -> Any:
+        tok = _GRADER_SEM_TOKEN.get()
+        if tok is not None:
+            _GRADER_SEM_TIMING.reset(tok)
+            _GRADER_SEM_TOKEN.set(None)
         return await self._inner.__aexit__(*exc)
 
 
@@ -262,13 +273,14 @@ def _build_hybrid_grader(
                 raise
             finally:
                 end_ns = time.monotonic_ns()
+                queued_ns, acquired_ns = _GRADER_SEM_TIMING.get()
                 svc_ns = max(0, end_ns - svc_start)
-                held_ns = max(svc_ns, end_ns - timed_sem.acquired_ns)
-                start_ns = max(0, timed_sem.acquired_ns - timed_sem.queued_ns)
+                held_ns = max(svc_ns, end_ns - acquired_ns) if acquired_ns > 0 else svc_ns
+                start_ns = max(0, acquired_ns - queued_ns) if acquired_ns > 0 else svc_start
                 _record_hybrid_grader_timing(
                     start_ns=start_ns,
                     end_ns=end_ns,
-                    queued_ns=timed_sem.queued_ns,
+                    queued_ns=queued_ns,
                     service_ns=svc_ns,
                     held_ns=held_ns,
                     attempts=1,

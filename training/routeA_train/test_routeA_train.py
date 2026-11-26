@@ -26,6 +26,7 @@ import queue_metrics
 from training.routeA_reward.hybrid_grader import HybridGrader, verify_hybrid_grader_sha256
 from training.routeA_reward.ladder import extract_ladder_variants
 from training.routeA_reward.reward_function import (
+    _TimedGraderSemaphore,
     close_step_metric_sinks,
     route_a_reward_func,
     summarize_metrics_window,
@@ -36,6 +37,7 @@ from training.routeA_train.prepare_parquet import (
     is_ceiling_group,
     prepare_routea_parquets,
 )
+from training.routeA_train.stage2_routea_pilot import summarize_stage2_routea
 
 EXPECTED_HYBRID_SHA256 = (
     "7d2a5f46619218e92ed11efc4e7e07f190027ac0f1cca9336905c090ff62709a"
@@ -642,20 +644,179 @@ class RouteATrainStage1Tests(unittest.TestCase):
             t017_steps = {int(k): v for k, v in baseline["steps"].items()}
             ra_steps = run_dir / "ra_steps"
             ra_steps.mkdir()
-            for s in range(1, 5):
+            # Steps 1..9: gated_rate drops to 0.10 so min_prior_ma5 = 0.10.
+            for s, rate in [(1, 0.40), (2, 0.30), (3, 0.20), (4, 0.10), (5, 0.10), (6, 0.10), (7, 0.10), (8, 0.10), (9, 0.10)]:
                 (ra_steps / f"{s}.json").write_text(
-                    json.dumps({"metrics": {"eduardo/routeA_gated_rate": 0.25}}),
+                    json.dumps({"metrics": {"eduardo/routeA_gated_rate": rate}}),
                     encoding="utf-8",
                 )
-            gates = pentry.assess_routea_stage3_gates(
-                step=5,
+            # Step 9 high rate without rebound >= 10: does not trigger rebound/abs gates (only tech fail).
+            gates_s9 = pentry.assess_routea_stage3_gates(
+                step=9,
                 steps_dir=ra_steps,
                 current_row={"routeA_metrics": {"metrics": sm}},
                 t017_steps=t017_steps,
             )
-            self.assertFalse(gates["passed"])
-            self.assertTrue(gates["tech_fail_exceeded"])
-            self.assertTrue(gates["gated_exceeded"])
+            self.assertTrue(gates_s9["tech_fail_exceeded"])
+            self.assertFalse(gates_s9["gated_rebound_exceeded"])
+            self.assertFalse(gates_s9["gated_abs_exceeded"])
+
+            # Step 10 with 0.90 gated jumps ma5 from 0.10 -> 0.26 (+0.16 > 0.15): triggers rebound gate.
+            gates_s10 = pentry.assess_routea_stage3_gates(
+                step=10,
+                steps_dir=ra_steps,
+                current_row={
+                    "routeA_metrics": {
+                        "metrics": {
+                            "eduardo/routeA_grader_llm_calls_total": 100.0,
+                            "eduardo/routeA_grader_tech_failed_total": 0.0,
+                            "eduardo/routeA_gated_rate": 0.90,
+                        }
+                    }
+                },
+                t017_steps=t017_steps,
+            )
+            self.assertFalse(gates_s10["passed"])
+            self.assertFalse(gates_s10["tech_fail_exceeded"])
+            self.assertTrue(gates_s10["gated_rebound_exceeded"])
+            self.assertFalse(gates_s10["gated_abs_exceeded"])
+
+            # Step 25 with steady 0.36 (> 0.35, no rebound): triggers abs gate and carries T-017 val ref 0.23.
+            ra_steps2 = run_dir / "ra_steps2"
+            ra_steps2.mkdir()
+            for s in range(1, 25):
+                (ra_steps2 / f"{s}.json").write_text(
+                    json.dumps({"metrics": {"eduardo/routeA_gated_rate": 0.36}}),
+                    encoding="utf-8",
+                )
+            gates_s25 = pentry.assess_routea_stage3_gates(
+                step=25,
+                steps_dir=ra_steps2,
+                current_row={
+                    "routeA_metrics": {
+                        "metrics": {
+                            "eduardo/routeA_grader_llm_calls_total": 100.0,
+                            "eduardo/routeA_grader_tech_failed_total": 1.0,
+                            "eduardo/routeA_gated_rate": 0.36,
+                        }
+                    }
+                },
+            )
+            self.assertFalse(gates_s25["passed"])
+            self.assertFalse(gates_s25["tech_fail_exceeded"])
+            self.assertFalse(gates_s25["gated_rebound_exceeded"])
+            self.assertTrue(gates_s25["gated_abs_exceeded"])
+            self.assertEqual(gates_s25["t017_val_gated_ref"], 0.23)
+
+    def test_timed_grader_semaphore_contextvar_isolation(self):
+        from training.routeA_reward import reward_function as rf
+
+        inner = asyncio.Semaphore(2)
+        timed = _TimedGraderSemaphore(inner)
+        observed = []
+
+        async def _worker(delay: float):
+            async with timed:
+                await asyncio.sleep(delay)
+                q_ns, acq_ns = rf._GRADER_SEM_TIMING.get()
+                observed.append((delay, q_ns, acq_ns))
+
+        async def _driver():
+            await asyncio.gather(_worker(0.03), _worker(0.01), _worker(0.02))
+
+        _run(_driver())
+        self.assertEqual(len(observed), 3)
+        acq_times = [x[2] for x in observed]
+        self.assertTrue(all(t > 0 for t in acq_times))
+        self.assertEqual(len(set(acq_times)), 3)
+        self.assertEqual(rf._GRADER_SEM_TIMING.get(), (0, 0))
+
+    def test_stage2_routea_summary_and_acceptance_gates(self):
+        layout = {
+            "mode": "8gpu",
+            "tutor_gpus": [0, 1, 2, 3],
+            "student_gpus": [4, 6],
+            "judge_gpus": [5, 7],
+            "judge_concurrency": 16,
+            "grader_max_concurrency": 32,
+        }
+
+        def _make_step(step_num: int, *, step_s: float, vram_mib: float, non2xx: int = 0, gate_p95_ms: float = 45000.0, grader_tech_fail: float = 0.0):
+            return {
+                "step": step_num,
+                "vote_log_counts": {"requests": 1536, "parse": 2, "recovery": 10},
+                "metrics": {
+                    "timing_s/step": step_s,
+                    "timing_s/gen": step_s * 0.85,
+                    "perf/total_num_tokens": 1_800_000,
+                    "actor/grad_norm": 0.1,
+                    "actor/pg_loss": -0.003,
+                },
+                "phase_timings": {
+                    "gen": {"minutes": step_s * 0.85 / 60.0, "ms_per_token": 0.5},
+                    "old_log_prob": {"minutes": 0.6, "ms_per_token": 0.02},
+                    "update_actor": {"minutes": 2.4, "ms_per_token": 0.08},
+                },
+                "telemetry": {
+                    "gen": {
+                        "gpus": {
+                            str(g): {"used_mib": {"max": vram_mib}, "util_pct": {"mean": 20.0 if g < 4 else 80.0}}
+                            for g in range(8)
+                        }
+                    },
+                    "old_log_prob": {"gpus": {}},
+                    "update_actor": {"gpus": {}},
+                },
+                "judge_proxy": {"total_chat_requests": 3000, "non_2xx": non2xx, "errors": 0, "combined_busy_wall_s": 800.0},
+                "student_proxy": {"total_chat_requests": 2600, "non_2xx": 0, "errors": 0, "combined_busy_wall_s": 400.0, "backends": {}},
+                "queues": {
+                    "groups": {
+                        "judge": {"calls": 1536, "wait_p50_ms": 100.0, "wait_p95_ms": 500.0, "service_p50_ms": 10000.0, "service_p95_ms": gate_p95_ms, "attempt_errors": 0},
+                        "hybrid_grader": {"calls": 1500, "wait_p50_ms": 50.0, "wait_p95_ms": 200.0, "service_p50_ms": 1200.0, "service_p95_ms": 3000.0, "attempt_errors": 0},
+                        "student_interaction": {"calls": 2000, "attempt_errors": 0},
+                        "student_final": {"calls": 600, "attempt_errors": 0},
+                    }
+                },
+                "routeA_metrics": {
+                    "n_rollouts": 256,
+                    "metrics": {
+                        "eduardo/routeA_theta_mean": 0.1,
+                        "eduardo/routeA_g_mean": 0.025,
+                        "eduardo/routeA_gated_rate": 0.15,
+                        "eduardo/routeA_grader_llm_calls_total": 1500.0,
+                        "eduardo/routeA_grader_llm_unknown_total": 0.0,
+                        "eduardo/routeA_grader_llm_unknown_rate": 0.0,
+                        "eduardo/routeA_grader_tech_failed_total": grader_tech_fail,
+                        "eduardo/routeA_grader_tech_failed_rate": grader_tech_fail / 1500.0,
+                        "eduardo/routeA_student_failed_total": 0.0,
+                    },
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            (work / "step-statistics").mkdir()
+            (work / "restore_step_2.json").write_text(json.dumps({"global_step": 2, "data_batches": 2}))
+            (work / "step2-comparison.json").write_text(json.dumps({"passed": True}))
+            for s_num, sec in ((1, 1300.0), (2, 1350.0), (3, 1320.0)):
+                (work / "step-statistics" / f"{s_num}.json").write_text(
+                    json.dumps(_make_step(s_num, step_s=sec, vram_mib=67000.0))
+                )
+            ok_sum = summarize_stage2_routea(work, layout, 20_720_000_000)
+            self.assertTrue(ok_sum["gates_passed"], ok_sum["gate_failures"])
+            self.assertEqual(ok_sum["rc"], 0)
+            self.assertEqual(ok_sum["steps"][0]["gate_calls"], 1536)
+            self.assertEqual(ok_sum["steps"][0]["hybrid_grader_qm_calls"], 1500)
+
+            # Fail every gate cleanly
+            (work / "restore_step_2.json").unlink()
+            (work / "step-statistics" / "2.json").write_text(
+                json.dumps(_make_step(2, step_s=2100.0, vram_mib=70000.0, non2xx=1, gate_p95_ms=305000.0, grader_tech_fail=20.0))
+            )
+            bad_sum = summarize_stage2_routea(work, layout, 20_720_000_000)
+            self.assertFalse(bad_sum["gates_passed"])
+            self.assertEqual(bad_sum["rc"], 4)
+            self.assertFalse(any(bad_sum["per_gate"].values()))
 
 
 if __name__ == "__main__":

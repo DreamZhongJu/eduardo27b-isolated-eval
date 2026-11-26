@@ -12,6 +12,6 @@ T-026 路线 A 正式训练（阶段 1：代码、单测与 Pro 5000 无卡预�
 ## 27B 并发分配说明（#6）
 
 Pro 5000 上 27B 服务（`Qwen3.6-27B`, `TP=2`, GPU 5 & 7）配置 `--max-num-seqs 256`，`reward.num_workers = 2`：
-- 门禁裁判：`judge_concurrency = 64` / worker（2 workers 合计 `128`，与 T-026 卡要求及 T-017 阶段 3 初始设置一致）；
+- 门禁裁判：`judge_concurrency = 16` / worker（2 workers 合计 `32`，按 T-026 卡第 2 版与 T-017 正式运行一致）；
 - 混合判法兜底：`grader_max_concurrency = 32` / worker（2 workers 合计 `64`，配合 AIMD 拥塞窗口 `1..32` 与独立 `hybrid_grader` 信号量）；
-- 合计并发上限：`128 + 64 = 192 <= 256`（留 64 个槽位余量防止队列打满；且 T-017 阶段 3 曾测到 `judge_concurrency=64` 时 27B `service_p95` 升至 `144.46s` 并出现 8 次 `300s` 超时，故保守设 `32`/worker 并在阶段 2 试跑 3 步重点盯防 `service_p95 < 300s`）。
+- 合计并发上限：`32 + 64 = 96 <= 256`（避免 T-017 在 `judge_concurrency=64` 时触发的 `300s` 长尾超时，同时给阶段 2 试跑留足排队余量）。

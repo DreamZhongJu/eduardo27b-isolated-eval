@@ -43,7 +43,9 @@ ALLOWED_REWARD_FUNCS = frozenset({
     ('pkg://training.routeA_reward.reward_function', 'route_a_reward_func'),
 })
 ROUTEA_TECH_FAIL_MAX_PERCENT = 1
-ROUTEA_GATED_DELTA_MAX = 0.10
+ROUTEA_GATED_REBOUND_MAX = 0.15
+ROUTEA_GATED_ABS_MAX = 0.35
+T017_VAL_GATED_REF = {25: 0.23, 50: 0.09, 75: 0.15, 100: 0.08}
 
 
 def assess_step1_judge(row: dict, judge_concurrency: int) -> dict:
@@ -180,44 +182,53 @@ def assess_routea_stage3_gates(
     step: int,
     steps_dir: Path,
     current_row: dict,
-    t017_steps: dict[int, dict],
+    t017_steps: dict[int, dict] | None = None,
 ) -> dict:
-    """Evaluate Route A Stage 3 stop rules (hybrid tech fail >1% and gated ma5 +10pp)."""
+    """Evaluate Route A Stage 3 stop rules (hybrid tech fail >1%, self-curve gated ma5 rebound/cap)."""
+    del t017_steps  # T-017 training logs lack per-step gated_rate; validation refs are reported separately.
     ra = current_row.get('routeA_metrics', {}).get('metrics', {})
     llm_calls = int(round(ra.get('eduardo/routeA_grader_llm_calls_total', 0.0)))
     tech_failed = int(round(ra.get('eduardo/routeA_grader_tech_failed_total', 0.0)))
     tech_fail_rate = (tech_failed / llm_calls) if llm_calls > 0 else 0.0
     tech_fail_exceeded = llm_calls > 0 and (100 * tech_failed > ROUTEA_TECH_FAIL_MAX_PERCENT * llm_calls)
 
-    window_rates: list[float] = []
-    for s in range(max(1, step - 4), step):
+    step_gated: dict[int, float] = {}
+    for s in range(1, step):
         p = steps_dir / f'{s}.json'
         if p.is_file():
             try:
                 prev = json.loads(p.read_text(encoding='utf-8'))
                 val = prev.get('metrics', {}).get('eduardo/routeA_gated_rate')
                 if isinstance(val, (int, float)):
-                    window_rates.append(float(val))
+                    step_gated[s] = float(val)
             except ValueError:
                 pass
     cur_gated = ra.get('eduardo/routeA_gated_rate')
     if isinstance(cur_gated, (int, float)):
-        window_rates.append(float(cur_gated))
-    gated_ma5 = (sum(window_rates) / len(window_rates)) if window_rates else None
+        step_gated[step] = float(cur_gated)
 
-    t017_entry = t017_steps.get(step)
-    t017_ma5 = t017_entry.get('gated_rate_ma5') if isinstance(t017_entry, dict) else None
-    t017_step_gated = t017_entry.get('gated_rate') if isinstance(t017_entry, dict) else None
-    gated_delta = (gated_ma5 - float(t017_ma5)) if (gated_ma5 is not None and t017_ma5 is not None) else None
-    gated_exceeded = gated_delta is not None and gated_delta > ROUTEA_GATED_DELTA_MAX
+    def _ma5_at(target_step: int) -> float | None:
+        vals = [step_gated[k] for k in range(max(1, target_step - 4), target_step + 1) if k in step_gated]
+        return (sum(vals) / len(vals)) if vals else None
+
+    gated_ma5 = _ma5_at(step)
+    prior_ma5s = [m for s in range(1, step) if (m := _ma5_at(s)) is not None]
+    min_prior_ma5 = min(prior_ma5s) if prior_ma5s else None
+    rebound = (gated_ma5 - min_prior_ma5) if (gated_ma5 is not None and min_prior_ma5 is not None) else None
+
+    gated_rebound_exceeded = step >= 10 and rebound is not None and rebound > ROUTEA_GATED_REBOUND_MAX
+    gated_abs_exceeded = step >= 25 and gated_ma5 is not None and gated_ma5 > ROUTEA_GATED_ABS_MAX
 
     failures = []
     if tech_fail_exceeded:
         failures.append(f'hybrid_tech_fail={tech_failed}/{llm_calls}>1%')
-    if gated_exceeded:
+    if gated_rebound_exceeded:
         failures.append(
-            f'gated_ma5={gated_ma5:.4f} exceeds T017_ma5={float(t017_ma5):.4f} by {gated_delta:.4f}>0.10'
+            f'step>={10} gated_ma5={gated_ma5:.4f} exceeds min_prior_ma5={min_prior_ma5:.4f} by {rebound:.4f}>0.15'
         )
+    if gated_abs_exceeded:
+        failures.append(f'step>={25} gated_ma5={gated_ma5:.4f}>0.35')
+
     return {
         'llm_calls': llm_calls,
         'tech_failed': tech_failed,
@@ -225,10 +236,11 @@ def assess_routea_stage3_gates(
         'tech_fail_exceeded': tech_fail_exceeded,
         'gated_rate': cur_gated,
         'gated_ma5': round(gated_ma5, 6) if gated_ma5 is not None else None,
-        't017_gated_rate': t017_step_gated,
-        't017_gated_ma5': t017_ma5,
-        'gated_ma5_delta': round(gated_delta, 6) if gated_delta is not None else None,
-        'gated_exceeded': gated_exceeded,
+        'min_gated_ma5_prior': round(min_prior_ma5, 6) if min_prior_ma5 is not None else None,
+        'gated_ma5_rebound': round(rebound, 6) if rebound is not None else None,
+        'gated_rebound_exceeded': gated_rebound_exceeded,
+        'gated_abs_exceeded': gated_abs_exceeded,
+        't017_val_gated_ref': T017_VAL_GATED_REF.get(step),
         'passed': not failures,
         'failures': failures,
     }
@@ -473,12 +485,15 @@ def bound_trainer(native):
                     if isinstance(metrics.get('timing_s/step'), (int, float)):
                         recent_secs.append(float(metrics['timing_s/step']))
                     avg5_s = (sum(recent_secs) / len(recent_secs)) if recent_secs else 0.0
-                    t017_g = row.get('routeA_gates', {}).get('t017_gated_rate')
-                    t017_str = f'{float(t017_g):.3f}' if t017_g is not None else 'N/A'
+                    rgates = row.get('routeA_gates', {})
+                    ma5_g = rgates.get('gated_ma5')
+                    ma5_str = f'{float(ma5_g):.3f}' if ma5_g is not None else 'N/A'
+                    t017_ref = rgates.get('t017_val_gated_ref')
+                    t017_str = f'{float(t017_ref):.2f}' if t017_ref is not None else 'N/A'
                     extra_ra = (
                         f" avg5_s={avg5_s:.1f}s reward={ram.get('eduardo/routeA_reward_mean', 0.0):.3f} "
                         f"theta={ram.get('eduardo/routeA_theta_mean', 0.0):.3f} "
-                        f"gated={ram.get('eduardo/routeA_gated_rate', 0.0):.3f} (t017={t017_str})"
+                        f"gated={ram.get('eduardo/routeA_gated_rate', 0.0):.3f} (ma5={ma5_str}, t017_val={t017_str})"
                     )
                 print(
                     f"[CKPT step={step}] step_s={metrics.get('timing_s/step', 0.0):.1f}s "
