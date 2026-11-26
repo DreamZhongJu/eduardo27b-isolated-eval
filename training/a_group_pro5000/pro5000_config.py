@@ -10,6 +10,8 @@ import sys
 TEACHER_MODEL_DEFAULT = Path('/data/models/Qwen3.5-4B')
 AUTHOR_COMMIT = 'e8c89b7293e65e632149571b16a1c2d4e33c77fe'
 SPLIT_ROWS = {'train.parquet': 4712, 'val.parquet': 100}
+VLLM_MAX_NUM_SEQS_27B = 256
+REWARD_NUM_WORKERS = 2
 
 
 def build_overrides(
@@ -29,8 +31,14 @@ def build_overrides(
     judge_concurrency: int = 16,
     max_actor_ckpt_to_keep: int | None = None,
     resume_step: int | None = None,
+    reward_mode: str = 'author',
+    data_dir: Path | None = None,
+    theta_scale: float = 0.25,
+    ladder_num_climbs: int = 8,
+    grader_max_concurrency: int = 32,
+    code_root: Path | None = None,
 ) -> list[str]:
-    data_dir = base / 'data' / 'author_prepared'
+    resolved_data_dir = data_dir if data_dir is not None else (base / 'data' / 'author_prepared')
     overrides = [
         'trainer.nnodes=1',
         f'trainer.n_gpus_per_node={tutor_gpus}',
@@ -53,7 +61,7 @@ def build_overrides(
         'actor_rollout_ref.rollout.temperature=1.15',
         'actor_rollout_ref.rollout.calculate_log_probs=true',
         'actor_rollout_ref.rollout.agent.num_workers=2',
-        'reward.num_workers=2',
+        f'reward.num_workers={REWARD_NUM_WORKERS}',
         'reward_model.num_workers=null',
         'custom_reward_function.reward_kwargs.num_student_attempts=16',
         f'custom_reward_function.reward_kwargs.judge_concurrency={judge_concurrency}',
@@ -61,8 +69,8 @@ def build_overrides(
         f'actor_rollout_ref.rollout.multi_turn.interaction_config_path={interaction}',
         f'vars.student_model_name={student_name}',
         'vars.judge_model_name=judge-local',
-        f'data.train_files={data_dir}/train.parquet',
-        f'data.val_files={data_dir}/val.parquet',
+        f'data.train_files={resolved_data_dir}/train.parquet',
+        f'data.val_files={resolved_data_dir}/val.parquet',
         f'trainer.total_training_steps={total_steps}',
         f'trainer.save_freq={save_freq}',
         f'trainer.test_freq={test_freq}',
@@ -78,6 +86,27 @@ def build_overrides(
         f'+ray_kwargs.ray_init.runtime_env.env_vars.EDU_QUEUE_METRICS_DIR={work}/queue-metrics',
         '+ray_kwargs.ray_init.runtime_env.env_vars.EDUARDO_CONV_DIR=/dev/null',
     ]
+    if reward_mode != 'author':
+        total_27b_conc = REWARD_NUM_WORKERS * (judge_concurrency + grader_max_concurrency)
+        if total_27b_conc > VLLM_MAX_NUM_SEQS_27B:
+            raise ValueError(
+                f'27B 并发超限: {REWARD_NUM_WORKERS} * ({judge_concurrency} + {grader_max_concurrency}) '
+                f'= {total_27b_conc} > {VLLM_MAX_NUM_SEQS_27B}'
+            )
+        overrides.extend([
+            'custom_reward_function.path=pkg://training.routeA_reward.reward_function',
+            'custom_reward_function.name=route_a_reward_func',
+            f'+custom_reward_function.reward_kwargs.mode={reward_mode}',
+            f'+custom_reward_function.reward_kwargs.theta_scale={theta_scale}',
+            f'+custom_reward_function.reward_kwargs.ladder_num_climbs={ladder_num_climbs}',
+            f'+custom_reward_function.reward_kwargs.grader_max_concurrency={grader_max_concurrency}',
+            f'+custom_reward_function.reward_kwargs.routeA_metrics_dir={work}/routeA-metrics',
+            f'+ray_kwargs.ray_init.runtime_env.env_vars.ROUTEA_STEP_METRICS_DIR={work}/routeA-metrics',
+        ])
+    if code_root is not None:
+        overrides.append(
+            f'+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH={code_root}:{code_root}/training/a_group_pro5000:{base}/source/EduardoRL'
+        )
     if resume_step is not None:
         overrides.extend([
             'trainer.resume_mode=resume_path',
@@ -117,13 +146,18 @@ def pin_composed(
     judge_concurrency: int = 16,
     max_actor_ckpt_to_keep: int | None = None,
     resume_step: int | None = None,
+    reward_mode: str = 'author',
+    data_dir: Path | None = None,
+    theta_scale: float = 0.25,
+    ladder_num_climbs: int = 8,
+    grader_max_concurrency: int = 32,
 ):
     trainer = config['trainer']
     ar = config['actor_rollout_ref']
     roll = ar['rollout']
     act = ar['actor']
     reward = config['custom_reward_function']['reward_kwargs']
-    data_dir = base / 'data' / 'author_prepared'
+    resolved_data_dir = data_dir if data_dir is not None else (base / 'data' / 'author_prepared')
 
     _expect(trainer, {
         'total_training_steps': total_steps,
@@ -142,8 +176,8 @@ def pin_composed(
     })
     _expect(config['data'], {
         'train_batch_size': 16,
-        'train_files': str(data_dir / 'train.parquet'),
-        'val_files': str(data_dir / 'val.parquet'),
+        'train_files': str(resolved_data_dir / 'train.parquet'),
+        'val_files': str(resolved_data_dir / 'val.parquet'),
         'shuffle': True,
         'max_prompt_length': 2048,
         'max_response_length': 8192,
@@ -178,7 +212,7 @@ def pin_composed(
     })
     _expect(roll['multi_turn'], {'enable': True, 'interaction_config_path': str(interaction)})
     _expect(roll['agent'], {'num_workers': 2})
-    _expect(config['reward'], {'num_workers': 2})
+    _expect(config['reward'], {'num_workers': REWARD_NUM_WORKERS})
     _expect(config['reward_model'], {'num_workers': None})
     _expect(reward, {
         'num_student_attempts': 16,
@@ -197,6 +231,23 @@ def pin_composed(
         'judge_model': 'judge-local',
         'student_model': student_name,
     })
+    if reward_mode != 'author':
+        total_27b_conc = REWARD_NUM_WORKERS * (judge_concurrency + grader_max_concurrency)
+        if total_27b_conc > VLLM_MAX_NUM_SEQS_27B:
+            raise ValueError(
+                f'27B 并发超限: {REWARD_NUM_WORKERS} * ({judge_concurrency} + {grader_max_concurrency}) '
+                f'= {total_27b_conc} > {VLLM_MAX_NUM_SEQS_27B}'
+            )
+        _expect(config['custom_reward_function'], {
+            'path': 'pkg://training.routeA_reward.reward_function',
+            'name': 'route_a_reward_func',
+        })
+        _expect(reward, {
+            'mode': reward_mode,
+            'theta_scale': theta_scale,
+            'ladder_num_climbs': ladder_num_climbs,
+            'grader_max_concurrency': grader_max_concurrency,
+        })
     ray_env = config['ray_kwargs']['ray_init']['runtime_env']
     _expect(ray_env, {'worker_process_setup_hook': 'queue_metrics.install'})
     _expect(ray_env['env_vars'], {'EDU_QUEUE_METRICS_DIR': str(work / 'queue-metrics')})
@@ -213,6 +264,7 @@ def run_preflight(
     judge_api_base: str,
     overrides: list[str],
     check_env: dict[str, str],
+    code_root: Path | None = None,
 ):
     cmd = [
         str(python_exe), '-B', str(trainer_entry), '--check-only',
@@ -222,11 +274,20 @@ def run_preflight(
         f'hydra.run.dir={work}/hydra-preflight',
         'hydra.output_subdir=null',
     ]
+    inferred_root = code_root
+    if inferred_root is None:
+        candidate = trainer_entry.resolve().parent.parent.parent
+        if (candidate / 'training' / 'routeA_reward').is_dir():
+            inferred_root = candidate
+    py_parts = [str(trainer_entry.parent)]
+    if inferred_root is not None:
+        py_parts.append(str(inferred_root))
+    py_parts.append(str(repo))
     env = dict(
         check_env,
         CUDA_VISIBLE_DEVICES='',
         CUDA_DEVICE_ORDER='PCI_BUS_ID',
-        PYTHONPATH=f"{trainer_entry.parent}:{repo}",
+        PYTHONPATH=':'.join(py_parts),
         WORK_DIR=str(work),
         EDUARDO_RECIPE_DIR=str(repo / 'eduardo'),
         MODEL_PATH=str(tutor_model),

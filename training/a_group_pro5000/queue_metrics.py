@@ -9,15 +9,18 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import weakref
 
 
-LABELS = ('student_interaction', 'student_final', 'judge')
+LABELS = ('student_interaction', 'student_final', 'judge', 'hybrid_grader')
 ENV = 'EDU_QUEUE_METRICS_DIR'
-MAX_CALLS_PER_LABEL_PER_WORKER = 8192
+MAX_CALLS_PER_LABEL_PER_WORKER = 262144
 AUTHOR_ALIASES = ('eduardo.eduardo_interaction', 'eduardo.metrics.correctness',
                   'eduardo.metrics.judge_quality')
+_CUSTOM_SINK_LOCK = threading.Lock()
+_CUSTOM_SINKS: dict[str, '_WorkerSink'] = {}
 
 
 class _Timing:
@@ -143,6 +146,49 @@ def install():
         caller = sys.modules.get(name)
         if caller is not None and getattr(caller, 'call_openai_with_retries', None) is original:
             caller.call_openai_with_retries = wrapped
+
+
+def record_custom_timing(
+    label: str,
+    *,
+    start_ns: int,
+    end_ns: int,
+    queued_ns: int = 0,
+    service_ns: int = 0,
+    held_ns: int = 0,
+    attempts: int = 1,
+    attempt_errors: int = 0,
+    fallback: int = 0,
+    call_error: int = 0,
+) -> None:
+    """Record a single non-author request timing sample when EDU_QUEUE_METRICS_DIR is set."""
+    if label not in LABELS:
+        return
+    raw_dir = os.environ.get(ENV, '').strip()
+    if not raw_dir:
+        return
+    try:
+        directory = Path(raw_dir)
+        if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+            return
+        with _CUSTOM_SINK_LOCK:
+            sink = _CUSTOM_SINKS.get(raw_dir)
+            if sink is None:
+                sink = _WorkerSink(directory, MAX_CALLS_PER_LABEL_PER_WORKER)
+                _CUSTOM_SINKS[raw_dir] = sink
+            if not sink.admit(label):
+                return
+            timing = _Timing(time.monotonic_ns)
+            timing.queued_ns = max(0, int(queued_ns))
+            timing.service_ns = max(0, int(service_ns))
+            timing.held_ns = max(0, int(held_ns))
+            timing.attempts = max(0, int(attempts))
+            timing.attempt_errors = max(0, int(attempt_errors))
+            timing.fallback = 1 if fallback else 0
+            timing.call_error = 1 if call_error else 0
+            sink.write(label, max(0, int(start_ns)), max(int(start_ns), int(end_ns)), timing)
+    except Exception:
+        return
 
 
 def _percentile_ms(samples, rank):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+import importlib
 import json
 import math
 from numbers import Real
@@ -37,6 +38,12 @@ MIN_EXTRA_FREE_BYTES = 20_000_000_000
 ESTIMATED_MODEL_EXTRA_CKPT_BYTES = 20_000_000_000
 STAGE2_STEP1_SECONDS = 1178.46
 STEP1_JUDGE_MAX_SERVICE_P95_MS = 300_000.0
+ALLOWED_REWARD_FUNCS = frozenset({
+    ('pkg://eduardo.reward_function', 'eduardo_reward_func'),
+    ('pkg://training.routeA_reward.reward_function', 'route_a_reward_func'),
+})
+ROUTEA_TECH_FAIL_MAX_PERCENT = 1
+ROUTEA_GATED_DELTA_MAX = 0.10
 
 
 def assess_step1_judge(row: dict, judge_concurrency: int) -> dict:
@@ -141,8 +148,8 @@ def keep_teacher_budgets(config):
     from omegaconf import open_dict
 
     reward = config.reward.custom_reward_function
-    if reward.path != 'pkg://eduardo.reward_function' or reward.name != 'eduardo_reward_func':
-        raise ValueError('奖励函数未绑定作者实现')
+    if (reward.path, reward.name) not in ALLOWED_REWARD_FUNCS:
+        raise ValueError(f'奖励函数未绑定允许实现: path={reward.path!r} name={reward.name!r}')
     keys = ('max_tokens_per_turn', 'max_thinking_tokens_per_turn')
     budgets = {k: reward.reward_kwargs[k] for k in keys}
     if tuple(budgets.values()) != (150, 512):
@@ -155,6 +162,76 @@ def keep_teacher_budgets(config):
         raise ValueError('教师与奖励函数的预算不一致')
     if tuple(config.custom_reward_function.reward_kwargs[k] for k in keys) != (150, 512):
         raise ValueError('教师预算交接失败')
+
+
+def _load_t017_baseline_steps(path_str: str) -> dict[int, dict]:
+    if not path_str:
+        return {}
+    p = Path(path_str)
+    if not p.is_file():
+        return {}
+    data = json.loads(p.read_text(encoding='utf-8'))
+    raw_steps = data.get('steps', {})
+    return {int(k): v for k, v in raw_steps.items()}
+
+
+def assess_routea_stage3_gates(
+    *,
+    step: int,
+    steps_dir: Path,
+    current_row: dict,
+    t017_steps: dict[int, dict],
+) -> dict:
+    """Evaluate Route A Stage 3 stop rules (hybrid tech fail >1% and gated ma5 +10pp)."""
+    ra = current_row.get('routeA_metrics', {}).get('metrics', {})
+    llm_calls = int(round(ra.get('eduardo/routeA_grader_llm_calls_total', 0.0)))
+    tech_failed = int(round(ra.get('eduardo/routeA_grader_tech_failed_total', 0.0)))
+    tech_fail_rate = (tech_failed / llm_calls) if llm_calls > 0 else 0.0
+    tech_fail_exceeded = llm_calls > 0 and (100 * tech_failed > ROUTEA_TECH_FAIL_MAX_PERCENT * llm_calls)
+
+    window_rates: list[float] = []
+    for s in range(max(1, step - 4), step):
+        p = steps_dir / f'{s}.json'
+        if p.is_file():
+            try:
+                prev = json.loads(p.read_text(encoding='utf-8'))
+                val = prev.get('metrics', {}).get('eduardo/routeA_gated_rate')
+                if isinstance(val, (int, float)):
+                    window_rates.append(float(val))
+            except ValueError:
+                pass
+    cur_gated = ra.get('eduardo/routeA_gated_rate')
+    if isinstance(cur_gated, (int, float)):
+        window_rates.append(float(cur_gated))
+    gated_ma5 = (sum(window_rates) / len(window_rates)) if window_rates else None
+
+    t017_entry = t017_steps.get(step)
+    t017_ma5 = t017_entry.get('gated_rate_ma5') if isinstance(t017_entry, dict) else None
+    t017_step_gated = t017_entry.get('gated_rate') if isinstance(t017_entry, dict) else None
+    gated_delta = (gated_ma5 - float(t017_ma5)) if (gated_ma5 is not None and t017_ma5 is not None) else None
+    gated_exceeded = gated_delta is not None and gated_delta > ROUTEA_GATED_DELTA_MAX
+
+    failures = []
+    if tech_fail_exceeded:
+        failures.append(f'hybrid_tech_fail={tech_failed}/{llm_calls}>1%')
+    if gated_exceeded:
+        failures.append(
+            f'gated_ma5={gated_ma5:.4f} exceeds T017_ma5={float(t017_ma5):.4f} by {gated_delta:.4f}>0.10'
+        )
+    return {
+        'llm_calls': llm_calls,
+        'tech_failed': tech_failed,
+        'tech_fail_rate': round(tech_fail_rate, 6),
+        'tech_fail_exceeded': tech_fail_exceeded,
+        'gated_rate': cur_gated,
+        'gated_ma5': round(gated_ma5, 6) if gated_ma5 is not None else None,
+        't017_gated_rate': t017_step_gated,
+        't017_gated_ma5': t017_ma5,
+        'gated_ma5_delta': round(gated_delta, 6) if gated_delta is not None else None,
+        'gated_exceeded': gated_exceeded,
+        'passed': not failures,
+        'failures': failures,
+    }
 
 
 def extract_numeric_metrics(data: dict) -> dict[str, float]:
@@ -184,6 +261,18 @@ def bound_trainer(native):
             self.formal_judge_conc = int(os.environ.get('PRO5000_JUDGE_CONC', '16'))
             self.formal_check_step1_judge = os.environ.get('PRO5000_CHECK_STEP1_JUDGE', '0') == '1'
             self.formal_check_step2 = os.environ.get('PRO5000_CHECK_STEP2_RATIO', '0') == '1'
+            self.formal_routea_metrics_dir = os.environ.get('ROUTEA_STEP_METRICS_DIR', '').strip()
+            if not self.formal_routea_metrics_dir:
+                try:
+                    cfg_dir = self.config.reward.custom_reward_function.reward_kwargs.get('routeA_metrics_dir', '')
+                    if cfg_dir:
+                        self.formal_routea_metrics_dir = str(cfg_dir).strip()
+                except Exception:
+                    pass
+            if not self.formal_routea_metrics_dir and (self.formal_work / 'routeA-metrics').is_dir():
+                self.formal_routea_metrics_dir = str(self.formal_work / 'routeA-metrics')
+            self.formal_routea_enforce = os.environ.get('PRO5000_ROUTEA_ENFORCE_GATES', '0') == '1'
+            self.formal_t017_steps = _load_t017_baseline_steps(os.environ.get('PRO5000_T017_BASELINE_JSON', '').strip())
             self.formal_saved = None
             self.formal_validation = False
             self.formal_ckpt_bytes_hint = int(os.environ.get('PRO5000_CKPT_HINT_BYTES', str(ESTIMATED_MODEL_EXTRA_CKPT_BYTES)))
@@ -329,6 +418,34 @@ def bound_trainer(native):
                 'wall_end': time.time(),
             }
 
+            if self.formal_routea_metrics_dir:
+                try:
+                    from training.routeA_reward.reward_function import summarize_metrics_window
+
+                    ra_summary = summarize_metrics_window(
+                        self.formal_routea_metrics_dir,
+                        self.formal_queue_start,
+                        self.formal_queue_end,
+                        split='train',
+                    )
+                    row['routeA_metrics'] = ra_summary
+                    metrics.update(ra_summary.get('metrics', {}))
+                except ImportError:
+                    pass
+
+            steps_dir = self.formal_work / 'step-statistics'
+            if 'routeA_metrics' in row and row['routeA_metrics'].get('n_rollouts', 0) > 0:
+                gates = assess_routea_stage3_gates(
+                    step=step,
+                    steps_dir=steps_dir,
+                    current_row=row,
+                    t017_steps=self.formal_t017_steps,
+                )
+                row['routeA_gates'] = gates
+                if self.formal_routea_enforce and not gates['passed']:
+                    write_json(steps_dir / f'{step}.json', row)
+                    raise RuntimeError(f'路线 A 阶段 3 停机规则触发 (step={step}): {gates["failures"]}')
+
             if self.formal_saved == step:
                 import torch
 
@@ -340,16 +457,38 @@ def bound_trainer(native):
                 self.formal_ckpt_bytes_hint = max(self.formal_ckpt_bytes_hint, info['size_bytes'])
                 row['checkpoint_saved'] = info
                 write_json(self.formal_work / f'ckpt-verified-{step}.json', {'step': step, **info})
+                extra_ra = ''
+                if 'routeA_metrics' in row and row['routeA_metrics'].get('n_rollouts', 0) > 0:
+                    ram = row['routeA_metrics']['metrics']
+                    recent_secs = []
+                    for s in range(max(1, step - 4), step):
+                        sp = steps_dir / f'{s}.json'
+                        if sp.is_file():
+                            try:
+                                prev_s = json.loads(sp.read_text(encoding='utf-8')).get('metrics', {}).get('timing_s/step')
+                                if isinstance(prev_s, (int, float)):
+                                    recent_secs.append(float(prev_s))
+                            except ValueError:
+                                pass
+                    if isinstance(metrics.get('timing_s/step'), (int, float)):
+                        recent_secs.append(float(metrics['timing_s/step']))
+                    avg5_s = (sum(recent_secs) / len(recent_secs)) if recent_secs else 0.0
+                    t017_g = row.get('routeA_gates', {}).get('t017_gated_rate')
+                    t017_str = f'{float(t017_g):.3f}' if t017_g is not None else 'N/A'
+                    extra_ra = (
+                        f" avg5_s={avg5_s:.1f}s reward={ram.get('eduardo/routeA_reward_mean', 0.0):.3f} "
+                        f"theta={ram.get('eduardo/routeA_theta_mean', 0.0):.3f} "
+                        f"gated={ram.get('eduardo/routeA_gated_rate', 0.0):.3f} (t017={t017_str})"
+                    )
                 print(
                     f"[CKPT step={step}] step_s={metrics.get('timing_s/step', 0.0):.1f}s "
                     f"gen={phase_timings.get('gen', {}).get('minutes', 0.0):.2f}m "
                     f"old={phase_timings.get('old_log_prob', {}).get('minutes', 0.0):.2f}m "
                     f"upd={phase_timings.get('update_actor', {}).get('minutes', 0.0):.2f}m "
-                    f"ckpt_gb={info['size_gb']} disk_free_gb={row['disk_free_gb']}",
+                    f"ckpt_gb={info['size_gb']} disk_free_gb={row['disk_free_gb']}{extra_ra}",
                     flush=True,
                 )
 
-            steps_dir = self.formal_work / 'step-statistics'
             write_json(steps_dir / f'{step}.json', row)
 
             if step == 1:
@@ -412,6 +551,12 @@ def run(check_only: bool):
         judge_conc = int(os.environ.get('PRO5000_JUDGE_CONC', '16'))
         max_ckpt_raw = os.environ.get('PRO5000_MAX_CKPT_KEEP', '').strip()
         max_ckpt_keep = int(max_ckpt_raw) if max_ckpt_raw and max_ckpt_raw.lower() != 'none' else None
+        reward_mode = os.environ.get('PRO5000_REWARD_MODE', 'author').strip() or 'author'
+        data_dir_raw = os.environ.get('PRO5000_DATA_DIR', '').strip()
+        data_dir = Path(data_dir_raw) if data_dir_raw else None
+        theta_scale = float(os.environ.get('PRO5000_THETA_SCALE', '0.25'))
+        ladder_climbs = int(os.environ.get('PRO5000_LADDER_CLIMBS', '8'))
+        grader_conc = int(os.environ.get('PRO5000_GRADER_CONC', '32'))
 
         pcfg.pin_composed(
             OmegaConf.to_container(cfg, resolve=True),
@@ -429,11 +574,23 @@ def run(check_only: bool):
             judge_concurrency=judge_conc,
             max_actor_ckpt_to_keep=max_ckpt_keep,
             resume_step=start,
+            reward_mode=reward_mode,
+            data_dir=data_dir,
+            theta_scale=theta_scale,
+            ladder_num_climbs=ladder_climbs,
+            grader_max_concurrency=grader_conc,
         )
         auto_set_device(cfg)
         cfg = migrate_legacy_reward_impl(cfg)
         keep_teacher_budgets(cfg)
         if check_only:
+            rf_path = cfg.reward.custom_reward_function.path
+            rf_name = cfg.reward.custom_reward_function.name
+            if rf_path == 'pkg://training.routeA_reward.reward_function':
+                mod = importlib.import_module('training.routeA_reward.reward_function')
+                fn = getattr(mod, rf_name, None)
+                if not callable(fn):
+                    raise ValueError(f'Route A 奖励函数不可调用: {rf_path}:{rf_name}')
             print('PRO5000_PRECHECK_OK', flush=True)
             return
         print('PRO5000_TUTOR_BUDGET 150+512=662', flush=True)

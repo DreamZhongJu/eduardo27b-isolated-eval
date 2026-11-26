@@ -755,16 +755,19 @@ class TestRouteARewardFunction(unittest.TestCase):
             theta = res["rasch_theta"]
             self.assertEqual(res["rasch_valid"], 1)
             self.assertEqual(res["rasch_prior_pulled"], 1)
+            self.assertAlmostEqual(res["rasch_theta_scale"], 0.25, places=12)
+            expected_g = theta * 0.25
+            self.assertAlmostEqual(res["rasch_gain_g"], expected_g, places=12)
             if expect_positive:
                 self.assertGreater(theta, 0.0)
                 self.assertAlmostEqual(
                     res["score"],
-                    theta * expected_vis_decay * expected_think_decay,
+                    expected_g * expected_vis_decay * expected_think_decay,
                     places=12,
                 )
             else:
                 self.assertLess(theta, 0.0)
-                self.assertAlmostEqual(res["score"], theta, places=12)
+                self.assertAlmostEqual(res["score"], expected_g, places=12)
                 self.assertEqual(res["r_length"], 0.0)
                 self.assertEqual(res["r_think_length"], 0.0)
 

@@ -25,11 +25,15 @@ Privacy guarantee:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Optional, Sequence
+import weakref
 
 from eduardo import reward_function as author_rf
 from eduardo.metrics import correctness as author_correctness
@@ -46,6 +50,7 @@ from .hybrid_grader import (
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_WINDOW,
     HybridGrader,
+    _default_openai_llm_call,
 )
 from .ladder import (
     DEFAULT_LADDER_CLIMBS,
@@ -60,6 +65,7 @@ from .rasch import rasch_map_estimate
 logger = logging.getLogger("routeA_reward")
 
 VALID_REWARD_MODES = ("ladder_rasch", "author", "author_hybrid")
+DEFAULT_THETA_SCALE = 0.25
 
 # Kwargs consumed only by Route A and stripped before delegating to author mode.
 _ROUTE_A_ONLY_KWARGS = frozenset(
@@ -67,6 +73,7 @@ _ROUTE_A_ONLY_KWARGS = frozenset(
         "mode",
         "reward_mode",
         "reward",
+        "theta_scale",
         "ladder_num_climbs",
         "num_climbs",
         "student_final_max_tokens",
@@ -81,9 +88,11 @@ _ROUTE_A_ONLY_KWARGS = frozenset(
         "grader_extra_body",
         "grader_use_vllm_no_thinking",
         "grader_backoff_base",
+        "grader_independent_semaphore",
         "middle_variant_policy",
         "batch_log_interval",
         "enable_batch_logging",
+        "routeA_metrics_dir",
     }
 )
 
@@ -95,6 +104,38 @@ _GRADER_WINDOW_LOCK = threading.Lock()
 _BATCH_LOCK = threading.Lock()
 _BATCH_ROWS: list[dict[str, Any]] = []
 _BATCH_START_TIME: Optional[float] = None
+
+# Thread-safe numeric-only per-rollout step metrics sink (ZERO text).
+_SINK_LOCK = threading.Lock()
+_SINK_FILES: dict[str, Any] = {}
+_METRIC_SINK_KEYS: tuple[str, ...] = (
+    "score",
+    "r_gate",
+    "gated",
+    "rasch_theta",
+    "rasch_gain_g",
+    "rasch_theta_scale",
+    "rasch_valid",
+    "rasch_prior_pulled",
+    "rasch_all_correct",
+    "rasch_all_wrong",
+    "compliant_g_lt_neg02",
+    "ladder_num_variants",
+    "ladder_num_climbs",
+    "ladder_student_calls",
+    "ladder_student_failed",
+    "ladder_reach_l1_rate",
+    "ladder_reach_l2_rate",
+    "ladder_reach_l3_rate",
+    "ladder_pass_l1_rate",
+    "ladder_pass_l2_rate",
+    "ladder_pass_l3_rate",
+    "grader_total_calls",
+    "grader_rule_correct",
+    "grader_llm_calls",
+    "grader_llm_unknown",
+    "grader_tech_failed",
+)
 
 
 def _get_grader_window(key: str, max_window: int) -> AsyncAdaptiveWindow:
@@ -134,6 +175,35 @@ def resolve_reward_mode(kwargs: dict[str, Any]) -> str:
     return mode
 
 
+def _record_hybrid_grader_timing(**kwargs: Any) -> None:
+    try:
+        import queue_metrics  # type: ignore
+
+        queue_metrics.record_custom_timing('hybrid_grader', **kwargs)
+    except Exception:
+        return
+
+
+class _TimedGraderSemaphore:
+    """Wrap an asyncio.Semaphore to capture queue wait and held duration."""
+
+    def __init__(self, inner: asyncio.Semaphore) -> None:
+        self._inner = inner
+        self.queued_ns = 0
+        self.acquired_ns = 0
+
+    async def __aenter__(self) -> Any:
+        t0 = time.monotonic_ns()
+        res = await self._inner.__aenter__()
+        now = time.monotonic_ns()
+        self.queued_ns = max(0, now - t0)
+        self.acquired_ns = now
+        return res
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        return await self._inner.__aexit__(*exc)
+
+
 def _build_hybrid_grader(
     kwargs: dict[str, Any],
     *,
@@ -156,8 +226,70 @@ def _build_hybrid_grader(
     use_vllm_no_thinking = bool(kwargs.get("grader_use_vllm_no_thinking", True))
     backoff_base = float(kwargs.get("grader_backoff_base", 1.0))
 
+    independent_sem = bool(kwargs.get("grader_independent_semaphore", True))
+    raw_sem = (
+        get_concurrency_semaphore("hybrid_grader", max_window)
+        if independent_sem
+        else judge_semaphore
+    )
+
     client = get_async_openai_client(api_base, api_key_env)
     window = _get_grader_window(f"{api_base}::{model}", max_window=max_window)
+
+    use_queue_metrics = bool(os.environ.get("EDU_QUEUE_METRICS_DIR", "").strip())
+    if use_queue_metrics and raw_sem is not None:
+        timed_sem = _TimedGraderSemaphore(raw_sem)
+        resolved_extra_body = (
+            dict(extra_body)
+            if extra_body is not None
+            else ({"chat_template_kwargs": {"enable_thinking": False}} if use_vllm_no_thinking else None)
+        )
+
+        async def _timed_llm_caller(messages: list[dict[str, str]]) -> tuple[Optional[str], Optional[str]]:
+            svc_start = time.monotonic_ns()
+            attempt_err = 0
+            try:
+                return await _default_openai_llm_call(
+                    client,
+                    model,
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra_body=resolved_extra_body,
+                )
+            except BaseException:
+                attempt_err = 1
+                raise
+            finally:
+                end_ns = time.monotonic_ns()
+                svc_ns = max(0, end_ns - svc_start)
+                held_ns = max(svc_ns, end_ns - timed_sem.acquired_ns)
+                start_ns = max(0, timed_sem.acquired_ns - timed_sem.queued_ns)
+                _record_hybrid_grader_timing(
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    queued_ns=timed_sem.queued_ns,
+                    service_ns=svc_ns,
+                    held_ns=held_ns,
+                    attempts=1,
+                    attempt_errors=attempt_err,
+                    fallback=0,
+                    call_error=attempt_err,
+                )
+
+        return HybridGrader(
+            llm_caller=_timed_llm_caller,
+            model=model,
+            max_attempts=max_attempts,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+            use_vllm_no_thinking=use_vllm_no_thinking,
+            window=window,
+            semaphore=timed_sem,  # type: ignore[arg-type]
+            backoff_base=backoff_base,
+        )
+
     return HybridGrader(
         client=client,
         model=model,
@@ -167,7 +299,7 @@ def _build_hybrid_grader(
         extra_body=extra_body,
         use_vllm_no_thinking=use_vllm_no_thinking,
         window=window,
-        semaphore=judge_semaphore,
+        semaphore=raw_sem,
         backoff_base=backoff_base,
     )
 
@@ -267,6 +399,7 @@ def _empty_route_a_reward(
     *,
     num_climbs: int = DEFAULT_LADDER_CLIMBS,
     omit_teacher_turns: bool = True,
+    theta_scale: float = DEFAULT_THETA_SCALE,
 ) -> dict[str, Any]:
     """Fixed-schema numeric reward dict for empty transcripts (matches veRL contract)."""
     return {
@@ -313,10 +446,13 @@ def _empty_route_a_reward(
         # Route A numeric telemetry (uniform keys on every rollout for veRL batching).
         "rasch_theta": 0.0,
         "rasch_theta_sq": 0.0,
+        "rasch_gain_g": 0.0,
+        "rasch_theta_scale": float(theta_scale),
         "rasch_valid": 0,
         "rasch_prior_pulled": 0,
         "rasch_all_correct": 0,
         "rasch_all_wrong": 0,
+        "compliant_g_lt_neg02": 0,
         "rasch_n_obs": 0,
         "ladder_num_variants": 0,
         "ladder_num_climbs": int(num_climbs),
@@ -351,27 +487,49 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
         return {}
 
     scores = [float(r.get("score", 0.0)) for r in results]
-    valid_thetas = [
-        float(r["rasch_theta"]) for r in results if int(r.get("rasch_valid", 0)) == 1
+    valid_compliant = [
+        r
+        for r in results
+        if int(r.get("gated", 0)) == 0 and int(r.get("rasch_valid", 0)) == 1
+    ]
+    valid_thetas = [float(r["rasch_theta"]) for r in valid_compliant]
+    valid_gs = [
+        float(r.get("rasch_gain_g", r.get("delta_solve", 0.0)))
+        for r in valid_compliant
     ]
     n_valid = len(valid_thetas)
     if n_valid > 0:
         theta_mean = sum(valid_thetas) / n_valid
         theta_var = sum((t - theta_mean) ** 2 for t in valid_thetas) / n_valid
         theta_std = math.sqrt(max(0.0, theta_var))
+        g_mean = sum(valid_gs) / n_valid
+        n_g_lt_neg02 = sum(1 for g in valid_gs if g < -0.2)
     else:
         theta_mean = 0.0
         theta_std = 0.0
+        g_mean = 0.0
+        n_g_lt_neg02 = 0
 
     score_mean = sum(scores) / n
     score_var = sum((s - score_mean) ** 2 for s in scores) / n
     score_std = math.sqrt(max(0.0, score_var))
+    score_min = min(scores)
 
     n_gated = sum(1 for r in results if int(r.get("gated", 0)) == 1)
     n_prior_pulled = sum(
+        1 for r in valid_compliant if int(r.get("rasch_prior_pulled", 0)) == 1
+    )
+    n_prior_all_correct = sum(
         1
-        for r in results
-        if int(r.get("rasch_valid", 0)) == 1 and int(r.get("rasch_prior_pulled", 0)) == 1
+        for r in valid_compliant
+        if int(r.get("rasch_prior_pulled", 0)) == 1
+        and int(r.get("rasch_all_correct", 0)) == 1
+    )
+    n_prior_all_wrong = sum(
+        1
+        for r in valid_compliant
+        if int(r.get("rasch_prior_pulled", 0)) == 1
+        and int(r.get("rasch_all_wrong", 0)) == 1
     )
     total_student_calls = sum(int(r.get("ladder_student_calls", 0)) for r in results)
     total_student_failed = sum(int(r.get("ladder_student_failed", 0)) for r in results)
@@ -381,6 +539,7 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
 
     non_gated = [r for r in results if int(r.get("gated", 0)) == 0]
     n_ng = len(non_gated)
+    compliant_student_calls = sum(int(r.get("ladder_student_calls", 0)) for r in non_gated)
 
     def _mean(rows: Sequence[dict[str, Any]], key: str) -> float:
         return sum(float(r.get(key, 0.0)) for r in rows) / len(rows) if rows else 0.0
@@ -388,11 +547,24 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
     return {
         "eduardo/routeA_reward_mean": score_mean,
         "eduardo/routeA_reward_std": score_std,
+        "eduardo/routeA_reward_min": score_min,
         "eduardo/routeA_theta_mean": theta_mean,
         "eduardo/routeA_theta_std": theta_std,
+        "eduardo/routeA_g_mean": g_mean,
+        "eduardo/routeA_compliant_g_lt_neg02_rate": (
+            n_g_lt_neg02 / n_valid if n_valid else 0.0
+        ),
         "eduardo/routeA_theta_valid_rate": n_valid / n,
         "eduardo/routeA_prior_pulled_rate": (n_prior_pulled / n_valid) if n_valid else 0.0,
+        "eduardo/routeA_prior_pulled_all_correct_rate": (
+            n_prior_all_correct / n_valid if n_valid else 0.0
+        ),
+        "eduardo/routeA_prior_pulled_all_wrong_rate": (
+            n_prior_all_wrong / n_valid if n_valid else 0.0
+        ),
         "eduardo/routeA_prior_pulled_all_rate": n_prior_pulled / n,
+        "eduardo/routeA_prior_pulled_all_correct_all_rate": n_prior_all_correct / n,
+        "eduardo/routeA_prior_pulled_all_wrong_all_rate": n_prior_all_wrong / n,
         "eduardo/routeA_gated_rate": n_gated / n,
         "eduardo/routeA_reach_l1_rate": _mean(non_gated, "ladder_reach_l1_rate") if n_ng else 0.0,
         "eduardo/routeA_reach_l2_rate": _mean(non_gated, "ladder_reach_l2_rate") if n_ng else 0.0,
@@ -401,6 +573,9 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
         "eduardo/routeA_pass_l2_rate": _mean(non_gated, "ladder_pass_l2_rate") if n_ng else 0.0,
         "eduardo/routeA_pass_l3_rate": _mean(non_gated, "ladder_pass_l3_rate") if n_ng else 0.0,
         "eduardo/routeA_student_calls_mean": total_student_calls / n,
+        "eduardo/routeA_student_calls_compliant_mean": (
+            compliant_student_calls / n_ng if n_ng else 0.0
+        ),
         "eduardo/routeA_student_calls_total": float(total_student_calls),
         "eduardo/routeA_student_failed_total": float(total_student_failed),
         "eduardo/routeA_grader_llm_calls_total": float(total_llm_calls),
@@ -410,6 +585,101 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
             total_llm_unknown / total_llm_calls if total_llm_calls > 0 else 0.0
         ),
         "eduardo/routeA_grader_tech_failed_total": float(total_grader_tech_failed),
+        "eduardo/routeA_grader_tech_failed_rate": (
+            total_grader_tech_failed / total_llm_calls if total_llm_calls > 0 else 0.0
+        ),
+    }
+
+
+def close_step_metric_sinks() -> None:
+    """Close any open per-rollout step metric file handles (useful in tests)."""
+    with _SINK_LOCK:
+        for fobj in _SINK_FILES.values():
+            try:
+                fobj.close()
+            except Exception:
+                pass
+        _SINK_FILES.clear()
+
+
+def _emit_step_metric_row(
+    result: dict[str, Any],
+    *,
+    split: str,
+    metrics_dir: str,
+) -> None:
+    """Append a strictly numeric rollout snapshot to per-PID JSONL (no text)."""
+    raw_dir = metrics_dir.strip()
+    if not raw_dir:
+        return
+    try:
+        dpath = Path(raw_dir)
+        if not dpath.is_absolute() or dpath.is_symlink():
+            return
+        dpath.mkdir(mode=0o700, parents=True, exist_ok=True)
+        split_tag = split if split in ("train", "val") else "unknown"
+        payload: dict[str, Any] = {
+            "ts_ns": time.monotonic_ns(),
+            "split": split_tag,
+        }
+        for k in _METRIC_SINK_KEYS:
+            val = result.get(k, 0)
+            if isinstance(val, bool):
+                payload[k] = int(val)
+            elif isinstance(val, (int, float)) and math.isfinite(float(val)):
+                payload[k] = val
+            else:
+                payload[k] = 0
+        line = json.dumps(payload, separators=(",", ":")) + "\n"
+        key = f"{raw_dir}::{os.getpid()}"
+        with _SINK_LOCK:
+            fobj = _SINK_FILES.get(key)
+            if fobj is None or fobj.closed:
+                fpath = dpath / f"routeA-metrics-{os.getpid()}.jsonl"
+                fobj = fpath.open("a", encoding="ascii", buffering=1)
+                _SINK_FILES[key] = fobj
+                weakref.finalize(fobj, fobj.close)
+            fobj.write(line)
+    except Exception:
+        return
+
+
+def summarize_metrics_window(
+    directory: str | Path,
+    start_ns: int,
+    end_ns: int,
+    *,
+    split: str = "train",
+) -> dict[str, Any]:
+    """Aggregate per-rollout numeric JSONL metrics within [start_ns, end_ns]."""
+    dpath = Path(directory)
+    if not dpath.is_dir() or dpath.is_symlink():
+        return {"n_rollouts": 0, "malformed_rows": 0, "metrics": {}}
+    matched: list[dict[str, Any]] = []
+    malformed = 0
+    for path in sorted(dpath.glob("routeA-metrics-*.jsonl")):
+        if path.is_symlink():
+            continue
+        try:
+            with path.open("r", encoding="ascii") as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        malformed += 1
+                        continue
+                    if not isinstance(row, dict) or not isinstance(row.get("ts_ns"), int):
+                        malformed += 1
+                        continue
+                    ts = row["ts_ns"]
+                    if start_ns <= ts <= end_ns and row.get("split") == split:
+                        matched.append(row)
+        except (OSError, UnicodeError):
+            malformed += 1
+    return {
+        "n_rollouts": len(matched),
+        "malformed_rows": malformed,
+        "metrics": summarize_step_metrics(matched),
     }
 
 
@@ -637,6 +907,14 @@ async def route_a_reward_func(
     num_climbs = int(
         kwargs.get("ladder_num_climbs", kwargs.get("num_climbs", DEFAULT_LADDER_CLIMBS))
     )
+    theta_scale = float(kwargs.get("theta_scale", DEFAULT_THETA_SCALE))
+    if not math.isfinite(theta_scale) or theta_scale <= 0.0:
+        raise ValueError(f"invalid theta_scale={theta_scale!r}; must be finite > 0")
+    metrics_dir = str(
+        kwargs.get("routeA_metrics_dir")
+        or os.environ.get("ROUTEA_STEP_METRICS_DIR", "")
+    )
+    split_tag = str(extra_info.get("split") or "unknown")
     batch_log_interval = (
         int(kwargs.get("batch_log_interval", 16))
         if bool(kwargs.get("enable_batch_logging", True))
@@ -652,7 +930,9 @@ async def route_a_reward_func(
         empty = _empty_route_a_reward(
             num_climbs=num_climbs,
             omit_teacher_turns=omit_teacher_turns,
+            theta_scale=theta_scale,
         )
+        _emit_step_metric_row(empty, split=split_tag, metrics_dir=metrics_dir)
         _record_and_maybe_log_batch(empty, interval=batch_log_interval)
         return empty
 
@@ -731,6 +1011,7 @@ async def route_a_reward_func(
 
     # Default telemetry values (populated if not gated).
     rasch_theta = 0.0
+    rasch_gain_g = 0.0
     rasch_valid = 0
     rasch_prior_pulled = 0
     rasch_all_correct = 0
@@ -809,9 +1090,10 @@ async def route_a_reward_func(
                 rasch_prior_pulled = int(est.prior_pulled)
                 rasch_all_correct = int(est.all_correct)
                 rasch_all_wrong = int(est.all_wrong)
-                gain = rasch_theta
+                gain = rasch_theta * theta_scale
+                rasch_gain_g = float(gain)
                 delta_solve = gain
-                delta_solve_raw = gain
+                delta_solve_raw = rasch_theta
                 post_solve_rate = est.n_correct / est.n_obs
             else:
                 # All climbs failed technically: invalid, no score awarded.
@@ -946,10 +1228,15 @@ async def route_a_reward_func(
         # Route A specific metrics
         "rasch_theta": float(rasch_theta),
         "rasch_theta_sq": float(rasch_theta * rasch_theta) if rasch_valid else 0.0,
+        "rasch_gain_g": float(rasch_gain_g),
+        "rasch_theta_scale": float(theta_scale),
         "rasch_valid": int(rasch_valid),
         "rasch_prior_pulled": int(rasch_prior_pulled),
         "rasch_all_correct": int(rasch_all_correct),
         "rasch_all_wrong": int(rasch_all_wrong),
+        "compliant_g_lt_neg02": int(
+            (not gated) and rasch_valid == 1 and rasch_gain_g < -0.2
+        ),
         "rasch_n_obs": int(rasch_n_obs),
         "ladder_num_variants": int(ladder_num_variants),
         "ladder_num_climbs": int(num_climbs),
@@ -987,5 +1274,6 @@ async def route_a_reward_func(
         result["grader_llm_unknown"],
         result["grader_tech_failed"],
     )
+    _emit_step_metric_row(result, split=split_tag, metrics_dir=metrics_dir)
     _record_and_maybe_log_batch(result, interval=batch_log_interval)
     return result
