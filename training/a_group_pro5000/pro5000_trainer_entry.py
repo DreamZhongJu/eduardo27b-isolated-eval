@@ -360,10 +360,48 @@ def bound_trainer(native):
 
         def _validate(self, merged=False):
             self.formal_validation = True
+            val_start_ns = time.monotonic_ns()
             try:
-                return super()._validate(merged=merged)
+                out = super()._validate(merged=merged)
             finally:
                 self.formal_validation = False
+            val_end_ns = time.monotonic_ns()
+            routea_metrics_dir = getattr(self, 'formal_routea_metrics_dir', None)
+            if routea_metrics_dir:
+                try:
+                    from training.routeA_reward.reward_function import summarize_metrics_window
+
+                    val_ra = summarize_metrics_window(
+                        routea_metrics_dir,
+                        val_start_ns,
+                        val_end_ns,
+                        split='val',
+                    )
+                    val_metrics = val_ra.get('metrics', {})
+                    t017_ref = T017_VAL_GATED_REF.get(int(self.global_steps))
+                    payload = {
+                        'step': int(self.global_steps),
+                        'wall_time': time.time(),
+                        'n_rollouts': int(val_ra.get('n_rollouts', 0)),
+                        'malformed_rows': int(val_ra.get('malformed_rows', 0)),
+                        'metrics': val_metrics,
+                        't017_val_gated_ref': t017_ref,
+                    }
+                    val_dir = self.formal_work / 'val-statistics'
+                    val_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    write_json(val_dir / f'{int(self.global_steps)}.json', payload)
+                    t017_str = f'{float(t017_ref):.2f}' if t017_ref is not None else 'N/A'
+                    print(
+                        f"[VAL step={self.global_steps}] n={payload['n_rollouts']} "
+                        f"reward={val_metrics.get('eduardo/routeA_reward_mean', 0.0):.3f} "
+                        f"theta={val_metrics.get('eduardo/routeA_theta_mean', 0.0):.3f} "
+                        f"gated={val_metrics.get('eduardo/routeA_gated_rate', 0.0):.3f} "
+                        f"(t017_ref={t017_str})",
+                        flush=True,
+                    )
+                except ImportError:
+                    pass
+            return out
 
         def _save_checkpoint(self):
             free = shutil.disk_usage(self.formal_work).free

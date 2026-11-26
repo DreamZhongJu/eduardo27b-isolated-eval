@@ -38,6 +38,7 @@ from training.routeA_train.prepare_parquet import (
     prepare_routea_parquets,
 )
 from training.routeA_train.stage2_routea_pilot import summarize_stage2_routea
+from training.routeA_train import stage3_routea_formal as s3f
 
 EXPECTED_HYBRID_SHA256 = (
     "7d2a5f46619218e92ed11efc4e7e07f190027ac0f1cca9336905c090ff62709a"
@@ -817,6 +818,155 @@ class RouteATrainStage1Tests(unittest.TestCase):
             self.assertFalse(bad_sum["gates_passed"])
             self.assertEqual(bad_sum["rc"], 4)
             self.assertFalse(any(bad_sum["per_gate"].values()))
+
+    def test_stage3_disk_floor_and_latest_run_lookup(self):
+        self.assertEqual(s3f.check_stage3_disk_floor(69_999_999_999, is_resume=False), (False, 70_000_000_000))
+        self.assertEqual(s3f.check_stage3_disk_floor(70_000_000_000, is_resume=False), (True, 70_000_000_000))
+        self.assertEqual(s3f.check_stage3_disk_floor(44_999_999_999, is_resume=True), (False, 45_000_000_000))
+        self.assertEqual(s3f.check_stage3_disk_floor(45_000_000_000, is_resume=True), (True, 45_000_000_000))
+
+        with tempfile.TemporaryDirectory() as td:
+            runs = Path(td)
+            # Ignores T-017 stage3_formal_* and Stage 2 pilot dirs
+            for dname in ("stage3_formal_20261120_000000", "t026_stage2_pilot_20261126_120239"):
+                d = runs / dname
+                d.mkdir()
+                (d / "run_meta.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                s3f.find_latest_routea_stage3_run(runs)
+
+            r1 = runs / "t026_stage3_formal_20261126_150000"
+            r2 = runs / "t026_stage3_formal_20261126_160000"
+            r1.mkdir()
+            (r1 / "run_meta.json").write_text("{}", encoding="utf-8")
+            (r2 / "checkpoints" / "global_step_5").mkdir(parents=True)
+            self.assertEqual(s3f.find_latest_routea_stage3_run(runs), r2)
+
+    def test_stage3_status_export_sha256_and_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            work = base / "runs" / "t026_stage3_formal_20261126_150000"
+            (work / "step-statistics").mkdir(parents=True)
+            (work / "val-statistics").mkdir(parents=True)
+            (work / "checkpoints" / "global_step_100").mkdir(parents=True)
+            (work / "ckpt-verified-100.json").write_text(json.dumps({"step": 100, "size_bytes": 20_700_000_000}))
+            (work / "run_meta.json").write_text(json.dumps({"total_steps": 100}))
+            (work / "step2-comparison.json").write_text(json.dumps({"passed": True, "ratios": {"update_actor": 0.99}}))
+
+            for step_num, sec, gated in ((1, 1180.0, 0.80), (25, 1220.0, 0.25), (100, 1210.0, 0.12)):
+                (work / "step-statistics" / f"{step_num}.json").write_text(
+                    json.dumps({
+                        "step": step_num,
+                        "metrics": {"timing_s/step": sec},
+                        "phase_timings": {
+                            "gen": {"minutes": 16.5},
+                            "old_log_prob": {"minutes": 0.6},
+                            "update_actor": {"minutes": 2.4},
+                        },
+                        "routeA_metrics": {
+                            "n_rollouts": 256,
+                            "metrics": {
+                                "eduardo/routeA_reward_mean": 0.15,
+                                "eduardo/routeA_theta_mean": 0.40,
+                                "eduardo/routeA_gated_rate": gated,
+                                "eduardo/routeA_grader_tech_failed_rate": 0.0,
+                            },
+                        },
+                        "routeA_gates": {
+                            "passed": True,
+                            "gated_ma5": gated,
+                            "t017_val_gated_ref": 0.23 if step_num == 25 else (0.08 if step_num == 100 else None),
+                        },
+                    }),
+                    encoding="utf-8",
+                )
+
+            (work / "val-statistics" / "25.json").write_text(
+                json.dumps({
+                    "step": 25,
+                    "n_rollouts": 1600,
+                    "t017_val_gated_ref": 0.23,
+                    "metrics": {
+                        "eduardo/routeA_reward_mean": 0.12,
+                        "eduardo/routeA_theta_mean": 0.35,
+                        "eduardo/routeA_gated_rate": 0.18,
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            status_txt = s3f.format_stage3_routea_status(
+                base, gpu_lines=["0, 48555 MiB, 73415 MiB, 98 %"], proc_lines=[]
+            )
+            self.assertIn("100 / 100", status_txt)
+            self.assertIn("global_step_100", status_txt)
+            self.assertIn("t017_ref=0.23", status_txt)
+            self.assertIn("reward=0.150", status_txt)
+
+            export_dir = work / "exports" / "step_100"
+            export_dir.mkdir(parents=True)
+            (export_dir / "config.json").write_text('{"architectures": ["Qwen3ForCausalLM"]}', encoding="utf-8")
+            (export_dir / "model.safetensors").write_bytes(b"fake-bf16-weights")
+            manifest = s3f.write_export_sha256_manifest(export_dir, work / "export_step100_sha256.txt")
+            self.assertEqual(manifest["file_count"], 2)
+            sha_lines = (work / "export_step100_sha256.txt").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(sha_lines), 2)
+            self.assertTrue(any(ln.endswith("  config.json") for ln in sha_lines))
+            self.assertTrue(any(ln.endswith("  model.safetensors") for ln in sha_lines))
+
+            with mock.patch("stage3_formal.verify_model_extra_checkpoint"):
+                kept = s3f.list_verified_checkpoints(work, work / "checkpoints", world_size=4)
+            summary = s3f.summarize_stage3_routea(
+                work=work,
+                layout={"mode": "8gpu", "judge_concurrency": 16, "grader_max_concurrency": 32},
+                total_steps=100,
+                final_info={"size_gb": 20.72},
+                export_info={"shards": 1, "size_gb": 8.0},
+                export_manifest=manifest,
+                ckpt_kept=kept,
+                shm_preserved=True,
+            )
+            self.assertEqual(summary["status"], "STAGE3_FORMAL_DONE")
+            self.assertEqual(summary["steps_completed"], 100)
+            self.assertEqual(summary["checkpoints_kept"], [100])
+            self.assertTrue(summary["shm_models_preserved"])
+            self.assertIn("25", summary["val_statistics"])
+            self.assertTrue((work / "stage3_summary.json").is_file())
+
+    def test_stage3_check_only_disk_floor_main(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "data" / "routeA_t026").mkdir(parents=True)
+            (base / "tmp").mkdir(parents=True)
+            (base / "models").mkdir(parents=True)
+            (base / "source" / "EduardoRL").mkdir(parents=True)
+            run_dir = base / "runs" / "t026_stage3_formal_20261126_150000"
+            (run_dir / "checkpoints" / "global_step_10").mkdir(parents=True)
+            (run_dir / "run_meta.json").write_text(json.dumps({"layout": {"judge_concurrency": 16, "grader_max_concurrency": 32}}))
+
+            disk_65g = SimpleNamespace(total=200 * 10**9, used=135 * 10**9, free=65 * 10**9)
+            with (
+                mock.patch("training.routeA_train.stage3_routea_formal.verify_routea_prereqs", return_value={"ok": True}),
+                mock.patch("training.routeA_train.stage3_routea_formal.shutil.disk_usage", return_value=disk_65g),
+            ):
+                # Fresh run needs >= 70 GB -> exits with 3
+                with mock.patch.object(sys, "argv", ["stage3_routea_formal.py", "--base", str(base), "--check-only"]):
+                    self.assertEqual(s3f.main(), 3)
+
+                # Resume run needs >= 45 GB -> 65 GB passes disk check and completes --check-only cleanly
+                with (
+                    mock.patch("training.routeA_train.stage3_routea_formal.verify_model_dir", side_effect=lambda _, p: p),
+                    mock.patch("training.routeA_train.stage3_routea_formal.find_local_model", side_effect=lambda root, default, _: default),
+                    mock.patch("training.routeA_train.stage3_routea_formal.ensure_eduardo_repo", return_value=base / "source" / "EduardoRL"),
+                    mock.patch("training.routeA_train.stage3_routea_formal.prepare_resume_checkpoint", return_value=10),
+                    mock.patch("training.routeA_train.stage3_routea_formal.pick_free_ports", return_value=[18861, 18862, 18871, 18872, 18873]),
+                    mock.patch("training.routeA_train.stage3_routea_formal.write_interaction_yaml", return_value=base / "interaction.yaml"),
+                    mock.patch("training.routeA_train.stage3_routea_formal.write_access_log_config", return_value=base / "access.json"),
+                    mock.patch("training.routeA_train.stage3_routea_formal.pcfg.build_overrides", return_value=["+x=1"]),
+                    mock.patch("training.routeA_train.stage3_routea_formal.pcfg.run_preflight"),
+                    mock.patch.object(sys, "argv", ["stage3_routea_formal.py", "--base", str(base), "--resume", "--check-only"]),
+                ):
+                    self.assertEqual(s3f.main(), 0)
 
 
 if __name__ == "__main__":
