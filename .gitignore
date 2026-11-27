@@ -160,6 +160,8 @@
 !/routeC_data/SHA256SUMS
 !/routeC_data/routeC-t031-kit-v1.zip
 !/routeC_data/routeC-t031-kit-v1.zip.sha256
+!/routeC_data/routeC-t031-kit-v2.zip
+!/routeC_data/routeC-t031-kit-v2.zip.sha256
 !/tests/
 /tests/*
 !/tests/test_routeA_data.py

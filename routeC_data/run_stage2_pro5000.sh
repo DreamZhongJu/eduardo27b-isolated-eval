@@ -144,10 +144,10 @@ bash "${HERE_DIR}/preflight_stage2_pro5000.sh" "${MEASURED_JSONL}" "${EXPECTED_S
 echo "ok" > "${RUN_DIR}/preflight_ok.flag"
 
 if [ ! -f "${RUN_DIR}/gpu_phase_done.flag" ]; then
-  echo "=== [2/3] Selecting 3-4 Idle GPUs (Judge TP=2 + Student DP=1..2) ==="
+  echo "=== [2/3] Selecting 4 Idle GPUs (Judge TP=2 + Student DP=2) ==="
   GPU_JSON="${RUN_DIR}/selected_gpus.json"
   "${PYTHON_BIN}" -B "${CODE_ROOT}/routeA_data/gpu_wait_pro5000.py" \
-    --num-gpus 4 --fallback-min-gpus 3 --min-free-mib 70000 \
+    --num-gpus 4 --fallback-min-gpus 4 --min-free-mib 70000 \
     --confirm-seconds 5 --poll-seconds "${POLL_SECONDS}" \
     --out-json "${GPU_JSON}"
 

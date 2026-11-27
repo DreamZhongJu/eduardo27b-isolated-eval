@@ -1,19 +1,20 @@
-"""Unit tests for T-031 Route C data pipeline (Card v1 / Inbox #1), using fake data ONLY.
+"""Unit tests for T-031 Route C data pipeline (Card v1 / Inbox #2), using fake data ONLY.
 
 Runnable via BOTH `python -m unittest discover -s tests` (Pro 5000 pro5000-fast)
 and `pytest` (cu04).
 
 Covers:
-1. `routeC_inventory.py`:
-   - Exact (tau, margin) routing counts, `total_usable`, `gap_vs_1600`, `easy_total + hard_total == N`.
-   - Boundary cases for hard-branch floor (`<= 1/16`) and easy-branch ceiling (`>= 15/16`).
-   - Cross-tab by source direction (`easier / mixed / harder`) and variant `generation_tier`.
-   - Hard rejection on SHA-256 mismatch or invalid pretest values.
-   - Stage 2 mode (`--source-pretest-jsonl`) replacing old `p_orig` with newly measured `p_orig`.
+1. `routeC_inventory.py` (Inbox #2 rules):
+   - T-026 ceiling group filtering on train only (dev preserved).
+   - 3-way routing (`easy_routed`, `hard_routed`, `fallback_routeA`) summing to `n_sources`.
+   - Decision 4: hard branch picks the variant with `delta_b <= -m` that has maximum `b` (closest to original).
+   - Decision 2: hard-branch floor requires `orig` AND all untaught variants to ALL be `<= 1/16`.
+   - Hard-branch post-test ladder level distribution (`1 / 2 / 3+`) summing to `hard_routed`.
+   - Branch switching (`old_hard->new_easy`, `old_easy->new_hard`) and 3-state transitions when Stage 2 `source_pretest_jsonl` is provided.
+   - SHA-256 mismatch rejection.
 2. `stage2_source_runner.py`:
    - End-to-end synthetic GPU + summarize phase: rule pass skips 27B, rule fail calls 27B,
      `unknown` counts as incorrect, >1% technical failure gate aborts, `--resume` skips completed items.
-   - Correlation and mean-difference calculations vs old `pre_solve_rate`.
    - Zero leakage check: unique sentinel problem/answer/response strings NEVER appear in stdout,
      `source_pretest_measured.jsonl`, `stage2_summary.*`, `stage2_manifest.json`, or `inventory_summary.*`.
 """
@@ -52,8 +53,7 @@ from routeA_data.hybrid_grader_caller import TechnicalFailureGateError
 from routeA_data.rasch_ladder import compute_smoothed_p_and_b
 from routeC_data.routeC_inventory import (
     compute_inventory,
-    compute_source_pretest_table_sha256,
-    format_inventory_report,
+    is_t026_ceiling_group,
     run_inventory,
 )
 from routeC_data.stage2_source_runner import (
@@ -126,74 +126,116 @@ def _fake_resp(text: str, finish: str = "stop") -> Any:
 
 class TestRouteCInventory(unittest.TestCase):
     def _build_synthetic_rows(self) -> List[Dict[str, Any]]:
-        # Construct 6 fake sources covering easy/hard branches, floor, ceiling, and margins:
-        # S1 (train, hard): old=1/16 (p=0.0882, b=+2.335), var=8/16 (b=0.0 -> delta_b=-2.335 <= -1.0) -> hard_usable & floor!
-        # S2 (train, hard): old=2/16 (p=0.1471, b=+1.758), var=4/16 (b=+1.022 -> delta_b=-0.736: usable at m=0.5, NOT m=1.0; NOT floor)
-        # S3 (train, mid):  old=5/16 (p=0.3235, b=+0.738), var=2/16 (b=+1.758 -> delta_b=+1.020) -> easy at tau=0.3 (usable m=0.5,1.0), hard at tau>=0.4 (not usable)
-        # S4 (train, easy): old=16/16 (p=0.9706, b=-3.497), var=15/16 (b=-2.335 -> delta_b=+1.161 >= 1.0) -> easy_usable & CEILING (15/16)!
-        # S5 (train, easy): old=16/16 (p=0.9706, b=-3.497), vars=[15/16 (db=+1.161), 14/16 (db=+1.758)] -> easy_usable & NOT ceiling (has 14/16)!
-        # S6 (dev, easy):   old=10/16 (p=0.6176, b=-0.479), var=7/16 (b=+0.236 -> delta_b=+0.715) -> easy at all taus, usable at m=0.5, NOT m=1.0
+        # S1 (train, hard): orig=1/16 (floor), vars=[8/16 (self), 1/16 (paper)]
+        #    -> hard_routed, taught=8/16, rem=[1/16] -> level=2, whole post-test ladder <= 1/16 -> LADDER FLOOR!
+        # S2 (train, hard): orig=1/16 (floor), vars=[10/16 (paper, b=-0.479), 5/16 (self, b=+0.738), 3/16 (paper, b=+1.358)]
+        #    -> delta_b(orig=2.335): 10/16(-2.814), 5/16(-1.598), 3/16(-0.977)
+        #    -> at m=0.5: taught=3/16 (max b, paper_transfer), rem=[10/16, 5/16] -> level=3+, NOT ladder floor!
+        #    -> at m=1.0: taught=5/16 (max b in <=-1.0, self_generated), rem=[10/16, 3/16] -> level=3+, NOT ladder floor!
+        # S3 (train, hard): orig=2/16 (not floor), var=[4/16] (db=-0.736) -> hard_routed at m=0.5 (level=1), fallback at m=1.0!
+        # S4 (train, ceiling): orig=16/16, var=[15/16] -> T-026 train ceiling REMOVED from train_t026!
+        # S5 (train, easy): orig=16/16, vars=[15/16, 14/16] -> NOT ceiling, easy_routed!
+        # S6 (train, mid): orig=6/16 (p=0.3824), var=[6/16] (db=0) -> always fallback_routeA!
+        # S7 (dev, ceiling): orig=16/16, var=[15/16] -> dev is NOT removed, easy_routed (ceil=1)!
         return [
-            _make_source_row("S1", "train", "easier", 1, [_make_variant("V1", 8, generation_tier="easier")]),
-            _make_source_row("S2", "train", "easier", 2, [_make_variant("V2", 4, generation_tier="easier")]),
-            _make_source_row("S3", "train", "mixed", 5, [_make_variant("V3", 2, generation_tier="nearby")]),
-            _make_source_row("S4", "train", "harder", 16, [_make_variant("V4", 15, generation_tier="harder")]),
+            _make_source_row(
+                "S1",
+                "train",
+                "easier",
+                1,
+                [
+                    _make_variant("V1a", 8, origin="self_generated", generation_tier="easier"),
+                    _make_variant("V1b", 1, origin="paper_transfer", generation_tier="paper_transfer"),
+                ],
+            ),
+            _make_source_row(
+                "S2",
+                "train",
+                "easier",
+                1,
+                [
+                    _make_variant("V2a", 10, origin="paper_transfer", generation_tier="paper_transfer"),
+                    _make_variant("V2b", 5, origin="self_generated", generation_tier="easier"),
+                    _make_variant("V2c", 3, origin="paper_transfer", generation_tier="paper_transfer"),
+                ],
+            ),
+            _make_source_row(
+                "S3",
+                "train",
+                "easier",
+                2,
+                [_make_variant("V3a", 4, origin="self_generated", generation_tier="easier")],
+            ),
+            _make_source_row(
+                "S4",
+                "train",
+                "harder",
+                16,
+                [_make_variant("V4a", 15, origin="self_generated", generation_tier="harder")],
+            ),
             _make_source_row(
                 "S5",
                 "train",
                 "harder",
                 16,
                 [
-                    _make_variant("V5a", 15, generation_tier="harder"),
+                    _make_variant("V5a", 15, origin="self_generated", generation_tier="harder"),
                     _make_variant("V5b", 14, origin="paper_transfer", generation_tier="paper_transfer"),
                 ],
             ),
-            _make_source_row("S6", "dev", "harder", 10, [_make_variant("V6", 7, generation_tier="harder")]),
+            _make_source_row(
+                "S6",
+                "train",
+                "mixed",
+                6,
+                [_make_variant("V6a", 6, origin="self_generated", generation_tier="nearby")],
+            ),
+            _make_source_row(
+                "S7",
+                "dev",
+                "harder",
+                16,
+                [_make_variant("V7a", 15, origin="self_generated", generation_tier="harder")],
+            ),
         ]
 
-    def test_routing_counts_floor_ceiling_and_crosstab(self) -> None:
+    def test_inbox2_t026_pool_taught_closest_ladder_floor_and_levels(self) -> None:
         rows = self._build_synthetic_rows()
-        summary, old_sha = compute_inventory(rows)
-        self.assertEqual(summary["n_sources"], 6)
-        self.assertEqual(summary["n_train"], 5)
-        self.assertEqual(summary["n_dev"], 1)
-        self.assertEqual(summary["n_variants"], 7)
-        self.assertEqual(len(old_sha), 64)
+        self.assertTrue(is_t026_ceiling_group(rows[3]["variants"]))
+        self.assertFalse(is_t026_ceiling_group(rows[4]["variants"]))
 
-        all_tbl = {(r["tau"], r["margin"]): r for r in summary["routing_tables"]["all"]}
-        for (tau, m), rec in all_tbl.items():
-            self.assertEqual(rec["easy_total"] + rec["hard_total"], 6)
-            self.assertEqual(rec["total_usable"], rec["easy_usable"] + rec["hard_usable"])
-            self.assertEqual(rec["gap_vs_1600"], rec["total_usable"] - 1600)
+        summary, _ = compute_inventory(rows)
+        pc = summary["pool_counts"]
+        self.assertEqual(pc["train_t026_sources"], 5)  # S4 removed
+        self.assertEqual(pc["removed_train_ceiling_sources"], 1)
+        self.assertEqual(pc["dev_sources"], 1)  # S7 kept
+        self.assertEqual(pc["t026_pool_sources"], 6)
+        self.assertEqual(pc["all_2100_sources"], 7)
 
-        # At tau=0.3, m=0.5: hard={S1,S2} (both usable, S1 floor=1); easy={S3,S4,S5,S6} (all 4 usable, S4 ceil=1)
-        r_03_05 = all_tbl[(0.3, 0.5)]
-        self.assertEqual(r_03_05["hard_total"], 2)
-        self.assertEqual(r_03_05["hard_usable"], 2)
-        self.assertEqual(r_03_05["hard_usable_orig_floor_le_1_16"], 1)
-        self.assertEqual(r_03_05["easy_total"], 4)
-        self.assertEqual(r_03_05["easy_usable"], 4)
-        self.assertEqual(r_03_05["easy_usable_all_qualifying_harder_ceil_ge_15_16"], 1)
-        self.assertEqual(r_03_05["total_usable"], 6)
-        self.assertEqual(r_03_05["usable_excl_floor_and_ceil"], 4)
+        tbl = {(r["tau"], r["margin"]): r for r in summary["routing_tables"]["train_t026"]}
+        # At tau=0.4, m=0.5:
+        #   S1,S2,S3 -> hard_routed=3 (S1 ladder_floor=1, S2 not floor; levels: S3=1, S1=2, S2=3+;
+        #     taught origins: S1=self, S2(3/16)=paper, S3=self -> self:2, paper:1)
+        #   S5 -> easy_routed=1 (ceil=0)
+        #   S6 -> fallback_routeA=1 (hard_fallback=1)
+        r04_05 = tbl[(0.4, 0.5)]
+        self.assertEqual(r04_05["hard_routed"], 3)
+        self.assertEqual(r04_05["easy_routed"], 1)
+        self.assertEqual(r04_05["fallback_routeA"], 1)
+        self.assertEqual(r04_05["hard_routed_orig_only_floor_le_1_16"], 2)  # S1 and S2 orig <= 1/16
+        self.assertEqual(r04_05["hard_routed_ladder_floor_le_1_16"], 1)  # only S1 has whole ladder <= 1/16
+        self.assertEqual(r04_05["hard_routed_posttest_levels"], {"1": 1, "2": 1, "3+": 1})
+        self.assertEqual(r04_05["hard_routed_taught_origin"], {"paper_transfer": 1, "self_generated": 2})
 
-        # At tau=0.4, m=1.0: hard={S1,S2,S3} (only S1 usable); easy={S4,S5,S6} (S4,S5 usable; S6 db=0.715 < 1.0)
-        r_04_10 = all_tbl[(0.4, 1.0)]
-        self.assertEqual(r_04_10["hard_total"], 3)
-        self.assertEqual(r_04_10["hard_usable"], 1)
-        self.assertEqual(r_04_10["easy_total"], 3)
-        self.assertEqual(r_04_10["easy_usable"], 2)
-        self.assertEqual(r_04_10["easy_usable_all_qualifying_harder_ceil_ge_15_16"], 1)
-        self.assertEqual(r_04_10["total_usable"], 3)
+        # At tau=0.4, m=1.0:
+        #   S2 picks 5/16 (self_generated) instead of 3/16 (db=-0.977 > -1.0)
+        #   S3 falls back to Route A
+        r04_10 = tbl[(0.4, 1.0)]
+        self.assertEqual(r04_10["hard_routed"], 2)
+        self.assertEqual(r04_10["fallback_routeA"], 2)
+        self.assertEqual(r04_10["hard_routed_taught_origin"], {"self_generated": 2})
 
-        # Cross-tab checks
-        ct = summary["direction_crosstab"]["by_source_direction_all_variants"]
-        self.assertEqual(ct["easier"]["n_variants"], 2)
-        self.assertEqual(ct["easier"]["matched_strict_count"], 2)
-        self.assertEqual(ct["harder"]["n_variants"], 4)
-        self.assertEqual(ct["harder"]["matched_strict_count"], 4)
-
-    def test_sha256_mismatch_rejected_and_stage2_source_override_works(self) -> None:
+    def test_sha256_mismatch_and_stage2_branch_switching(self) -> None:
         rows = self._build_synthetic_rows()
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -208,20 +250,16 @@ class TestRouteCInventory(unittest.TestCase):
                     allow_custom_sha256=False,
                 )
 
-            # Stage 1 mode with custom sha allowed
-            s1_dir = tmp / "s1"
-            s1_sum = run_inventory(measured_jsonl=mpath, out_dir=s1_dir, allow_custom_sha256=True)
-            self.assertEqual(s1_sum["mode"], "stage1_preliminary_old_pretest")
-
-            # Stage 2 mode: override S1 from 1/16 -> 12/16, so S1 moves to easy branch at tau=0.4!
+            # Stage 2 pretest flips S1 (1/16 -> 12/16, hard->easy) and S5 (16/16 -> 2/16, easy->hard)
             sp_path = tmp / "source_pretest.jsonl"
             sp_rows = [
                 {"source_id": "S1", "n_correct_hybrid": 12, "n_scored": 16},
-                {"source_id": "S2", "n_correct_hybrid": 2, "n_scored": 16},
-                {"source_id": "S3", "n_correct_hybrid": 5, "n_scored": 16},
+                {"source_id": "S2", "n_correct_hybrid": 1, "n_scored": 16},
+                {"source_id": "S3", "n_correct_hybrid": 2, "n_scored": 16},
                 {"source_id": "S4", "n_correct_hybrid": 16, "n_scored": 16},
-                {"source_id": "S5", "n_correct_hybrid": 16, "n_scored": 16},
-                {"source_id": "S6", "n_correct_hybrid": 10, "n_scored": 16},
+                {"source_id": "S5", "n_correct_hybrid": 2, "n_scored": 16},
+                {"source_id": "S6", "n_correct_hybrid": 6, "n_scored": 16},
+                {"source_id": "S7", "n_correct_hybrid": 16, "n_scored": 16},
             ]
             sp_path.write_text("".join(json.dumps(r) + "\n" for r in sp_rows), encoding="utf-8")
             s2_dir = tmp / "s2"
@@ -232,10 +270,14 @@ class TestRouteCInventory(unittest.TestCase):
                 allow_custom_sha256=True,
             )
             self.assertEqual(s2_sum["mode"], "stage2_final")
-            tbl = {(r["tau"], r["margin"]): r for r in s2_sum["routing_tables"]["all"]}
-            # S1 is now 12/16 >= 0.4, with variant 8/16 (delta_b > 0.5), so easy_total=4 at tau=0.4!
-            self.assertEqual(tbl[(0.4, 0.5)]["easy_total"], 4)
-            self.assertEqual(tbl[(0.4, 0.5)]["hard_total"], 2)
+            sw_tau04 = next(
+                x
+                for x in s2_sum["switching_stats"]["train_t026"]["by_tau_branch_switch"]
+                if abs(x["tau"] - 0.4) < 1e-9
+            )
+            self.assertEqual(sw_tau04["old_hard_to_new_easy"], 1)  # S1
+            self.assertEqual(sw_tau04["old_easy_to_new_hard"], 1)  # S5
+            self.assertEqual(sw_tau04["total_branch_switched"], 2)
 
 
 class TestStage2SourceRunner(unittest.TestCase):
@@ -250,7 +292,7 @@ class TestStage2SourceRunner(unittest.TestCase):
                 "split": "train",
                 "direction": "easier",
                 "source_problem": f"{sentinel_prob}_A",
-                "source_answer": f"10",
+                "source_answer": "10",
                 "source_pre_solve_rate_old": 4 / 16.0,
                 "variants": [_make_variant("VA1", 8, generation_tier="easier")],
             },
@@ -273,11 +315,9 @@ class TestStage2SourceRunner(unittest.TestCase):
             stu_calls += 1
             prompt = kwargs["messages"][0]["content"]
             if "_A" in prompt:
-                # 1st half hit rule \boxed{10}, 2nd half non-boxed equivalent "ten" (goes to 27B)
                 if stu_calls % 2 == 0:
                     return _fake_resp(f"{sentinel_resp} \\boxed{{10}}")
                 return _fake_resp(f"{sentinel_resp} answer is ten")
-            # For SRC_B, answer is sentinel_ans: return non-boxed half the time, ambiguous half the time
             if stu_calls % 4 == 0:
                 return _fake_resp(f"{sentinel_resp} ambiguous")
             return _fake_resp(f"{sentinel_resp} \\boxed{{{sentinel_ans}}}")
@@ -288,7 +328,7 @@ class TestStage2SourceRunner(unittest.TestCase):
             u = kwargs["messages"][1]["content"]
             if "answer is ten" in u:
                 return _fake_resp('{"correct": true}')
-            return _fake_resp('{"correct": null}')  # unknown -> counted as wrong
+            return _fake_resp('{"correct": null}')
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -318,7 +358,6 @@ class TestStage2SourceRunner(unittest.TestCase):
                 self.assertGreater(stats1["llm_calls"], 0)
                 self.assertGreater(stats1["llm_unknown"], 0)
 
-                # Resume should make 0 additional student or judge calls
                 prev_stu, prev_llm = stu_calls, llm_calls
                 stats2 = asyncio.run(
                     run_gpu_phase(
@@ -351,8 +390,8 @@ class TestStage2SourceRunner(unittest.TestCase):
             self.assertGreater(summary["counts"]["n_unknown"], 0)
             self.assertIn("vs_old_pre_solve_rate", summary)
             self.assertEqual(summary["final_inventory"]["mode"], "stage2_final")
+            self.assertIn("switching_stats", summary["final_inventory"])
 
-            # Strict zero-leakage check across stdout and all public/summary outputs
             artifacts_to_scan = [
                 buf.getvalue(),
                 (run_dir / "source_pretest_measured.jsonl").read_text(encoding="utf-8"),
@@ -367,7 +406,6 @@ class TestStage2SourceRunner(unittest.TestCase):
                     self.assertNotIn(tok, blob)
 
     def test_technical_failure_gate_aborts_above_1_percent(self) -> None:
-        # 15 sources x 16 = 240 rollouts; make all student calls fail -> triggers >1% gate after min_samples=200
         rows = [
             _make_source_row(f"S{i}", "train", "easier", 2, [_make_variant(f"V{i}", 4)])
             for i in range(15)

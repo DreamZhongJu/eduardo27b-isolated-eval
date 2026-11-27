@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Route C difficulty-routing inventory (T-031 Stage 1 preliminary & Stage 2 final).
+"""Route C difficulty-routing inventory (T-031 Stage 1 & Stage 2, Card v1 / Inbox #2).
+
+Inbox #2 rules implemented here:
+1. Floor problems are NOT excluded — only reported separately.
+2. Hard-branch floor looks at the ENTIRE post-test ladder:
+   `orig` + all remaining variants other than `v_taught` are ALL <= 1/16.
+3. Unroutable sources fall back to Route A (teach orig, post-test all variants).
+   Main pool matches T-026: `train` after removing ceiling groups (`1,895` in T-026)
+   plus `dev` (`100`) = `1,995`, alongside `all_2100` for card-level verification.
+4. Hard branch teaches the variant with `delta_b <= -m` that is CLOSEST to the
+   original problem (i.e. maximum `b_var`).
+5. When `source_pretest_jsonl` is provided (Stage 2), also reports old-vs-new
+   branch switching counts and 3-state route transitions.
 
 PRIVACY GUARANTEE:
-- Reads `routeA_stage2_measured.jsonl` (and optional `source_pretest_measured.jsonl`)
-  in-memory only for numerical computations.
 - Never prints or writes problem statements, reference answers, or student responses.
 """
 from __future__ import annotations
@@ -12,7 +22,6 @@ import argparse
 import collections
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -31,7 +40,7 @@ EXPECTED_OLD_SOURCE_PRETEST_TABLE_SHA256 = (
 )
 DEFAULT_TAUS: Tuple[float, ...] = (0.3, 0.4, 0.5, 0.6)
 DEFAULT_MARGINS: Tuple[float, ...] = (0.5, 1.0)
-TARGET_ROUTE_C_SOURCES = 1600
+CEILING_MIN_CORRECT = 15
 
 
 def sha256_file(path: Path) -> str:
@@ -48,6 +57,13 @@ def compute_source_pretest_table_sha256(rows: Sequence[Tuple[str, int, int]]) ->
         for sid, nc, ns in sorted(rows, key=lambda x: x[0])
     ]
     return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+
+
+def is_t026_ceiling_group(variants: Sequence[Dict[str, Any]]) -> bool:
+    """Return True iff every variant in the source group has n_correct_hybrid >= 15."""
+    if not variants:
+        return False
+    return all(int(v["n_correct_hybrid"]) >= CEILING_MIN_CORRECT for v in variants)
 
 
 def _median(vals: Sequence[float]) -> Optional[float]:
@@ -92,73 +108,178 @@ def _load_source_pretest_map(
     return out, actual_sha
 
 
+def _classify_route_state(
+    it: Dict[str, Any],
+    tau: float,
+    margin: float,
+    *,
+    use_old: bool = False,
+) -> str:
+    p_orig = float(it["old_p_orig"] if use_old else it["p_orig"])
+    b_orig = float(it["old_b_orig"] if use_old else it["b_orig"])
+    variants = it["variants"]
+    if p_orig >= tau:
+        if any((float(v["b_var"]) - b_orig) >= margin for v in variants):
+            return "easy_routed"
+        return "fallback_routeA"
+    if any((float(v["b_var"]) - b_orig) <= -margin for v in variants):
+        return "hard_routed"
+    return "fallback_routeA"
+
+
 def _evaluate_tau_margin(
     items: Sequence[Dict[str, Any]],
     tau: float,
     margin: float,
-    target_total: int = TARGET_ROUTE_C_SOURCES,
 ) -> Dict[str, Any]:
-    easy_total = 0
-    easy_usable = 0
-    easy_usable_all_qual_ceil = 0
-    easy_all_strict_harder_ceil = 0
+    easy_routed = 0
+    easy_routed_ceil = 0
+    easy_fallback_routeA = 0
 
-    hard_total = 0
-    hard_usable = 0
-    hard_usable_orig_floor = 0
-    hard_all_orig_floor = 0
+    hard_routed = 0
+    hard_routed_ladder_floor = 0
+    hard_routed_orig_only_floor = 0
+    hard_fallback_routeA = 0
+
+    level_1 = 0
+    level_2 = 0
+    level_3plus = 0
+    taught_origin_counts: collections.Counter[str] = collections.Counter()
+    taught_delta_bs: List[float] = []
 
     for it in items:
         p_orig = float(it["p_orig"])
-        n_orig = int(it["n_orig"])
-        n_orig_scored = int(it["n_orig_scored"])
-        is_orig_floor = (n_orig / n_orig_scored) <= (1.0 / 16.0 + 1e-9)
-
+        is_orig_floor = (it["n_orig"] / it["n_orig_scored"]) <= (1.0 / 16.0 + 1e-9)
         variants = it["variants"]
-        if p_orig < tau:
-            hard_total += 1
-            if is_orig_floor:
-                hard_all_orig_floor += 1
-            qualifying = [v for v in variants if v["delta_b"] <= -margin]
-            if qualifying:
-                hard_usable += 1
-                if is_orig_floor:
-                    hard_usable_orig_floor += 1
-        else:
-            easy_total += 1
-            strictly_harder = [v for v in variants if v["delta_b"] > 0.0]
-            if strictly_harder and all(v["is_ceil_ge_15_16"] for v in strictly_harder):
-                easy_all_strict_harder_ceil += 1
+
+        if p_orig >= tau:
             qualifying = [v for v in variants if v["delta_b"] >= margin]
             if qualifying:
-                easy_usable += 1
+                easy_routed += 1
                 if all(v["is_ceil_ge_15_16"] for v in qualifying):
-                    easy_usable_all_qual_ceil += 1
+                    easy_routed_ceil += 1
+            else:
+                easy_fallback_routeA += 1
+        else:
+            qualifying_pairs = [
+                (idx, v) for idx, v in enumerate(variants) if v["delta_b"] <= -margin
+            ]
+            if qualifying_pairs:
+                hard_routed += 1
+                # Decision 4: pick the variant in delta_b <= -m closest to original (max b_var).
+                taught_idx, v_taught = min(
+                    qualifying_pairs,
+                    key=lambda pair: (-float(pair[1]["b_var"]), str(pair[1]["variant_id"]), pair[0]),
+                )
+                taught_origin_counts[str(v_taught["origin"])] += 1
+                taught_delta_bs.append(float(v_taught["delta_b"]))
 
-    total_sources = easy_total + hard_total
-    assert total_sources == len(items)
-    total_usable = easy_usable + hard_usable
-    usable_excl_floor_and_ceil = (
-        (easy_usable - easy_usable_all_qual_ceil)
-        + (hard_usable - hard_usable_orig_floor)
-    )
+                rem_vars = [v for idx, v in enumerate(variants) if idx != taught_idx]
+                n_levels = 1 + len(rem_vars)
+                if n_levels == 1:
+                    level_1 += 1
+                elif n_levels == 2:
+                    level_2 += 1
+                else:
+                    level_3plus += 1
+
+                # Decision 2: entire post-test ladder (orig + all untaught variants) <= 1/16
+                if is_orig_floor:
+                    hard_routed_orig_only_floor += 1
+                    if all(v["is_floor_le_1_16"] for v in rem_vars):
+                        hard_routed_ladder_floor += 1
+            else:
+                hard_fallback_routeA += 1
+
+    n_sources = len(items)
+    fallback_routeA = easy_fallback_routeA + hard_fallback_routeA
+    assert easy_routed + hard_routed + fallback_routeA == n_sources
+    assert level_1 + level_2 + level_3plus == hard_routed
+
     return {
         "tau": tau,
         "margin": margin,
-        "n_sources": total_sources,
-        "easy_total": easy_total,
-        "easy_usable": easy_usable,
-        "easy_usable_all_qualifying_harder_ceil_ge_15_16": easy_usable_all_qual_ceil,
-        "easy_all_strictly_harder_ceil_ge_15_16": easy_all_strict_harder_ceil,
-        "hard_total": hard_total,
-        "hard_usable": hard_usable,
-        "hard_usable_orig_floor_le_1_16": hard_usable_orig_floor,
-        "hard_all_orig_floor_le_1_16": hard_all_orig_floor,
-        "total_usable": total_usable,
-        "gap_vs_1600": total_usable - target_total,
-        "usable_excl_floor_and_ceil": usable_excl_floor_and_ceil,
-        "gap_excl_floor_and_ceil_vs_1600": usable_excl_floor_and_ceil - target_total,
+        "n_sources": n_sources,
+        "easy_routed": easy_routed,
+        "easy_routed_all_qualifying_harder_ceil_ge_15_16": easy_routed_ceil,
+        "hard_routed": hard_routed,
+        "hard_routed_ladder_floor_le_1_16": hard_routed_ladder_floor,
+        "hard_routed_orig_only_floor_le_1_16": hard_routed_orig_only_floor,
+        "fallback_routeA": fallback_routeA,
+        "easy_fallback_routeA": easy_fallback_routeA,
+        "hard_fallback_routeA": hard_fallback_routeA,
+        "hard_routed_posttest_levels": {
+            "1": level_1,
+            "2": level_2,
+            "3+": level_3plus,
+        },
+        "hard_routed_taught_origin": dict(sorted(taught_origin_counts.items())),
+        "hard_routed_taught_mean_delta_b": round(sum(taught_delta_bs) / len(taught_delta_bs), 6)
+        if taught_delta_bs
+        else None,
     }
+
+
+def _compute_switching_stats(
+    items: Sequence[Dict[str, Any]],
+    taus: Sequence[float],
+    margins: Sequence[float],
+) -> Optional[Dict[str, Any]]:
+    if not items or any(it.get("old_p_orig") is None for it in items):
+        return None
+
+    by_tau: List[Dict[str, Any]] = []
+    for tau in taus:
+        old_hard_new_easy = 0
+        old_easy_new_hard = 0
+        stayed_hard = 0
+        stayed_easy = 0
+        for it in items:
+            old_hard = float(it["old_p_orig"]) < tau
+            new_hard = float(it["p_orig"]) < tau
+            if old_hard and not new_hard:
+                old_hard_new_easy += 1
+            elif (not old_hard) and new_hard:
+                old_easy_new_hard += 1
+            elif old_hard and new_hard:
+                stayed_hard += 1
+            else:
+                stayed_easy += 1
+        assert old_hard_new_easy + old_easy_new_hard + stayed_hard + stayed_easy == len(items)
+        by_tau.append(
+            {
+                "tau": float(tau),
+                "n_sources": len(items),
+                "old_hard_to_new_easy": old_hard_new_easy,
+                "old_easy_to_new_hard": old_easy_new_hard,
+                "total_branch_switched": old_hard_new_easy + old_easy_new_hard,
+                "stayed_hard": stayed_hard,
+                "stayed_easy": stayed_easy,
+            }
+        )
+
+    by_tau_margin: List[Dict[str, Any]] = []
+    for tau in taus:
+        for margin in margins:
+            trans: collections.Counter[str] = collections.Counter()
+            switched = 0
+            for it in items:
+                s_old = _classify_route_state(it, float(tau), float(margin), use_old=True)
+                s_new = _classify_route_state(it, float(tau), float(margin), use_old=False)
+                trans[f"{s_old}->{s_new}"] += 1
+                if s_old != s_new:
+                    switched += 1
+            by_tau_margin.append(
+                {
+                    "tau": float(tau),
+                    "margin": float(margin),
+                    "n_sources": len(items),
+                    "total_route_switched": switched,
+                    "transitions": dict(sorted(trans.items())),
+                }
+            )
+
+    return {"by_tau_branch_switch": by_tau, "by_tau_margin_route_switch": by_tau_margin}
 
 
 def _summarize_direction_group(
@@ -214,114 +335,7 @@ def _summarize_direction_group(
     }
 
 
-def compute_inventory(
-    measured_rows: Sequence[Dict[str, Any]],
-    *,
-    source_pretest_map: Optional[Dict[str, Dict[str, Any]]] = None,
-    taus: Sequence[float] = DEFAULT_TAUS,
-    margins: Sequence[float] = DEFAULT_MARGINS,
-) -> Tuple[Dict[str, Any], str]:
-    """Compute Route C routing inventory and direction cross-tabs (pure numbers)."""
-    items: List[Dict[str, Any]] = []
-    old_table_tuples: List[Tuple[str, int, int]] = []
-    all_variants_flat: List[Dict[str, Any]] = []
-    seen_sids = set()
-
-    for row in measured_rows:
-        sid = str(row["source_id"])
-        if sid in seen_sids:
-            raise ValueError(f"Duplicate source_id in measured_jsonl: {sid}")
-        seen_sids.add(sid)
-        split = str(row["split"])
-        direction = str(row["direction"])
-
-        if source_pretest_map is not None:
-            if sid not in source_pretest_map:
-                raise ValueError(f"source_id {sid} missing from source_pretest_jsonl")
-            sp = source_pretest_map[sid]
-            n_orig = int(sp["n_correct"])
-            n_orig_scored = int(sp["n_scored"])
-            p_orig = float(sp["p_orig"])
-            b_orig = float(sp["b_orig"])
-        else:
-            old_rate = row.get("source_pre_solve_rate_old")
-            if old_rate is None:
-                raise ValueError(f"Missing source_pre_solve_rate_old for {sid}")
-            old_rate_f = float(old_rate)
-            n_orig = int(round(old_rate_f * 16))
-            if abs(old_rate_f - n_orig / 16.0) > 1e-9:
-                raise ValueError(f"Non-k/16 source_pre_solve_rate_old for {sid}: {old_rate_f}")
-            n_orig_scored = 16
-            p_orig, b_orig = compute_smoothed_p_and_b(n_orig, n_orig_scored)
-            old_table_tuples.append((sid, n_orig, n_orig_scored))
-
-        var_entries: List[Dict[str, Any]] = []
-        for var in row["variants"]:
-            n_hyb = int(var["n_correct_hybrid"])
-            n_scored = int(var.get("n_scored", 16))
-            p_var, b_var = compute_smoothed_p_and_b(n_hyb, n_scored)
-            if var.get("p_new") is not None and abs(float(var["p_new"]) - p_var) > 1e-5:
-                raise ValueError(
-                    f"Variant p_new mismatch for {sid}/{var.get('variant_id')}: {var.get('p_new')} vs {p_var}"
-                )
-            delta_b = b_var - b_orig
-            is_ceil = (n_hyb / n_scored) >= (15.0 / 16.0 - 1e-9)
-            ve = {
-                "source_id": sid,
-                "split": split,
-                "source_direction": direction,
-                "origin": str(var.get("origin", "")),
-                "generation_tier": str(var.get("generation_tier", "")),
-                "generation_tag": str(var.get("generation_tag", "")),
-                "n_correct_hybrid": n_hyb,
-                "n_scored": n_scored,
-                "p_var": p_var,
-                "b_var": b_var,
-                "delta_b": delta_b,
-                "is_ceil_ge_15_16": is_ceil,
-            }
-            var_entries.append(ve)
-            all_variants_flat.append(ve)
-
-        items.append(
-            {
-                "source_id": sid,
-                "split": split,
-                "direction": direction,
-                "n_orig": n_orig,
-                "n_orig_scored": n_orig_scored,
-                "p_orig": p_orig,
-                "b_orig": b_orig,
-                "variants": var_entries,
-            }
-        )
-
-    if source_pretest_map is not None and len(source_pretest_map) != len(items):
-        raise ValueError(
-            f"source_pretest_jsonl count ({len(source_pretest_map)}) != measured_jsonl count ({len(items)})"
-        )
-
-    old_table_sha = (
-        compute_source_pretest_table_sha256(old_table_tuples)
-        if old_table_tuples
-        else ""
-    )
-
-    by_split: Dict[str, List[Dict[str, Any]]] = {
-        "all": items,
-        "train": [it for it in items if it["split"] == "train"],
-        "dev": [it for it in items if it["split"] == "dev"],
-    }
-
-    routing_tables: Dict[str, List[Dict[str, Any]]] = {}
-    for split_name, sub_items in by_split.items():
-        rows_out: List[Dict[str, Any]] = []
-        for tau in taus:
-            for margin in margins:
-                rows_out.append(_evaluate_tau_margin(sub_items, float(tau), float(margin)))
-        routing_tables[split_name] = rows_out
-
-    # Cross-tab 1: by source direction label (easier / mixed / harder)
+def _compute_crosstab(variants_flat: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     def _expected_sign_for_label(lbl: str) -> Optional[str]:
         if lbl == "easier":
             return "negative"
@@ -334,39 +348,200 @@ def compute_inventory(
     cross_by_source_dir_paper: Dict[str, Any] = {}
     for lbl in ("easier", "mixed", "harder"):
         exp_sign = _expected_sign_for_label(lbl)
-        sub_all = [v for v in all_variants_flat if v["source_direction"] == lbl]
+        sub_all = [v for v in variants_flat if v["source_direction"] == lbl]
         sub_self = [v for v in sub_all if v["origin"] == "self_generated"]
         sub_paper = [v for v in sub_all if v["origin"] == "paper_transfer"]
         cross_by_source_dir_all[lbl] = _summarize_direction_group(sub_all, exp_sign)
         cross_by_source_dir_self[lbl] = _summarize_direction_group(sub_self, exp_sign)
         cross_by_source_dir_paper[lbl] = _summarize_direction_group(sub_paper, exp_sign)
 
-    # Cross-tab 2: by variant generation_tier (easier / nearby / harder / paper_transfer)
     cross_by_gen_tier: Dict[str, Any] = {}
     for tier in ("easier", "nearby", "harder", "paper_transfer"):
         exp_sign = _expected_sign_for_label(tier)
-        sub_t = [v for v in all_variants_flat if v["generation_tier"] == tier]
+        sub_t = [v for v in variants_flat if v["generation_tier"] == tier]
         cross_by_gen_tier[tier] = _summarize_direction_group(sub_t, exp_sign)
 
-    summary = {
+    return {
+        "by_source_direction_all_variants": cross_by_source_dir_all,
+        "by_source_direction_self_generated_only": cross_by_source_dir_self,
+        "by_source_direction_paper_transfer_only": cross_by_source_dir_paper,
+        "by_variant_generation_tier": cross_by_gen_tier,
+    }
+
+
+def compute_inventory(
+    measured_rows: Sequence[Dict[str, Any]],
+    *,
+    source_pretest_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    taus: Sequence[float] = DEFAULT_TAUS,
+    margins: Sequence[float] = DEFAULT_MARGINS,
+    enforce_t026_counts: bool = False,
+) -> Tuple[Dict[str, Any], str]:
+    """Compute Route C routing inventory (Card v1 / Inbox #2, pure numbers)."""
+    items: List[Dict[str, Any]] = []
+    old_table_tuples: List[Tuple[str, int, int]] = []
+    seen_sids = set()
+
+    for row in measured_rows:
+        sid = str(row["source_id"])
+        if sid in seen_sids:
+            raise ValueError(f"Duplicate source_id in measured_jsonl: {sid}")
+        seen_sids.add(sid)
+        split = str(row["split"])
+        direction = str(row["direction"])
+
+        old_rate = row.get("source_pre_solve_rate_old")
+        old_p_orig: Optional[float] = None
+        old_b_orig: Optional[float] = None
+        old_k16: Optional[int] = None
+        if old_rate is not None:
+            old_rate_f = float(old_rate)
+            old_k16 = int(round(old_rate_f * 16))
+            if abs(old_rate_f - old_k16 / 16.0) > 1e-9:
+                raise ValueError(f"Non-k/16 source_pre_solve_rate_old for {sid}: {old_rate_f}")
+            old_p_orig, old_b_orig = compute_smoothed_p_and_b(old_k16, 16)
+            old_table_tuples.append((sid, old_k16, 16))
+
+        if source_pretest_map is not None:
+            if sid not in source_pretest_map:
+                raise ValueError(f"source_id {sid} missing from source_pretest_jsonl")
+            sp = source_pretest_map[sid]
+            n_orig = int(sp["n_correct"])
+            n_orig_scored = int(sp["n_scored"])
+            p_orig = float(sp["p_orig"])
+            b_orig = float(sp["b_orig"])
+        else:
+            if old_k16 is None or old_p_orig is None or old_b_orig is None:
+                raise ValueError(f"Missing source_pre_solve_rate_old for {sid}")
+            n_orig = old_k16
+            n_orig_scored = 16
+            p_orig = old_p_orig
+            b_orig = old_b_orig
+
+        var_entries: List[Dict[str, Any]] = []
+        for var in row["variants"]:
+            n_hyb = int(var["n_correct_hybrid"])
+            n_scored = int(var.get("n_scored", 16))
+            p_var, b_var = compute_smoothed_p_and_b(n_hyb, n_scored)
+            if var.get("p_new") is not None and abs(float(var["p_new"]) - p_var) > 1e-5:
+                raise ValueError(
+                    f"Variant p_new mismatch for {sid}/{var.get('variant_id')}: {var.get('p_new')} vs {p_var}"
+                )
+            delta_b = b_var - b_orig
+            is_ceil = (n_hyb / n_scored) >= (15.0 / 16.0 - 1e-9)
+            is_floor = (n_hyb / n_scored) <= (1.0 / 16.0 + 1e-9)
+            var_entries.append(
+                {
+                    "source_id": sid,
+                    "variant_id": str(var["variant_id"]),
+                    "split": split,
+                    "source_direction": direction,
+                    "origin": str(var.get("origin", "")),
+                    "generation_tier": str(var.get("generation_tier", "")),
+                    "generation_tag": str(var.get("generation_tag", "")),
+                    "n_correct_hybrid": n_hyb,
+                    "n_scored": n_scored,
+                    "p_var": p_var,
+                    "b_var": b_var,
+                    "delta_b": delta_b,
+                    "is_ceil_ge_15_16": is_ceil,
+                    "is_floor_le_1_16": is_floor,
+                }
+            )
+
+        is_train_ceil = (split == "train") and is_t026_ceiling_group(row["variants"])
+        items.append(
+            {
+                "source_id": sid,
+                "split": split,
+                "direction": direction,
+                "n_orig": n_orig,
+                "n_orig_scored": n_orig_scored,
+                "p_orig": p_orig,
+                "b_orig": b_orig,
+                "old_p_orig": old_p_orig,
+                "old_b_orig": old_b_orig,
+                "is_t026_train_ceiling": is_train_ceil,
+                "variants": var_entries,
+            }
+        )
+
+    if source_pretest_map is not None and len(source_pretest_map) != len(items):
+        raise ValueError(
+            f"source_pretest_jsonl count ({len(source_pretest_map)}) != measured_jsonl count ({len(items)})"
+        )
+
+    old_table_sha = (
+        compute_source_pretest_table_sha256(old_table_tuples)
+        if len(old_table_tuples) == len(items)
+        else ""
+    )
+
+    by_scope: Dict[str, List[Dict[str, Any]]] = {
+        "train_t026": [it for it in items if it["split"] == "train" and not it["is_t026_train_ceiling"]],
+        "dev": [it for it in items if it["split"] == "dev"],
+        "t026_pool": [
+            it
+            for it in items
+            if (it["split"] == "train" and not it["is_t026_train_ceiling"]) or it["split"] == "dev"
+        ],
+        "train_all": [it for it in items if it["split"] == "train"],
+        "all_2100": items,
+    }
+    removed_train_ceiling = len(by_scope["train_all"]) - len(by_scope["train_t026"])
+
+    if enforce_t026_counts:
+        if (
+            len(by_scope["train_t026"]) != 1895
+            or len(by_scope["dev"]) != 100
+            or len(by_scope["t026_pool"]) != 1995
+            or len(by_scope["all_2100"]) != 2100
+            or removed_train_ceiling != 105
+        ):
+            raise ValueError(
+                f"Unexpected T-026 pool sizes: train_t026={len(by_scope['train_t026'])}, "
+                f"dev={len(by_scope['dev'])}, removed={removed_train_ceiling}, all={len(by_scope['all_2100'])}"
+            )
+
+    routing_tables: Dict[str, List[Dict[str, Any]]] = {}
+    switching_stats: Dict[str, Any] = {}
+    for scope_name, sub_items in by_scope.items():
+        rows_out: List[Dict[str, Any]] = []
+        for tau in taus:
+            for margin in margins:
+                rows_out.append(_evaluate_tau_margin(sub_items, float(tau), float(margin)))
+        routing_tables[scope_name] = rows_out
+        if source_pretest_map is not None:
+            sw = _compute_switching_stats(sub_items, taus, margins)
+            if sw is not None:
+                switching_stats[scope_name] = sw
+
+    t026_vars_flat = [v for it in by_scope["t026_pool"] for v in it["variants"]]
+    all_vars_flat = [v for it in by_scope["all_2100"] for v in it["variants"]]
+
+    summary: Dict[str, Any] = {
         "mode": "stage2_final" if source_pretest_map is not None else "stage1_preliminary_old_pretest",
-        "n_sources": len(items),
-        "n_train": len(by_split["train"]),
-        "n_dev": len(by_split["dev"]),
-        "n_variants": len(all_variants_flat),
-        "orig_floor_le_1_16_total": sum(
-            1 for it in items if (it["n_orig"] / it["n_orig_scored"]) <= (1.0 / 16.0 + 1e-9)
+        "pool_counts": {
+            "train_t026_sources": len(by_scope["train_t026"]),
+            "train_t026_variants": sum(len(it["variants"]) for it in by_scope["train_t026"]),
+            "removed_train_ceiling_sources": removed_train_ceiling,
+            "dev_sources": len(by_scope["dev"]),
+            "dev_variants": sum(len(it["variants"]) for it in by_scope["dev"]),
+            "t026_pool_sources": len(by_scope["t026_pool"]),
+            "t026_pool_variants": len(t026_vars_flat),
+            "all_2100_sources": len(by_scope["all_2100"]),
+            "all_2100_variants": len(all_vars_flat),
+        },
+        "orig_floor_le_1_16_t026_pool": sum(
+            1 for it in by_scope["t026_pool"] if (it["n_orig"] / it["n_orig_scored"]) <= (1.0 / 16.0 + 1e-9)
         ),
-        "orig_ceil_ge_15_16_total": sum(
-            1 for it in items if (it["n_orig"] / it["n_orig_scored"]) >= (15.0 / 16.0 - 1e-9)
+        "orig_ceil_ge_15_16_t026_pool": sum(
+            1 for it in by_scope["t026_pool"] if (it["n_orig"] / it["n_orig_scored"]) >= (15.0 / 16.0 - 1e-9)
         ),
         "routing_tables": routing_tables,
-        "direction_crosstab": {
-            "by_source_direction_all_variants": cross_by_source_dir_all,
-            "by_source_direction_self_generated_only": cross_by_source_dir_self,
-            "by_source_direction_paper_transfer_only": cross_by_source_dir_paper,
-            "by_variant_generation_tier": cross_by_gen_tier,
-        },
+        "switching_stats": switching_stats,
+        "direction_crosstab_t026_pool": _compute_crosstab(t026_vars_flat),
+        "direction_crosstab_all_2100": _compute_crosstab(all_vars_flat),
     }
     return summary, old_table_sha
 
@@ -379,17 +554,18 @@ def format_inventory_report(
     source_pretest_sha256: str = "",
     hybrid_grader_sha256: str = CANONICAL_HYBRID_GRADER_SHA256,
 ) -> str:
+    pc = summary["pool_counts"]
     lines: List[str] = []
     mode_label = (
-        "阶段 2 最终清点（bf16 新原题前测）"
+        "阶段 2 最终清点（bf16 新原题前测，收件箱第 2 条新口径）"
         if summary["mode"] == "stage2_final"
-        else "阶段 1 初步清点（旧原题前测 pre_solve_rate + T-023 bf16 重测变体）"
+        else "阶段 1 初步清点（旧原题前测 + 收件箱第 2 条新口径）"
     )
     lines.append(f"=== T-031 Route C Inventory: {mode_label} ===")
     lines.append(
-        f"n_sources={summary['n_sources']} (train={summary['n_train']}, dev={summary['n_dev']}), "
-        f"n_variants={summary['n_variants']}, orig_floor_le_1_16={summary['orig_floor_le_1_16_total']}, "
-        f"orig_ceil_ge_15_16={summary['orig_ceil_ge_15_16_total']}"
+        f"t026_pool={pc['t026_pool_sources']} (train_t026={pc['train_t026_sources']}, "
+        f"removed_train_ceiling={pc['removed_train_ceiling_sources']}, dev={pc['dev_sources']}), "
+        f"t026_variants={pc['t026_pool_variants']}, all_2100={pc['all_2100_sources']} ({pc['all_2100_variants']} variants)"
     )
     lines.append(f"measured_jsonl_sha256={measured_sha256}")
     if old_table_sha256:
@@ -398,24 +574,43 @@ def format_inventory_report(
         lines.append(f"source_pretest_sha256={source_pretest_sha256}")
     lines.append(f"hybrid_grader_sha256={hybrid_grader_sha256}")
 
-    for split_name in ("all", "train", "dev"):
+    for scope_name in ("train_t026", "dev", "t026_pool", "all_2100"):
         lines.append("")
-        lines.append(f"--- Routing Table ({split_name}) ---")
+        lines.append(f"--- Routing Table ({scope_name}, n={summary['routing_tables'][scope_name][0]['n_sources']}) ---")
         lines.append(
-            "| tau | m | easy_total | easy_usable | easy_ceil(>=15/16) | hard_total | hard_usable | hard_floor(<=1/16) | total_usable | gap_vs_1600 | net_excl_floor_ceil |"
+            "| tau | m | easy_routed (ceil>=15/16) | hard_routed | hard_ladder_floor(<=1/16) [orig_only] | fallback_routeA (easy+hard) | posttest_levels (1/2/3+) | total_check |"
         )
-        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-        for r in summary["routing_tables"][split_name]:
+        lines.append("|---:|---:|---:|---:|---:|---:|---|---:|")
+        for r in summary["routing_tables"][scope_name]:
+            lv = r["hard_routed_posttest_levels"]
+            chk = r["easy_routed"] + r["hard_routed"] + r["fallback_routeA"]
             lines.append(
-                f"| {r['tau']:.1f} | {r['margin']:.1f} | {r['easy_total']} | {r['easy_usable']} | "
-                f"{r['easy_usable_all_qualifying_harder_ceil_ge_15_16']} (strict:{r['easy_all_strictly_harder_ceil_ge_15_16']}) | "
-                f"{r['hard_total']} | {r['hard_usable']} | "
-                f"{r['hard_usable_orig_floor_le_1_16']} (all:{r['hard_all_orig_floor_le_1_16']}) | "
-                f"{r['total_usable']} | {r['gap_vs_1600']:+d} | {r['usable_excl_floor_and_ceil']} |"
+                f"| {r['tau']:.1f} | {r['margin']:.1f} | "
+                f"{r['easy_routed']} ({r['easy_routed_all_qualifying_harder_ceil_ge_15_16']}) | "
+                f"{r['hard_routed']} | "
+                f"{r['hard_routed_ladder_floor_le_1_16']} [{r['hard_routed_orig_only_floor_le_1_16']}] | "
+                f"{r['fallback_routeA']} ({r['easy_fallback_routeA']}+{r['hard_fallback_routeA']}) | "
+                f"{lv['1']}/{lv['2']}/{lv['3+']} | {chk} |"
             )
 
+    if summary.get("switching_stats"):
+        for scope_name in ("train_t026", "dev", "t026_pool", "all_2100"):
+            sw = summary["switching_stats"].get(scope_name)
+            if not sw:
+                continue
+            lines.append("")
+            lines.append(f"--- Branch Switch Old->New ({scope_name}) ---")
+            lines.append("| tau | n | old_hard->new_easy | old_easy->new_hard | total_switched | stayed_hard | stayed_easy |")
+            lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+            for b in sw["by_tau_branch_switch"]:
+                lines.append(
+                    f"| {b['tau']:.1f} | {b['n_sources']} | {b['old_hard_to_new_easy']} | "
+                    f"{b['old_easy_to_new_hard']} | {b['total_branch_switched']} | "
+                    f"{b['stayed_hard']} | {b['stayed_easy']} |"
+                )
+
     lines.append("")
-    lines.append("--- Direction Tag Cross-Tab (by source direction: all / self_generated / paper_transfer) ---")
+    lines.append("--- Direction Tag Cross-Tab (t026_pool) ---")
     for sub_key in (
         "by_source_direction_all_variants",
         "by_source_direction_self_generated_only",
@@ -425,7 +620,7 @@ def format_inventory_report(
         lines.append(f"[{sub_key}]")
         lines.append("| tag | n | <=-1.0 | <=-0.5 | <0 | ==0 | >0 | >=+0.5 | >=+1.0 | mean_db | med_db | match(<0 or >0) |")
         lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
-        for lbl, rec in summary["direction_crosstab"][sub_key].items():
+        for lbl, rec in summary["direction_crosstab_t026_pool"][sub_key].items():
             mc = rec["matched_strict_count"]
             mr = rec["matched_strict_rate"]
             match_str = f"{mc}/{rec['n_variants']} ({100.0 * mr:.2f}%)" if mc is not None and mr is not None else "—"
@@ -436,19 +631,20 @@ def format_inventory_report(
                 f"{rec['mean_delta_b']} | {rec['median_delta_b']} | {match_str} |"
             )
 
-    # Pick tau=0.4, m=0.5 (all) as compact machine-readable headline indicator
-    headline = next(
-        (r for r in summary["routing_tables"]["all"] if abs(r["tau"] - 0.4) < 1e-9 and abs(r["margin"] - 0.5) < 1e-9),
-        summary["routing_tables"]["all"][0],
+    hl = next(
+        (r for r in summary["routing_tables"]["train_t026"] if abs(r["tau"] - 0.4) < 1e-9 and abs(r["margin"] - 0.5) < 1e-9),
+        summary["routing_tables"]["train_t026"][0],
     )
     lines.append("")
     lines.append("status: STAGE1_DONE" if summary["mode"] != "stage2_final" else "status: STAGE2_INVENTORY_DONE")
     lines.append("rc: 0")
     lines.append("calls: 0")
     lines.append("failures: 0")
-    lines.append(f"n_sources: {summary['n_sources']}")
-    lines.append(f"n_variants: {summary['n_variants']}")
-    lines.append(f"usable_tau04_m05: {headline['total_usable']}")
+    lines.append(f"t026_train_sources: {pc['train_t026_sources']}")
+    lines.append(f"dev_sources: {pc['dev_sources']}")
+    lines.append(f"t026_train_easy_tau04_m05: {hl['easy_routed']}")
+    lines.append(f"t026_train_hard_tau04_m05: {hl['hard_routed']}")
+    lines.append(f"t026_train_fallback_tau04_m05: {hl['fallback_routeA']}")
     lines.append(f"measured_jsonl_sha256: {measured_sha256}")
     if old_table_sha256:
         lines.append(f"old_pretest_table_sha256: {old_table_sha256}")
@@ -492,6 +688,7 @@ def run_inventory(
     summary, old_table_sha = compute_inventory(
         measured_rows,
         source_pretest_map=sp_map,
+        enforce_t026_counts=(not allow_custom_sha256),
     )
     if (
         sp_map is None

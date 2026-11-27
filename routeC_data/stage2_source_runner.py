@@ -540,10 +540,11 @@ def run_summarize_phase(
         source_pretest_sha256=out_pretest_sha,
         hybrid_grader_sha256=hybrid_sha,
     )
-    headline = next(
-        (r for r in inv_summary["routing_tables"]["all"] if abs(r["tau"] - 0.4) < 1e-9 and abs(r["margin"] - 0.5) < 1e-9),
-        inv_summary["routing_tables"]["all"][0],
+    hl = next(
+        (r for r in inv_summary["routing_tables"]["train_t026"] if abs(r["tau"] - 0.4) < 1e-9 and abs(r["margin"] - 0.5) < 1e-9),
+        inv_summary["routing_tables"]["train_t026"][0],
     )
+    vs_old = summary["vs_old_pre_solve_rate"]
     lines = [
         "=== T-031 STAGE 2 SOURCE PRETEST SUMMARY (ZERO TEXT) ===",
         f"hybrid_grader_sha256={hybrid_sha}",
@@ -553,7 +554,7 @@ def run_summarize_phase(
         f"(stu_fail={tot_student_failed}, llm_fail={tot_llm_tech_failed}, overall_fail_rate={tech_fail_rate_overall:.4%})",
         f"rule_correct={tot_rule_correct} hybrid_correct={tot_hybrid_correct} promoted=+{tot_hybrid_correct - tot_rule_correct} "
         f"llm_called={tot_llm_called} unknown={tot_unknown} (unk_of_llm={unk_rate_of_llm:.4%}, unk_of_scored={unk_rate_of_scored:.4%})",
-        f"vs_old_pre_solve_rate={summary['vs_old_pre_solve_rate']}",
+        f"vs_old_pre_solve_rate={vs_old}",
         "",
         inv_txt.strip(),
         "",
@@ -561,10 +562,16 @@ def run_summarize_phase(
         "rc: 0",
         f"calls: {total_calls}",
         f"failures: {tot_failed}",
+        f"tech_fail_rate_overall: {tech_fail_rate_overall:.6f}",
         f"llm_called: {tot_llm_called}",
         f"unknown: {tot_unknown}",
-        f"usable_tau04_m05: {headline['total_usable']}",
+        f"unknown_rate_of_llm: {unk_rate_of_llm:.6f}",
+        f"pearson_smoothed: {vs_old['pearson_smoothed']}",
+        f"mean_diff_smoothed: {vs_old['mean_diff_new_minus_old_smoothed']}",
         f"source_pretest_sha256: {out_pretest_sha}",
+        f"t026_train_easy_tau04_m05: {hl['easy_routed']}",
+        f"t026_train_hard_tau04_m05: {hl['hard_routed']}",
+        f"t026_train_fallback_tau04_m05: {hl['fallback_routeA']}",
     ]
     (run_dir / "stage2_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (run_dir / "STAGE2_DONE.flag").write_text("ok\n", encoding="utf-8")
