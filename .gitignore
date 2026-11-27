@@ -152,10 +152,19 @@
 !/routeA_data/routeA-t023-stage2-kit-v1.zip.sha256
 !/routeA_data/routeA-t023-stage2-kit-v2.zip
 !/routeA_data/routeA-t023-stage2-kit-v2.zip.sha256
+!/routeC_data/
+/routeC_data/*
+!/routeC_data/*.py
+!/routeC_data/*.sh
+!/routeC_data/README.md
+!/routeC_data/SHA256SUMS
+!/routeC_data/routeC-t031-kit-v1.zip
+!/routeC_data/routeC-t031-kit-v1.zip.sha256
 !/tests/
 /tests/*
 !/tests/test_routeA_data.py
 !/tests/test_t024_hybrid_grader.py
+!/tests/test_routeC_data.py
 
 # These patterns remain forbidden even if a future exception is added above.
 **/__pycache__/
