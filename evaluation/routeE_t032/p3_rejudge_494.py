@@ -155,9 +155,10 @@ async def rejudge_model_file(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="P3 rejudge 494 conversations for A-group & Eduardo-27B")
-    ap.add_argument("--agroup-json", required=True)
-    ap.add_argument("--model27b-json", required=True)
+    ap = argparse.ArgumentParser(description="P3 rejudge 494 conversations for A-group, Eduardo-27B, and optional Route A")
+    ap.add_argument("--agroup-json", default=None)
+    ap.add_argument("--model27b-json", default=None)
+    ap.add_argument("--routea-json", default=None)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--judge-api-base", required=True)
     ap.add_argument("--judge-model", default="Qwen3.6-27B")
@@ -169,6 +170,16 @@ def main() -> None:
     ap.add_argument("--require-math-verify", action="store_true", default=False)
     args = ap.parse_args()
 
+    targets: list[tuple[str, str, Path]] = []
+    if args.agroup_json:
+        targets.append(("a_group_step100", "agroup", Path(args.agroup_json)))
+    if args.model27b_json:
+        targets.append(("eduardo_27b", "m27b", Path(args.model27b_json)))
+    if args.routea_json:
+        targets.append(("route_a_step100", "routea", Path(args.routea_json)))
+    if not targets:
+        raise ValueError("At least one of --agroup-json, --model27b-json, or --routea-json must be provided")
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     client = AsyncJudgeClient(
@@ -178,49 +189,48 @@ def main() -> None:
     )
 
     async def _run() -> dict[str, Any]:
-        a_sum = await rejudge_model_file(
-            label="a_group_step100",
-            eval_json_path=Path(args.agroup_json),
-            judge_client=client,
-            judge_mode=args.judge_mode,
-            out_dir=out_dir,
-            require_math_verify=args.require_math_verify,
-            num_votes=args.judge_votes,
-            draws=args.draws,
-            seed=args.seed,
-        )
-        b_sum = await rejudge_model_file(
-            label="eduardo_27b",
-            eval_json_path=Path(args.model27b_json),
-            judge_client=client,
-            judge_mode=args.judge_mode,
-            out_dir=out_dir,
-            require_math_verify=args.require_math_verify,
-            num_votes=args.judge_votes,
-            draws=args.draws,
-            seed=args.seed,
-        )
-        return {"a_group_step100": a_sum, "eduardo_27b": b_sum}
+        out: dict[str, Any] = {}
+        for label, _prefix, path in targets:
+            out[label] = await rejudge_model_file(
+                label=label,
+                eval_json_path=path,
+                judge_client=client,
+                judge_mode=args.judge_mode,
+                out_dir=out_dir,
+                require_math_verify=args.require_math_verify,
+                num_votes=args.judge_votes,
+                draws=args.draws,
+                seed=args.seed,
+            )
+        return out
 
-    rep = asyncio.run(_run())
-    atomic_write_json(out_dir / "p3_rejudge_summary.json", rep)
+    rep_new = asyncio.run(_run())
+    summary_path = out_dir / "p3_rejudge_summary.json"
+    rep_merged: dict[str, Any] = {}
+    if summary_path.is_file():
+        try:
+            rep_merged = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            rep_merged = {}
+    rep_merged.update(rep_new)
+    atomic_write_json(summary_path, rep_merged)
 
-    a = rep["a_group_step100"]
-    b = rep["eduardo_27b"]
-    print_machine_summary(
-        {
-            "status": "P3_REJUDGE_DONE",
-            "rc": 0,
-            "calls": a["calls"] + b["calls"],
-            "failures": a["failures"] + b["failures"],
-            "agroup_leak_rate_all": format_ci(a["leak_rate_all"], *a["leak_rate_all_ci"], pct=True),
-            "agroup_empty_turn_rate": format_ci(a["empty_turn_rate_conv_mean"], *a["empty_turn_rate_conv_ci"], pct=True),
-            "agroup_leak_rate_nonempty": format_ci(a["leak_rate_nonempty_convs"], *a["leak_rate_nonempty_convs_ci"], pct=True),
-            "m27b_leak_rate_all": format_ci(b["leak_rate_all"], *b["leak_rate_all_ci"], pct=True),
-            "m27b_empty_turn_rate": format_ci(b["empty_turn_rate_conv_mean"], *b["empty_turn_rate_conv_ci"], pct=True),
-            "m27b_leak_rate_nonempty": format_ci(b["leak_rate_nonempty_convs"], *b["leak_rate_nonempty_convs_ci"], pct=True),
-        }
-    )
+    summary_fields: dict[str, Any] = {
+        "status": "P3_REJUDGE_DONE",
+        "rc": 0,
+        "calls": sum(rep_new[label]["calls"] for label, _, _ in targets),
+        "failures": sum(rep_new[label]["failures"] for label, _, _ in targets),
+    }
+    for label, prefix, _ in targets:
+        m = rep_new[label]
+        summary_fields[f"{prefix}_leak_rate_all"] = format_ci(m["leak_rate_all"], *m["leak_rate_all_ci"], pct=True)
+        summary_fields[f"{prefix}_empty_turn_rate"] = format_ci(
+            m["empty_turn_rate_conv_mean"], *m["empty_turn_rate_conv_ci"], pct=True
+        )
+        summary_fields[f"{prefix}_leak_rate_nonempty"] = format_ci(
+            m["leak_rate_nonempty_convs"], *m["leak_rate_nonempty_convs_ci"], pct=True
+        )
+    print_machine_summary(summary_fields)
 
 
 if __name__ == "__main__":

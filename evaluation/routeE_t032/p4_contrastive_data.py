@@ -25,10 +25,12 @@ from common_utils import (
     AUTHOR_DATASET_FILES,
     AUTHOR_DATASET_REV,
     TEACHER_SYSTEM_PROMPT,
+    TEST_494_PARQUET_SHA256,
     atomic_write_json,
     atomic_write_jsonl,
     download_verified_file,
     print_machine_summary,
+    sha256_file,
     sha256_text,
     strip_teacher_controls,
 )
@@ -177,18 +179,52 @@ def assert_zero_split_overlap(
     *,
     val_parquet: Path | None = None,
     test_parquet: Path | None = None,
-) -> None:
+    require_test_guard: bool = True,
+    expected_test_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Verify train problems have zero hash overlap with val and test parquets.
+
+    Computes SHA-256 hashes only; never prints problem text or test contents.
+    """
     train_hashes = {sha256_text(p.strip()) for p in train_problems if p.strip()}
-    if val_parquet and Path(val_parquet).is_file():
-        val_hashes = _extract_problem_hashes(Path(val_parquet))
+    guard_info: dict[str, Any] = {
+        "train_unique_problem_hashes": len(train_hashes),
+        "val_guard_checked": False,
+        "test_guard_checked": False,
+        "test_parquet_sha256": None,
+    }
+    if val_parquet is not None:
+        val_p = Path(val_parquet)
+        if not val_p.is_file():
+            raise ContaminationError(f"val_parquet guard file missing: {val_p}")
+        val_hashes = _extract_problem_hashes(val_p)
         overlap = train_hashes & val_hashes
         if overlap:
             raise ContaminationError(f"Train overlaps val.parquet on {len(overlap)} problem(s)")
-    if test_parquet and Path(test_parquet).is_file():
-        test_hashes = _extract_problem_hashes(Path(test_parquet))
+        guard_info["val_guard_checked"] = True
+        guard_info["val_unique_problem_hashes"] = len(val_hashes)
+
+    if require_test_guard and test_parquet is None:
+        raise ContaminationError("test_parquet guard is mandatory but was not provided")
+
+    if test_parquet is not None:
+        test_p = Path(test_parquet)
+        if not test_p.is_file():
+            raise ContaminationError(f"test_parquet guard file missing: {test_p}")
+        actual_sha = sha256_file(test_p)
+        if expected_test_sha256 and actual_sha != expected_test_sha256:
+            raise ContaminationError(
+                f"test_parquet SHA-256 mismatch: got {actual_sha}, expected {expected_test_sha256}"
+            )
+        test_hashes = _extract_problem_hashes(test_p)
         overlap = train_hashes & test_hashes
         if overlap:
             raise ContaminationError(f"Train overlaps test.parquet on {len(overlap)} problem(s)")
+        guard_info["test_guard_checked"] = True
+        guard_info["test_parquet_sha256"] = actual_sha
+        guard_info["test_unique_problem_hashes"] = len(test_hashes)
+
+    return guard_info
 
 
 def default_token_counter(text: str, tokenizer: Any | None = None) -> int:
@@ -328,6 +364,8 @@ async def build_contrastive_pairs(
     rewriter_client: AsyncJudgeClient,
     val_parquet: Path | None = None,
     test_parquet: Path | None = None,
+    require_test_guard: bool = True,
+    expected_test_sha256: str | None = None,
     tokenizer: Any | None = None,
     target_pairs: int = 600,
     min_pairs: int = 300,
@@ -337,10 +375,12 @@ async def build_contrastive_pairs(
     require_math_verify: bool = False,
     seed: int = 42,
 ) -> dict[str, Any]:
-    assert_zero_split_overlap(
+    guard_info = assert_zero_split_overlap(
         [str(c.get("problem", "")) for c in conversations],
         val_parquet=val_parquet,
         test_parquet=test_parquet,
+        require_test_guard=require_test_guard,
+        expected_test_sha256=expected_test_sha256,
     )
     candidates = extract_candidate_teacher_turns(
         conversations, max_turns_per_conv=3, require_math_verify=require_math_verify
@@ -441,6 +481,7 @@ async def build_contrastive_pairs(
         "all": accepted,
         "stats": {
             **stats,
+            **guard_info,
             "accepted_total": len(accepted),
             "fit_count": len(fit_pairs),
             "heldout_count": len(heldout_pairs),
@@ -510,7 +551,16 @@ def main() -> None:
     ap.add_argument("--min-pairs", type=int, default=300)
     ap.add_argument("--max-pairs", type=int, default=1000)
     ap.add_argument("--tokenizer-path", default=None)
-    ap.add_argument("--test-parquet-guard", default=None, help="Optional path to test.parquet hash-guard")
+    ap.add_argument(
+        "--test-parquet-guard",
+        required=True,
+        help="Mandatory path to author 494 test.parquet hash-guard (only hashes, never prints content)",
+    )
+    ap.add_argument(
+        "--expected-test-parquet-sha256",
+        default=TEST_494_PARQUET_SHA256,
+        help="Expected SHA-256 of test.parquet guard file (default: T-020 author 494 test.parquet)",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--require-math-verify", action="store_true", default=False)
     args = ap.parse_args()
@@ -548,7 +598,9 @@ def main() -> None:
             conversations=convs,
             rewriter_client=rewriter,
             val_parquet=val_pq,
-            test_parquet=Path(args.test_parquet_guard) if args.test_parquet_guard else None,
+            test_parquet=Path(args.test_parquet_guard),
+            require_test_guard=True,
+            expected_test_sha256=args.expected_test_parquet_sha256 or None,
             tokenizer=tokenizer,
             target_pairs=args.target_pairs,
             min_pairs=args.min_pairs,

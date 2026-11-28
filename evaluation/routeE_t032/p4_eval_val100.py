@@ -298,10 +298,12 @@ def summarize_against_base(
     base_items: Sequence[dict[str, Any]],
     arm_math500_vec: Sequence[int],
     base_math500_vec: Sequence[int],
+    engine: str = "vllm",
+    paired_against: str | None = None,
     draws: int = 10000,
     seed: int = 42,
 ) -> dict[str, Any]:
-    """Compute exact Criterion #1-#4 numbers paired against the unmodified same base."""
+    """Compute exact Criterion #1-#4 numbers paired against the same-engine unmodified base."""
     dt = paired_bootstrap_diff_ci(
         [r["delta_transfer"] for r in base_items],
         [r["delta_transfer"] for r in arm_items],
@@ -327,6 +329,8 @@ def summarize_against_base(
     return {
         "arm": arm_name,
         "base_label": base_label,
+        "engine": engine,
+        "paired_against": paired_against or f"unmodified_{engine}",
         "n_val": len(arm_items),
         "leak_rate": leak_arm["mean"],
         "leak_rate_ci": [leak_arm["ci_low"], leak_arm["ci_high"]],
@@ -348,36 +352,74 @@ def summarize_against_base(
     }
 
 
-def _hf_steering_rollout_sync(
+def select_paired_baseline(
+    *,
+    kind: str,
+    vllm_baseline: tuple[Sequence[dict[str, Any]], Sequence[int]],
+    hf_baseline: tuple[Sequence[dict[str, Any]], Sequence[int]] | None,
+) -> tuple[str, str, Sequence[dict[str, Any]], Sequence[int]]:
+    """Select same-engine unmodified baseline (HF for steering_hook; vLLM for all other arms)."""
+    if kind == "steering_hook":
+        if hf_baseline is None:
+            raise RuntimeError("HF unmodified baseline is required for steering_hook paired comparison")
+        return "hf", "unmodified_hf", hf_baseline[0], hf_baseline[1]
+    return "vllm", "unmodified_vllm", vllm_baseline[0], vllm_baseline[1]
+
+
+def render_val100_markdown_table(summary_rows: Sequence[dict[str, Any]]) -> str:
+    """Render objective numeric summary table (no pass/fail verdict)."""
+    lines = [
+        "| Base | Arm | Engine | Paired Against | Leak Rate | Rel Drop | Empty% | Δ_transfer (paired diff) | Δ_same (paired diff) | MATH500 (pp diff) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in summary_rows:
+        leak_s = format_ci(r["leak_rate"], *r["leak_rate_ci"], pct=True)
+        rel_s = f"{r['leak_rel_drop_vs_base'] * 100.0:+.1f}%"
+        emp_s = format_ci(r["empty_turn_rate"], *r["empty_turn_rate_ci"], pct=True)
+        dt_s = f"{r['delta_transfer']:+.4f} ({r['delta_transfer_paired_diff']:+.4f})"
+        ds_s = f"{r['delta_same']:+.4f} ({r['delta_same_paired_diff']:+.4f})"
+        m5_s = f"{r['math500_acc'] * 100.0:.2f}% ({r['math500_diff_vs_base_pp']:+.2f}pp)"
+        lines.append(
+            f"| {r['base_label']} | {r['arm']} | {r.get('engine', 'vllm')} | {r.get('paired_against', 'unmodified_vllm')} "
+            f"| {leak_s} | {rel_s} | {emp_s} | {dt_s} | {ds_s} | {m5_s} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _hf_rollout_sync(
     *,
     rows: Sequence[dict[str, Any]],
     base_model_path: Path,
-    artifact_dir: Path,
+    artifact_dir: Path | None,
     student_api_base: str,
     student_model: str,
     math500_items: Sequence[dict[str, Any]],
     max_teacher_turns: int = 11,
     min_teacher_turns_before_eoc: int = 3,
     require_math_verify: bool = False,
+    seed: int = 42,
 ) -> tuple[list[dict[str, Any]], list[int]]:
-    """Run steering_hook rollout + MATH500 via HF bfloat16 with ModificationController."""
+    """Run HF bfloat16 rollout + MATH500 (unmodified when artifact_dir is None, or steering_hook)."""
     import openai
     import torch
     from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer, PretrainedConfig
 
-    sv = torch.load(artifact_dir / "steering_vectors.pt", map_location="cpu", weights_only=True)
     configs = PretrainedConfig.get_config_dict(str(base_model_path))
     cls = AutoModelForImageTextToText if any("vision_config" in c for c in configs) else AutoModelForCausalLM
     tok = AutoTokenizer.from_pretrained(str(base_model_path), trust_remote_code=True)
     model = cls.from_pretrained(str(base_model_path), dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
-    ctrl = ModificationController(
-        model=model,
-        tokenizer=tok,
-        kind="steering_hook",
-        steering_vectors=sv["unit_vectors"],
-        steering_layers=sv["layers"],
-        steering_alpha=float(sv["alpha"]),
-    )
+    if artifact_dir is not None:
+        sv = torch.load(artifact_dir / "steering_vectors.pt", map_location="cpu", weights_only=True)
+        ctrl = ModificationController(
+            model=model,
+            tokenizer=tok,
+            kind="steering_hook",
+            steering_vectors=sv["unit_vectors"],
+            steering_layers=sv["layers"],
+            steering_alpha=float(sv["alpha"]),
+        )
+    else:
+        ctrl = ModificationController(model=model, tokenizer=tok, kind="none")
 
     async def _rollout() -> list[dict[str, Any]]:
         s_client = openai.AsyncClient(api_key="EMPTY", base_url=student_api_base, timeout=300.0, max_retries=2)
@@ -532,12 +574,54 @@ def main() -> None:
 
         summary_rows.append(
             summarize_against_base(
-                arm_name="unmodified",
+                arm_name="unmodified_vllm",
                 base_label=base_label,
                 arm_items=base_scored,
                 base_items=base_scored,
                 arm_math500_vec=base_m500["correct_vec"],
                 base_math500_vec=base_m500["correct_vec"],
+                engine="vllm",
+                paired_against="unmodified_vllm",
+                draws=args.draws,
+                seed=args.seed,
+            )
+        )
+
+        # Always run unmodified HF baseline with identical sampling so steering_hook (Method 3)
+        # is paired against HF unmodified and engine difference (HF vs vLLM) is explicitly reported.
+        base_hf_convs, base_hf_m500_vec = _hf_rollout_sync(
+            rows=val_rows,
+            base_model_path=base_path,
+            artifact_dir=None,
+            student_api_base=args.student_api_base,
+            student_model=args.student_model,
+            math500_items=math500_items,
+            require_math_verify=args.require_math_verify,
+            seed=args.seed,
+        )
+        base_hf_scored = asyncio.run(
+            score_val_conversations(
+                convs=base_hf_convs,
+                student_api_base=args.student_api_base,
+                student_model=args.student_model,
+                judge_client=judge_client,
+                num_student_attempts=args.num_student_attempts,
+                require_math_verify=args.require_math_verify,
+                cache_path=out_dir / f"{base_label}_unmodified_hf_judge_cache.jsonl",
+            )
+        )
+        total_calls += sum(r["judge_calls"] for r in base_hf_scored) + len(val_rows)
+        total_failures += sum(r["student_failed"] + r["judge_failures"] for r in base_hf_scored)
+        summary_rows.append(
+            summarize_against_base(
+                arm_name="unmodified_hf",
+                base_label=base_label,
+                arm_items=base_hf_scored,
+                base_items=base_scored,
+                arm_math500_vec=base_hf_m500_vec,
+                base_math500_vec=base_m500["correct_vec"],
+                engine="hf",
+                paired_against="unmodified_vllm",
                 draws=args.draws,
                 seed=args.seed,
             )
@@ -594,7 +678,7 @@ def main() -> None:
                 # Weight-free prompt_only does not alter standalone math solving weights
                 arm_m500_vec = base_m500["correct_vec"]
             elif kind == "steering_hook":
-                arm_convs, arm_m500_vec = _hf_steering_rollout_sync(
+                arm_convs, arm_m500_vec = _hf_rollout_sync(
                     rows=val_rows,
                     base_model_path=base_path,
                     artifact_dir=mdir,
@@ -602,6 +686,7 @@ def main() -> None:
                     student_model=args.student_model,
                     math500_items=math500_items,
                     require_math_verify=args.require_math_verify,
+                    seed=args.seed,
                 )
             else:
                 raise ValueError(f"Unsupported kind {kind}")
@@ -620,13 +705,20 @@ def main() -> None:
             total_calls += sum(r["judge_calls"] for r in arm_scored) + len(val_rows)
             total_failures += sum(r["student_failed"] + r["judge_failures"] for r in arm_scored)
 
+            engine_name, paired_ref, ref_items, ref_m500_vec = select_paired_baseline(
+                kind=kind,
+                vllm_baseline=(base_scored, base_m500["correct_vec"]),
+                hf_baseline=(base_hf_scored, base_hf_m500_vec),
+            )
             row_summary = summarize_against_base(
                 arm_name=mmanifest["method"],
                 base_label=base_label,
                 arm_items=arm_scored,
-                base_items=base_scored,
+                base_items=ref_items,
                 arm_math500_vec=arm_m500_vec,
-                base_math500_vec=base_m500["correct_vec"],
+                base_math500_vec=ref_m500_vec,
+                engine=engine_name,
+                paired_against=paired_ref,
                 draws=args.draws,
                 seed=args.seed,
             )
@@ -634,6 +726,7 @@ def main() -> None:
             summary_rows.append(row_summary)
 
     atomic_write_json(out_dir / "p4_val100_table.json", {"rows": summary_rows})
+    (out_dir / "p4_val100_table.md").write_text(render_val100_markdown_table(summary_rows), encoding="utf-8")
     print_machine_summary(
         {
             "status": "P4_EVAL_VAL100_DONE",

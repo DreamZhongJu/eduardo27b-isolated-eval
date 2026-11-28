@@ -71,6 +71,20 @@ STEP100_LOCK: dict[str, str] = {
     "tokenizer_config.json": "7488550a894dcf741616126e322ea31d66cf9457b59ec5825f4c7efdced421f8",
 }
 
+# T-026 Route A step_100 export (runs/t026_stage3_formal_20261126_140508/export_step100_sha256.txt)
+ROUTE_A_STEP100_LOCK: dict[str, str] = {
+    "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "config.json": "6d320dedc3a50ea3eb4bf7ab503fed018f21784f001c61ff9de9a7ed411e69f0",
+    "generation_config.json": "944b9abc4ec388933cc00c757a7b794683929e5a02e5123853892a5750645689",
+    "model.safetensors": "9411088e35efc7106fa0f7ed2d9cc3990bfebb4180faa6f3bab2dce7501a96dd",
+    "processor_config.json": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "7488550a894dcf741616126e322ea31d66cf9457b59ec5825f4c7efdced421f8",
+}
+
+# Author 494-problem test.parquet (same file as T-018 / T-020 / T-022 / T-033)
+TEST_494_PARQUET_SHA256 = "338dc73b005b2c8036cc23959061007d7339c24d1988800b62543e1c8224385c"
+
 STUDENT_8B_LOCK: dict[str, str] = {
     "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
     "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4",
