@@ -162,6 +162,37 @@
 !/official/eduardo/configs/prompts/
 /official/eduardo/configs/prompts/*
 !/official/eduardo/configs/prompts/*.txt
+!/deviations.md
+!/evaluation/routeA_t033/
+/evaluation/routeA_t033/*
+!/evaluation/routeA_t033/*.py
+!/evaluation/routeA_t033/*.sh
+!/evaluation/routeA_t033/*.md
+!/evaluation/routeA_t033/*.zip
+!/evaluation/routeA_t033/*.sha256
+!/evaluation/author494/
+/evaluation/author494/*
+!/evaluation/author494/*.py
+!/evaluation/author494/*.sh
+!/evaluation/author494/*.md
+!/evaluation/author494_pro5000/
+/evaluation/author494_pro5000/*
+!/evaluation/author494_pro5000/*.py
+!/evaluation/author494_pro5000/*.sh
+!/evaluation/author494_pro5000/*.md
+!/evaluation/agroup_selfbuilt_pro5000/
+/evaluation/agroup_selfbuilt_pro5000/*
+!/evaluation/agroup_selfbuilt_pro5000/*.py
+!/evaluation/agroup_selfbuilt_pro5000/*.sh
+!/evaluation/agroup_selfbuilt_pro5000/*.md
+!/evaluation/base4b_selfbuilt/
+/evaluation/base4b_selfbuilt/*
+!/evaluation/base4b_selfbuilt/*.py
+!/evaluation/base4b_selfbuilt/*.md
+!/evaluation/paired_gain/
+/evaluation/paired_gain/*
+!/evaluation/paired_gain/*.py
+!/evaluation/paired_gain/*.md
 
 # These patterns remain forbidden even if a future exception is added above.
 **/__pycache__/
