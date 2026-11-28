@@ -283,7 +283,14 @@ def verify_model_bfloat16(model_dir: Path) -> str:
     if not cfg_path.is_file():
         raise FileNotFoundError(f"config.json not found in {model_dir}")
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or "")
+    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    dtype = str(
+        cfg.get("torch_dtype")
+        or cfg.get("dtype")
+        or text_cfg.get("torch_dtype")
+        or text_cfg.get("dtype")
+        or ""
+    )
     if dtype != "bfloat16":
         raise RuntimeError(f"Expected bfloat16 in {cfg_path}, got {dtype!r}")
     return dtype
