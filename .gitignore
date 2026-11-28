@@ -88,6 +88,14 @@
 !/evaluation/official/eduardo/configs/prompts/
 /evaluation/official/eduardo/configs/prompts/*
 !/evaluation/official/eduardo/configs/prompts/*.txt
+!/evaluation/routeE_t032/
+/evaluation/routeE_t032/*
+!/evaluation/routeE_t032/*.py
+!/evaluation/routeE_t032/*.sh
+!/evaluation/routeE_t032/*.md
+!/evaluation/routeE_t032/SHA256SUMS
+!/evaluation/routeE_t032/routeE-t032-kit-v1.zip
+!/evaluation/routeE_t032/routeE-t032-kit-v1.zip.sha256
 !/app/
 /app/*
 !/app/*.py
