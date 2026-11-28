@@ -22,7 +22,8 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 AUTHOR494_27B_DIR = REPO_ROOT / "evaluation" / "author494"
 AUTHOR494_PRO_DIR = REPO_ROOT / "evaluation" / "author494_pro5000"
-for _p in (str(HERE), str(AUTHOR494_27B_DIR), str(AUTHOR494_PRO_DIR)):
+PAIRED_DIR = REPO_ROOT / "evaluation" / "paired_gain"
+for _p in (str(HERE), str(AUTHOR494_27B_DIR), str(AUTHOR494_PRO_DIR), str(PAIRED_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

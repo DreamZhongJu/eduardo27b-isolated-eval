@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -286,6 +287,45 @@ class TestT033Package(unittest.TestCase):
         self.assertEqual(picked, [0, 1, 2, 3])
         self.assertEqual(out_buf.getvalue(), "")
         self.assertIn("[t033_gpu]", err_buf.getvalue())
+
+    def test_all_scripts_standalone_import(self) -> None:
+        scripts = (
+            "preflight_t033.py",
+            "check_overlap_t033.py",
+            "precision_compare_selfbuilt.py",
+            "run_eval_routea_author494.py",
+            "run_post_eval_routea.py",
+            "run_t033_dev_sim.py",
+        )
+        env = os.environ.copy()
+        pp = [str(REPO_ROOT)]
+        try:
+            edu = common.locate_eduardo_repo(None)
+            pp.append(str(edu))
+        except Exception:
+            pass
+        if env.get("PYTHONPATH"):
+            pp.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pp)
+        loader = (
+            "import importlib.util, sys; "
+            "p = sys.argv[1]; "
+            "spec = importlib.util.spec_from_file_location('_t033_standalone', p); "
+            "mod = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(mod)"
+        )
+        for name in scripts:
+            proc = subprocess.run(
+                [sys.executable, "-B", "-c", loader, str(HERE / name)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                msg=f"standalone import failed for {name}:\nSTDOUT:{proc.stdout}\nSTDERR:{proc.stderr}",
+            )
 
     def test_shell_scripts_bash_syntax(self) -> None:
         for sh in sorted(HERE.glob("*.sh")):
