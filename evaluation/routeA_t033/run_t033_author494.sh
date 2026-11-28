@@ -107,7 +107,7 @@ echo "$$" > "${OUTPUT_DIR}/runner.pid"
 
 TOTAL_GPUS=$((1 + STUDENT_DP))
 if [ "${AUTO_WAIT}" = "1" ]; then
-  READ_GPUS="$("${PYTHON_BIN}" -B - "${HERE_DIR}" "${TOTAL_GPUS}" "${POLL_SECONDS}" <<'PY'
+  READ_GPUS="$("${PYTHON_BIN}" -B - "${HERE_DIR}" "${TOTAL_GPUS}" "${POLL_SECONDS}" <<'PY' | awk 'NF{line=$0} END{print line}'
 import sys
 sys.path.insert(0, sys.argv[1])
 from common import wait_for_free_gpus
@@ -118,6 +118,9 @@ PY
   TUTOR_GPU="${READ_GPUS%% *}"
   STUDENT_GPUS="${READ_GPUS#* }"
 fi
+[[ "${TUTOR_GPU}" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid TUTOR_GPU='${TUTOR_GPU}'" >&2; exit 2; }
+[[ "${STUDENT_GPUS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "ERROR: invalid STUDENT_GPUS='${STUDENT_GPUS}'" >&2; exit 2; }
+echo "[t033_author494] selected tutor_gpu=${TUTOR_GPU} student_gpus=${STUDENT_GPUS}" >&2
 
 RESOLVED_STUDENT="$("${PYTHON_BIN}" -B - "${HERE_DIR}" "${BASE}" <<'PY'
 import sys
@@ -164,12 +167,18 @@ CUDA_VISIBLE_DEVICES="${STUDENT_GPUS}" VLLM_API_KEY="${SERVING_API_KEY}" \
   > "${OUTPUT_DIR}/student_server.log" 2>&1 &
 STUDENT_PID=$!
 
-"${PYTHON_BIN}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" <<'PY'
+"${PYTHON_BIN}" -B - "${STUDENT_PID}" "${STUDENT_PORT}" "${OUTPUT_DIR}/student_server.log" <<'PY'
 import os, sys, time, urllib.request
-pid, port = int(sys.argv[1]), int(sys.argv[2])
+from pathlib import Path
+pid, port, log_p = int(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3])
 deadline = time.monotonic() + 600
 while time.monotonic() < deadline:
-    os.kill(pid, 0)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        tail = log_p.read_text(encoding="utf-8", errors="replace").splitlines()[-25:] if log_p.is_file() else []
+        print("\n".join(tail), file=sys.stderr)
+        raise SystemExit("ERROR: student vllm exited before becoming healthy")
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as resp:
             if resp.status == 200:

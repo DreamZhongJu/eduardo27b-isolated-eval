@@ -262,6 +262,31 @@ class TestT033Package(unittest.TestCase):
         # theta_hat must STILL be computed even when gated!
         self.assertEqual(m_gated["k16"]["theta_hat"], m_ok["k16"]["theta_hat"])
 
+    def test_wait_for_free_gpus_stdout_is_clean(self) -> None:
+        import contextlib
+        import io
+        from unittest import mock
+
+        gpu_csv = "\n".join([
+            "0, UUID-0, 10, 73405, 73415, 0",
+            "1, UUID-1, 10, 73405, 73415, 0",
+            "2, UUID-2, 10, 73405, 73415, 0",
+            "3, UUID-3, 10, 73405, 73415, 0",
+        ])
+        snap = common.parse_gpu_snapshot(gpu_csv, "")
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with (
+            mock.patch.object(common, "snapshot_gpus", return_value=snap),
+            mock.patch.object(common.time, "sleep", return_value=None),
+            contextlib.redirect_stdout(out_buf),
+            contextlib.redirect_stderr(err_buf),
+        ):
+            picked = common.wait_for_free_gpus(4, poll_seconds=1)
+        self.assertEqual(picked, [0, 1, 2, 3])
+        self.assertEqual(out_buf.getvalue(), "")
+        self.assertIn("[t033_gpu]", err_buf.getvalue())
+
     def test_shell_scripts_bash_syntax(self) -> None:
         for sh in sorted(HERE.glob("*.sh")):
             proc = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)

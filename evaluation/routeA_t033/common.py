@@ -281,12 +281,12 @@ def wait_for_free_gpus(
         free = select_free_gpus(s1, s2, min_free_mib=min_free_mib)
         if len(free) >= num_gpus:
             picked = free[:num_gpus]
-            print(f"[t033_gpu] acquired {num_gpus} GPUs: {picked} (all_free={free})", flush=True)
+            print(f"[t033_gpu] acquired {num_gpus} GPUs: {picked} (all_free={free})", file=sys.stderr, flush=True)
             return picked
         polls += 1
         if deadline is not None and time.monotonic() >= deadline:
             raise RuntimeError(f"Timed out waiting for {num_gpus} idle GPUs (free={free})")
-        print(f"[t033_gpu] poll={polls} free={free} (<{num_gpus}), sleeping {poll_seconds}s...", flush=True)
+        print(f"[t033_gpu] poll={polls} free={free} (<{num_gpus}), sleeping {poll_seconds}s...", file=sys.stderr, flush=True)
         time.sleep(poll_seconds)
 
 
