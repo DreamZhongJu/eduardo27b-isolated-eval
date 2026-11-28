@@ -29,6 +29,19 @@
 !/training/routeA_train/*.md
 !/training/routeA_train/*.zip
 !/training/routeA_train/*.sha256
+!/training/routeC_train/
+/training/routeC_train/*
+!/training/routeC_train/*.py
+!/training/routeC_train/*.sh
+!/training/routeC_train/*.md
+!/training/routeC_train/*.zip
+!/training/routeC_train/*.sha256
+!/routeA_data/
+/routeA_data/*
+!/routeA_data/*.py
+!/routeC_data/
+/routeC_data/*
+!/routeC_data/*.py
 # Canonical evaluation tree; root names are tracked compatibility symlinks.
 !/evaluation/
 /evaluation/*

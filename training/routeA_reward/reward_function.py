@@ -109,10 +109,17 @@ _BATCH_START_TIME: Optional[float] = None
 # Thread-safe numeric-only per-rollout step metrics sink (ZERO text).
 _SINK_LOCK = threading.Lock()
 _SINK_FILES: dict[str, Any] = {}
+_VALID_ROUTE_BRANCHES = ("easy", "hard", "fallback")
+_VALID_GATE_FAIL_TYPES = ("pass", "teaching_only", "leak_only", "both")
 _METRIC_SINK_KEYS: tuple[str, ...] = (
     "score",
     "r_gate",
     "gated",
+    "judge_no_leak_ok",
+    "judge_teaching_ok",
+    "gate_fail_teaching_only",
+    "gate_fail_leak_only",
+    "gate_fail_both",
     "rasch_theta",
     "rasch_gain_g",
     "rasch_theta_scale",
@@ -137,6 +144,26 @@ _METRIC_SINK_KEYS: tuple[str, ...] = (
     "grader_llm_unknown",
     "grader_tech_failed",
 )
+
+
+def _normalize_route_branch(raw: Any) -> str:
+    val = str(raw or "").strip().lower()
+    return val if val in _VALID_ROUTE_BRANCHES else "unknown"
+
+
+def _normalize_gate_fail_type(raw: Any) -> str:
+    val = str(raw or "").strip().lower()
+    return val if val in _VALID_GATE_FAIL_TYPES else "pass"
+
+
+def _median_float(vals: Sequence[float]) -> float:
+    if not vals:
+        return 0.0
+    s = sorted(float(v) for v in vals)
+    mid = len(s) // 2
+    if len(s) % 2 == 1:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
 
 
 def _get_grader_window(key: str, max_window: int) -> AsyncAdaptiveWindow:
@@ -412,6 +439,7 @@ def _empty_route_a_reward(
     num_climbs: int = DEFAULT_LADDER_CLIMBS,
     omit_teacher_turns: bool = True,
     theta_scale: float = DEFAULT_THETA_SCALE,
+    route_branch: str = "unknown",
 ) -> dict[str, Any]:
     """Fixed-schema numeric reward dict for empty transcripts (matches veRL contract)."""
     return {
@@ -421,6 +449,9 @@ def _empty_route_a_reward(
         "r_judge": 0.0,
         "r_gate": 0.0,
         "gated": 0,
+        "gate_fail_teaching_only": 0,
+        "gate_fail_leak_only": 0,
+        "gate_fail_both": 0,
         "r_length": 0.0,
         "length_decay": 1.0,
         "r_think_length": 0.0,
@@ -485,7 +516,121 @@ def _empty_route_a_reward(
         # Non-numeric status labels only (zero reasoning/text logged).
         "judge_no_leak": "REJECT",
         "judge_teaching": "REJECT",
+        "route_branch": _normalize_route_branch(route_branch),
+        "gate_fail_type": "pass",
     }
+
+
+def _row_gate_fail_type(row: dict[str, Any]) -> str:
+    if int(row.get("gated", 0)) == 0:
+        return "pass"
+    raw_type = row.get("gate_fail_type")
+    if raw_type in ("teaching_only", "leak_only", "both"):
+        return str(raw_type)
+    if int(row.get("gate_fail_both", 0)) == 1:
+        return "both"
+    if int(row.get("gate_fail_teaching_only", 0)) == 1:
+        return "teaching_only"
+    if int(row.get("gate_fail_leak_only", 0)) == 1:
+        return "leak_only"
+    if "judge_no_leak_ok" in row and "judge_teaching_ok" in row:
+        leak_bad = int(row.get("judge_no_leak_ok", 1)) == 0
+        teach_bad = int(row.get("judge_teaching_ok", 1)) == 0
+        if leak_bad and teach_bad:
+            return "both"
+        if teach_bad:
+            return "teaching_only"
+        if leak_bad:
+            return "leak_only"
+    return "unknown"
+
+
+def summarize_gate_breakdown(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize gate failure counts & rates by gate type (numeric-only)."""
+    n_total = len(results)
+    if n_total == 0:
+        return {
+            "n_total": 0,
+            "n_gated": 0,
+            "gated_rate": 0.0,
+            "teaching_only_count": 0,
+            "teaching_only_rate": 0.0,
+            "leak_only_count": 0,
+            "leak_only_rate": 0.0,
+            "both_count": 0,
+            "both_rate": 0.0,
+            "teaching_any_count": 0,
+            "leak_any_count": 0,
+        }
+    n_gated = sum(1 for r in results if int(r.get("gated", 0)) == 1)
+    types = [_row_gate_fail_type(r) for r in results]
+    teaching_only = sum(1 for t in types if t == "teaching_only")
+    leak_only = sum(1 for t in types if t == "leak_only")
+    both = sum(1 for t in types if t == "both")
+    return {
+        "n_total": n_total,
+        "n_gated": n_gated,
+        "gated_rate": n_gated / n_total,
+        "teaching_only_count": teaching_only,
+        "teaching_only_rate": teaching_only / n_total,
+        "leak_only_count": leak_only,
+        "leak_only_rate": leak_only / n_total,
+        "both_count": both,
+        "both_rate": both / n_total,
+        "teaching_any_count": teaching_only + both,
+        "leak_any_count": leak_only + both,
+    }
+
+
+def summarize_by_branch(results: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Summarize rollout metrics grouped by ``route_branch`` (numeric-only)."""
+    grouped: dict[str, list[dict[str, Any]]] = {b: [] for b in _VALID_ROUTE_BRANCHES}
+    grouped["unknown"] = []
+    for r in results:
+        b = _normalize_route_branch(r.get("route_branch"))
+        grouped[b].append(r)
+
+    branches_to_emit = list(_VALID_ROUTE_BRANCHES)
+    if grouped["unknown"]:
+        branches_to_emit.append("unknown")
+
+    out: dict[str, dict[str, Any]] = {}
+    for b in branches_to_emit:
+        rows = grouped[b]
+        cnt = len(rows)
+        reward_mean = (
+            sum(float(r.get("score", 0.0)) for r in rows) / cnt if cnt > 0 else 0.0
+        )
+        valid_compliant = [
+            r
+            for r in rows
+            if int(r.get("gated", 0)) == 0 and int(r.get("rasch_valid", 0)) == 1
+        ]
+        thetas = [float(r["rasch_theta"]) for r in valid_compliant]
+        gs = [
+            float(r.get("rasch_gain_g", r.get("delta_solve", 0.0)))
+            for r in valid_compliant
+        ]
+        gb = summarize_gate_breakdown(rows)
+        out[b] = {
+            "count": cnt,
+            "reward_mean": reward_mean,
+            "theta_mean": (sum(thetas) / len(thetas)) if thetas else 0.0,
+            "gated_count": gb["n_gated"],
+            "gated_rate": gb["gated_rate"],
+            "compliant_valid_count": len(valid_compliant),
+            "compliant_g_mean": (sum(gs) / len(gs)) if gs else 0.0,
+            "compliant_g_median": _median_float(gs) if gs else 0.0,
+            "teaching_only_count": gb["teaching_only_count"],
+            "teaching_only_rate": gb["teaching_only_rate"],
+            "leak_only_count": gb["leak_only_count"],
+            "leak_only_rate": gb["leak_only_rate"],
+            "both_count": gb["both_count"],
+            "both_rate": gb["both_rate"],
+            "teaching_any_count": gb["teaching_any_count"],
+            "leak_any_count": gb["leak_any_count"],
+        }
+    return out
 
 
 def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float]:
@@ -556,7 +701,8 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
     def _mean(rows: Sequence[dict[str, Any]], key: str) -> float:
         return sum(float(r.get(key, 0.0)) for r in rows) / len(rows) if rows else 0.0
 
-    return {
+    gb = summarize_gate_breakdown(results)
+    metrics: dict[str, float] = {
         "eduardo/routeA_reward_mean": score_mean,
         "eduardo/routeA_reward_std": score_std,
         "eduardo/routeA_reward_min": score_min,
@@ -600,7 +746,28 @@ def summarize_step_metrics(results: Sequence[dict[str, Any]]) -> dict[str, float
         "eduardo/routeA_grader_tech_failed_rate": (
             total_grader_tech_failed / total_llm_calls if total_llm_calls > 0 else 0.0
         ),
+        "eduardo/routeC_compliant_g_median": _median_float(valid_gs) if valid_gs else 0.0,
+        "eduardo/routeC_gate_fail_teaching_only_count": float(gb["teaching_only_count"]),
+        "eduardo/routeC_gate_fail_teaching_only_rate": gb["teaching_only_rate"],
+        "eduardo/routeC_gate_fail_leak_only_count": float(gb["leak_only_count"]),
+        "eduardo/routeC_gate_fail_leak_only_rate": gb["leak_only_rate"],
+        "eduardo/routeC_gate_fail_both_count": float(gb["both_count"]),
+        "eduardo/routeC_gate_fail_both_rate": gb["both_rate"],
     }
+    if any(_normalize_route_branch(r.get("route_branch")) in _VALID_ROUTE_BRANCHES for r in results):
+        by_branch = summarize_by_branch(results)
+        for b in _VALID_ROUTE_BRANCHES:
+            st = by_branch[b]
+            metrics[f"eduardo/routeC_{b}_count"] = float(st["count"])
+            metrics[f"eduardo/routeC_{b}_reward_mean"] = float(st["reward_mean"])
+            metrics[f"eduardo/routeC_{b}_theta_mean"] = float(st["theta_mean"])
+            metrics[f"eduardo/routeC_{b}_gated_rate"] = float(st["gated_rate"])
+            metrics[f"eduardo/routeC_{b}_compliant_g_mean"] = float(st["compliant_g_mean"])
+            metrics[f"eduardo/routeC_{b}_compliant_g_median"] = float(st["compliant_g_median"])
+            metrics[f"eduardo/routeC_{b}_gate_teaching_only_rate"] = float(st["teaching_only_rate"])
+            metrics[f"eduardo/routeC_{b}_gate_leak_only_rate"] = float(st["leak_only_rate"])
+            metrics[f"eduardo/routeC_{b}_gate_both_rate"] = float(st["both_rate"])
+    return metrics
 
 
 def close_step_metric_sinks() -> None:
@@ -619,8 +786,10 @@ def _emit_step_metric_row(
     *,
     split: str,
     metrics_dir: str,
+    route_branch: str = "unknown",
+    gate_fail_type: str = "pass",
 ) -> None:
-    """Append a strictly numeric rollout snapshot to per-PID JSONL (no text)."""
+    """Append a strictly numeric/enum rollout snapshot to per-PID JSONL (no text)."""
     raw_dir = metrics_dir.strip()
     if not raw_dir:
         return
@@ -633,6 +802,8 @@ def _emit_step_metric_row(
         payload: dict[str, Any] = {
             "ts_ns": time.monotonic_ns(),
             "split": split_tag,
+            "route_branch": _normalize_route_branch(route_branch),
+            "gate_fail_type": _normalize_gate_fail_type(gate_fail_type),
         }
         for k in _METRIC_SINK_KEYS:
             val = result.get(k, 0)
@@ -666,7 +837,13 @@ def summarize_metrics_window(
     """Aggregate per-rollout numeric JSONL metrics within [start_ns, end_ns]."""
     dpath = Path(directory)
     if not dpath.is_dir() or dpath.is_symlink():
-        return {"n_rollouts": 0, "malformed_rows": 0, "metrics": {}}
+        return {
+            "n_rollouts": 0,
+            "malformed_rows": 0,
+            "metrics": {},
+            "by_branch": {},
+            "gate_breakdown": summarize_gate_breakdown([]),
+        }
     matched: list[dict[str, Any]] = []
     malformed = 0
     for path in sorted(dpath.glob("routeA-metrics-*.jsonl")):
@@ -692,6 +869,8 @@ def summarize_metrics_window(
         "n_rollouts": len(matched),
         "malformed_rows": malformed,
         "metrics": summarize_step_metrics(matched),
+        "by_branch": summarize_by_branch(matched),
+        "gate_breakdown": summarize_gate_breakdown(matched),
     }
 
 
@@ -927,6 +1106,7 @@ async def route_a_reward_func(
         or os.environ.get("ROUTEA_STEP_METRICS_DIR", "")
     )
     split_tag = str(extra_info.get("split") or "unknown")
+    route_branch = _normalize_route_branch(extra_info.get("route_branch"))
     batch_log_interval = (
         int(kwargs.get("batch_log_interval", 16))
         if bool(kwargs.get("enable_batch_logging", True))
@@ -943,8 +1123,15 @@ async def route_a_reward_func(
             num_climbs=num_climbs,
             omit_teacher_turns=omit_teacher_turns,
             theta_scale=theta_scale,
+            route_branch=route_branch,
         )
-        _emit_step_metric_row(empty, split=split_tag, metrics_dir=metrics_dir)
+        _emit_step_metric_row(
+            empty,
+            split=split_tag,
+            metrics_dir=metrics_dir,
+            route_branch=route_branch,
+            gate_fail_type="pass",
+        )
         _record_and_maybe_log_batch(empty, interval=batch_log_interval)
         return empty
 
@@ -1195,6 +1382,17 @@ async def route_a_reward_func(
     llm_unknown_rate = (
         grader_llm_unknown / grader_llm_calls if grader_llm_calls > 0 else 0.0
     )
+    gate_fail_teaching_only = int(gated and (teaching == "REJECT") and (no_leak == "OK"))
+    gate_fail_leak_only = int(gated and (no_leak == "REJECT") and (teaching == "OK"))
+    gate_fail_both = int(gated and (no_leak == "REJECT") and (teaching == "REJECT"))
+    if not gated:
+        gate_fail_type = "pass"
+    elif gate_fail_both:
+        gate_fail_type = "both"
+    elif gate_fail_teaching_only:
+        gate_fail_type = "teaching_only"
+    else:
+        gate_fail_type = "leak_only"
 
     result = {
         "score": float(total),
@@ -1203,6 +1401,9 @@ async def route_a_reward_func(
         "r_judge": float(r_judge),
         "r_gate": float(r_gate),
         "gated": int(gated),
+        "gate_fail_teaching_only": int(gate_fail_teaching_only),
+        "gate_fail_leak_only": int(gate_fail_leak_only),
+        "gate_fail_both": int(gate_fail_both),
         "r_length": float(r_length),
         "length_decay": float(length_decay),
         "r_think_length": float(r_think_length),
@@ -1269,23 +1470,33 @@ async def route_a_reward_func(
         # Non-numeric gate status only (no text / reasoning).
         "judge_no_leak": no_leak,
         "judge_teaching": teaching,
+        "route_branch": route_branch,
+        "gate_fail_type": gate_fail_type,
     }
 
     # Sanitized rollout debug log: numeric & status fields only.
     logger.debug(
-        "routeA_rollout mode=%s score=%.4f theta=%.4f valid=%d prior_pulled=%d "
-        "gated=%d student_calls=%d llm_calls=%d llm_unknown=%d tech_fail=%d",
+        "routeA_rollout mode=%s branch=%s score=%.4f theta=%.4f valid=%d prior_pulled=%d "
+        "gated=%d gate_fail=%s student_calls=%d llm_calls=%d llm_unknown=%d tech_fail=%d",
         mode,
+        route_branch,
         result["score"],
         result["rasch_theta"],
         result["rasch_valid"],
         result["rasch_prior_pulled"],
         result["gated"],
+        gate_fail_type,
         result["ladder_student_calls"],
         result["grader_llm_calls"],
         result["grader_llm_unknown"],
         result["grader_tech_failed"],
     )
-    _emit_step_metric_row(result, split=split_tag, metrics_dir=metrics_dir)
+    _emit_step_metric_row(
+        result,
+        split=split_tag,
+        metrics_dir=metrics_dir,
+        route_branch=route_branch,
+        gate_fail_type=gate_fail_type,
+    )
     _record_and_maybe_log_batch(result, interval=batch_log_interval)
     return result

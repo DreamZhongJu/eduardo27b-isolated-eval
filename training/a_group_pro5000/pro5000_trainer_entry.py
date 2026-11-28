@@ -378,6 +378,8 @@ def bound_trainer(native):
                         split='val',
                     )
                     val_metrics = val_ra.get('metrics', {})
+                    val_by_branch = val_ra.get('by_branch', {})
+                    val_gate_bd = val_ra.get('gate_breakdown', {})
                     t017_ref = T017_VAL_GATED_REF.get(int(self.global_steps))
                     payload = {
                         'step': int(self.global_steps),
@@ -385,18 +387,28 @@ def bound_trainer(native):
                         'n_rollouts': int(val_ra.get('n_rollouts', 0)),
                         'malformed_rows': int(val_ra.get('malformed_rows', 0)),
                         'metrics': val_metrics,
+                        'by_branch': val_by_branch,
+                        'gate_breakdown': val_gate_bd,
                         't017_val_gated_ref': t017_ref,
                     }
                     val_dir = self.formal_work / 'val-statistics'
                     val_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
                     write_json(val_dir / f'{int(self.global_steps)}.json', payload)
                     t017_str = f'{float(t017_ref):.2f}' if t017_ref is not None else 'N/A'
+                    branch_parts = []
+                    for b in ('easy', 'hard', 'fallback'):
+                        bst = val_by_branch.get(b)
+                        if bst and bst.get('count', 0) > 0:
+                            branch_parts.append(
+                                f"{b}:n={bst['count']},g={bst.get('compliant_g_mean', 0.0):.3f},gated={bst.get('gated_rate', 0.0):.3f}"
+                            )
+                    branch_str = f" branches=({' '.join(branch_parts)})" if branch_parts else ''
                     print(
                         f"[VAL step={self.global_steps}] n={payload['n_rollouts']} "
                         f"reward={val_metrics.get('eduardo/routeA_reward_mean', 0.0):.3f} "
                         f"theta={val_metrics.get('eduardo/routeA_theta_mean', 0.0):.3f} "
                         f"gated={val_metrics.get('eduardo/routeA_gated_rate', 0.0):.3f} "
-                        f"(t017_ref={t017_str})",
+                        f"(t017_ref={t017_str}){branch_str}",
                         flush=True,
                     )
                 except ImportError:
@@ -528,10 +540,17 @@ def bound_trainer(native):
                     ma5_str = f'{float(ma5_g):.3f}' if ma5_g is not None else 'N/A'
                     t017_ref = rgates.get('t017_val_gated_ref')
                     t017_str = f'{float(t017_ref):.2f}' if t017_ref is not None else 'N/A'
+                    by_branch = row['routeA_metrics'].get('by_branch', {})
+                    b_parts = []
+                    for b, tag in (('easy', 'E'), ('hard', 'H'), ('fallback', 'F')):
+                        bst = by_branch.get(b)
+                        if bst and bst.get('count', 0) > 0:
+                            b_parts.append(f"{tag}:{bst.get('gated_rate', 0.0):.3f}")
+                    b_str = f" branch_gated=({','.join(b_parts)})" if b_parts else ''
                     extra_ra = (
                         f" avg5_s={avg5_s:.1f}s reward={ram.get('eduardo/routeA_reward_mean', 0.0):.3f} "
                         f"theta={ram.get('eduardo/routeA_theta_mean', 0.0):.3f} "
-                        f"gated={ram.get('eduardo/routeA_gated_rate', 0.0):.3f} (ma5={ma5_str}, t017_val={t017_str})"
+                        f"gated={ram.get('eduardo/routeA_gated_rate', 0.0):.3f} (ma5={ma5_str}, t017_val={t017_str}){b_str}"
                     )
                 print(
                     f"[CKPT step={step}] step_s={metrics.get('timing_s/step', 0.0):.1f}s "
