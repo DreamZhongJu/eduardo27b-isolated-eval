@@ -24,7 +24,13 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from common_utils import check_grading_packages, grade_math_response, sha256_file, strip_teacher_controls
+from common_utils import (
+    check_grading_packages,
+    grade_math_response,
+    sha256_file,
+    strip_teacher_controls,
+    verify_model_bfloat16,
+)
 from leakage_judges import (
     AsyncJudgeClient,
     Layer1RuleScreener,
@@ -915,6 +921,18 @@ class TestRouteET032(unittest.TestCase):
         )
         self.assertNotEqual(proc_conc.returncode, 0)
         self.assertIn("<= 8", proc_conc.stderr)
+
+        # 5. Nested text_config.dtype=bfloat16 (Qwen3.5 multimodal config) accepted; fp16 rejected
+        with tempfile.TemporaryDirectory() as td_cfg:
+            p_ok = Path(td_cfg) / "m_ok"
+            p_ok.mkdir()
+            (p_ok / "config.json").write_text(json.dumps({"text_config": {"dtype": "bfloat16"}}), encoding="utf-8")
+            self.assertEqual(verify_model_bfloat16(p_ok), "bfloat16")
+            p_bad = Path(td_cfg) / "m_bad"
+            p_bad.mkdir()
+            (p_bad / "config.json").write_text(json.dumps({"text_config": {"dtype": "float16"}}), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                verify_model_bfloat16(p_bad)
 
 
 if __name__ == "__main__":
