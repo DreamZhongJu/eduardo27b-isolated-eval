@@ -57,7 +57,9 @@ from routeC_data.routeC_inventory import (
     run_inventory,
 )
 from routeC_data.stage2_source_runner import (
+    is_pro5000_gpu_idle,
     load_measured_rows,
+    parse_pro5000_gpu_csv_with_used,
     run_gpu_phase,
     run_summarize_phase,
 )
@@ -430,6 +432,29 @@ class TestStage2SourceRunner(unittest.TestCase):
                         k_samples=16,
                     )
                 )
+
+    def test_pro5000_gpu_idle_parser_handles_584mib_reserve_and_gpu6_quirk(self) -> None:
+        gpu_csv = "\n".join(
+            [
+                f"{i}, GPU-{i}, 0, 72831, 73415, {100 if i == 6 else 0}"
+                for i in range(8)
+            ]
+        )
+        gpus = parse_pro5000_gpu_csv_with_used(gpu_csv, "")
+        self.assertEqual(len(gpus), 8)
+        self.assertTrue(all(is_pro5000_gpu_idle(g) for g in gpus))
+
+        # GPU 6 with used_mib >= 500 or an active compute app must be marked busy
+        gpu_csv_busy = "\n".join(
+            [
+                "0, GPU-0, 0, 72831, 73415, 0",
+                "6, GPU-6, 512, 72319, 73415, 100",
+                "7, GPU-7, 0, 72831, 73415, 0",
+            ]
+        )
+        gpus_busy = parse_pro5000_gpu_csv_with_used(gpu_csv_busy, "GPU-7, 12345, 200")
+        idle_map = {g["index"]: is_pro5000_gpu_idle(g) for g in gpus_busy}
+        self.assertEqual(idle_map, {0: True, 6: False, 7: False})
 
 
 if __name__ == "__main__":

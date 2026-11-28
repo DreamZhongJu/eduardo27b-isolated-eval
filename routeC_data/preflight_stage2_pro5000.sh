@@ -24,7 +24,7 @@ export PYTHONPATH="${CODE_ROOT}:${EDUARDO_REPO}"
 "${PYTHON_BIN}" -B - "${CODE_ROOT}" "${STUDENT_MODEL}" "${JUDGE_MODEL}" "${MEASURED_JSONL}" "${EXPECTED_SHA256}" "${BASE}" <<'PY'
 import hashlib, importlib.metadata, json, shutil, subprocess, sys
 from pathlib import Path
-from routeA_data.gpu_wait_pro5000 import is_gpu_eligible, parse_gpu_csv
+from routeC_data.stage2_source_runner import is_pro5000_gpu_idle, parse_pro5000_gpu_csv_with_used
 
 code_root = Path(sys.argv[1])
 student_arg = Path(sys.argv[2])
@@ -138,17 +138,19 @@ else:
 
 print("=== 6. All-8-GPU Idle Gate (T-026 Must Be Finished) & Disk ===")
 gpu_csv = subprocess.check_output(
-    ["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
+    ["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.free,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
     text=True,
 )
 apps_csv = subprocess.check_output(
     ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
     text=True,
 )
-gpus = parse_gpu_csv(gpu_csv, apps_csv)
-idle_idxs = [g["index"] for g in gpus if is_gpu_eligible(g, min_free_mib=70000)]
-busy_idxs = [g["index"] for g in gpus if not is_gpu_eligible(g, min_free_mib=70000)]
+gpus = parse_pro5000_gpu_csv_with_used(gpu_csv, apps_csv)
+idle_idxs = [g["index"] for g in gpus if is_pro5000_gpu_idle(g, min_free_mib=70000, max_used_mib=500)]
+busy_idxs = [g["index"] for g in gpus if not is_pro5000_gpu_idle(g, min_free_mib=70000, max_used_mib=500)]
+gpu_brief = ", ".join(f"{g['index']}:used={g['used_mib']}MiB/free={g['free_mib']}MiB/util={g['util_pct']}%" for g in gpus)
 print(f"  total_gpus={len(gpus)} idle_gpus={idle_idxs} busy_gpus={busy_idxs}")
+print(f"  gpu_detail=[{gpu_brief}]")
 if len(gpus) < 8 or len(idle_idxs) < len(gpus):
     hard_errors.append(f"GPUS_NOT_ALL_IDLE:idle={len(idle_idxs)}/{len(gpus)}")
 

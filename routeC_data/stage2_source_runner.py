@@ -20,7 +20,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from routeA_data.hybrid_grader import (
     DEFAULT_MAX_WINDOW,
@@ -54,6 +54,69 @@ from routeC_data.routeC_inventory import (
 
 def source_key_hash(source_id: str) -> str:
     return sha256_bytes(f"source::{source_id}".encode("utf-8"))[:24]
+
+
+def parse_pro5000_gpu_csv_with_used(gpu_csv: str, apps_csv: str) -> List[Dict[str, Any]]:
+    """Parse `nvidia-smi --query-gpu=index,uuid,memory.used,memory.free,memory.total,utilization.gpu`
+    and `--query-compute-apps=gpu_uuid,pid,used_memory`.
+    Uses real `memory.used` (not `total - free`, which includes 584 MiB driver/ECC reserve).
+    """
+    gpus: Dict[int, Dict[str, Any]] = {}
+    uuid_to_idx: Dict[str, int] = {}
+    for raw in gpu_csv.strip().splitlines():
+        if not raw.strip():
+            continue
+        parts = [x.strip() for x in raw.split(",")]
+        if len(parts) != 6:
+            raise ValueError(f"Unexpected nvidia-smi GPU row: {raw!r}")
+        idx = int(parts[0])
+        uuid = parts[1]
+        used_mib = int(parts[2])
+        free_mib = int(parts[3])
+        total_mib = int(parts[4])
+        util_pct = int(parts[5])
+        gpus[idx] = {
+            "index": idx,
+            "uuid": uuid,
+            "used_mib": used_mib,
+            "free_mib": free_mib,
+            "total_mib": total_mib,
+            "util_pct": util_pct,
+            "apps": [],
+        }
+        uuid_to_idx[uuid] = idx
+
+    for raw in apps_csv.strip().splitlines():
+        if not raw.strip():
+            continue
+        parts = [x.strip() for x in raw.split(",")]
+        if len(parts) != 3:
+            continue
+        uuid, pid_s, mem_s = parts
+        if uuid in uuid_to_idx:
+            gpus[uuid_to_idx[uuid]]["apps"].append((pid_s, mem_s))
+
+    return [gpus[i] for i in sorted(gpus)]
+
+
+def is_pro5000_gpu_idle(
+    gpu: Dict[str, Any],
+    *,
+    min_free_mib: int = 70000,
+    max_used_mib: int = 500,
+    quirk_gpus: Optional[Set[int]] = None,
+) -> bool:
+    """Return True if a Pro 5000 GPU is idle per 资源账本.md (handles GPU 6 util=100% quirk)."""
+    qset = {6} if quirk_gpus is None else quirk_gpus
+    if gpu["total_mib"] < min_free_mib or gpu["free_mib"] < min_free_mib:
+        return False
+    if gpu["used_mib"] >= max_used_mib:
+        return False
+    if len(gpu["apps"]) != 0:
+        return False
+    if gpu["index"] in qset:
+        return True
+    return gpu["util_pct"] < 10
 
 
 def load_measured_rows(
