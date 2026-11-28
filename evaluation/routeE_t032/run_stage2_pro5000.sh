@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Stage 2 runner for T-032 on Pro 5000:
-#   --step p1                 (1 idle GPU, bf16, MATH500 + GSM8K)
+#   --step p1                 (1 idle GPU, bf16, MATH500 + GSM8K x base_4b, a_group_step100, route_a_step100)
 #   --step p2_sample          (0 GPUs, stratified 50+50 blind sampling)
 #   --step p2_export_claude30 (0 GPUs, export 30 blind dialogues for Claude)
-#   --step p2_calibrate       (reuses shared 27B or starts TP=2 on 2 idle GPUs)
-#   --step p3                 (reuses shared 27B or starts TP=2 on 2 idle GPUs)
+#   --step p2_calibrate       (reuses shared 27B [concurrency<=8] or starts TP=2 on 2 idle GPUs)
+#   --step p3                 (reuses shared 27B [concurrency<=8] or starts TP=2 on 2 idle GPUs)
+#   --step p3_routea          (supplement P3 with Route A 494 dialogues once T-033 Stage 2 completes)
 #   --step status             (print latest run status & aggregate summary)
 set -euo pipefail
 
@@ -16,14 +17,17 @@ VLLM_BIN="${VLLM_BIN:-${ENV_DIR}/bin/vllm}"
 
 BASE_4B="${BASE_4B_MODEL:-/data/models/Qwen3.5-4B}"
 STEP100_DIR="${A_GROUP_STEP100:-${BASE}/runs/stage3_formal_20261121_144311/exports/step_100}"
+ROUTE_A_STEP100_DIR="${ROUTE_A_STEP100:-${BASE}/runs/t026_stage3_formal_20261126_140508/exports/step_100}"
 JUDGE_MODEL_DIR="${JUDGE_MODEL_DIR:-/dev/shm/zhujie_a_group/Qwen3.6-27B}"
 AGROUP_494_JSON="${AGROUP_494_JSON:-${BASE}/runs/eval_author494_agroup_full_20261123_134421/a_group_step100/transfer_eval_a_group_step100_author494_pro5000_20261123_134533.json}"
 M27B_494_JSON="${M27B_494_JSON:-${BASE}/runs/t022_27b_pro5000_20261125_102341/full494/transfer_eval_eduardo_27b_author494_pro5000_full494_20261125_103810.json}"
+ROUTEA_494_JSON="${ROUTEA_494_JSON:-}"
 
 STEP=""
 RUN_DIR="${BASE}/runs/t032_stage2"
 SHARED_JUDGE_URL=""
 JUDGE_PORT="18991"
+JUDGE_CONCURRENCY=""
 USER_CSV=""
 CLAUDE_CSV=""
 
@@ -33,11 +37,24 @@ while [ "$#" -gt 0 ]; do
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --shared-judge-api-base) SHARED_JUDGE_URL="$2"; shift 2 ;;
     --judge-port) JUDGE_PORT="$2"; shift 2 ;;
+    --judge-concurrency) JUDGE_CONCURRENCY="$2"; shift 2 ;;
+    --routea-494-json) ROUTEA_494_JSON="$2"; shift 2 ;;
     --user-csv) USER_CSV="$2"; shift 2 ;;
     --claude-csv) CLAUDE_CSV="$2"; shift 2 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "${SHARED_JUDGE_URL}" ]; then
+  if [ -z "${JUDGE_CONCURRENCY}" ]; then
+    JUDGE_CONCURRENCY="8"
+  elif [ "${JUDGE_CONCURRENCY}" -gt 8 ]; then
+    echo "ERROR: shared 27B concurrency must be <= 8 (got ${JUDGE_CONCURRENCY})" >&2
+    exit 2
+  fi
+else
+  JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-16}"
+fi
 
 unset LD_LIBRARY_PATH HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy CUDA_VISIBLE_DEVICES AGNES_API_KEY GEMINI_API_KEY || true
 export LD_LIBRARY_PATH="${ENV_DIR}/lib"
@@ -113,7 +130,7 @@ print(idle[0])
 PY
 )"
     CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" -B "${HERE}/p1_math_checkup.py" \
-      --models "base_4b=${BASE_4B},a_group_step100=${STEP100_DIR}" \
+      --models "base_4b=${BASE_4B},a_group_step100=${STEP100_DIR},route_a_step100=${ROUTE_A_STEP100_DIR}" \
       --benchmarks math500,gsm8k \
       --data-dir "${BASE}/data/routeE_benchmarks" \
       --out-dir "${RUN_DIR}/p1" \
@@ -142,15 +159,35 @@ PY
       --claude-csv "${C_CSV}" \
       --out-dir "${RUN_DIR}/p2_calibrated" \
       --judge-api-base "${J_URL}" \
+      --judge-concurrency "${JUDGE_CONCURRENCY}" \
       --require-math-verify
     ;;
   p3)
     J_URL="$(ensure_judge_server)"
+    EXTRA_P3_ARGS=()
+    if [ -n "${ROUTEA_494_JSON}" ] && [ -f "${ROUTEA_494_JSON}" ]; then
+      EXTRA_P3_ARGS+=(--routea-json "${ROUTEA_494_JSON}")
+    fi
     "${PYTHON_BIN}" -B "${HERE}/p3_rejudge_494.py" \
       --agroup-json "${AGROUP_494_JSON}" \
       --model27b-json "${M27B_494_JSON}" \
+      "${EXTRA_P3_ARGS[@]}" \
       --out-dir "${RUN_DIR}/p3" \
       --judge-api-base "${J_URL}" \
+      --judge-concurrency "${JUDGE_CONCURRENCY}" \
+      --require-math-verify
+    ;;
+  p3_routea)
+    if [ -z "${ROUTEA_494_JSON}" ] || [ ! -f "${ROUTEA_494_JSON}" ]; then
+      echo "ERROR: --step p3_routea requires an existing --routea-494-json file (got '${ROUTEA_494_JSON}')" >&2
+      exit 2
+    fi
+    J_URL="$(ensure_judge_server)"
+    "${PYTHON_BIN}" -B "${HERE}/p3_rejudge_494.py" \
+      --routea-json "${ROUTEA_494_JSON}" \
+      --out-dir "${RUN_DIR}/p3" \
+      --judge-api-base "${J_URL}" \
+      --judge-concurrency "${JUDGE_CONCURRENCY}" \
       --require-math-verify
     ;;
   status)
@@ -163,7 +200,7 @@ PY
     done
     ;;
   *)
-    echo "Usage: $0 --step {p1|p2_sample|p2_export_claude30|p2_calibrate|p3|status} [options]" >&2
+    echo "Usage: $0 --step {p1|p2_sample|p2_export_claude30|p2_calibrate|p3|p3_routea|status} [options]" >&2
     exit 2
     ;;
 esac

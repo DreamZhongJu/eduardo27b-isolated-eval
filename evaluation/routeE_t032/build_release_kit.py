@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ZIP_NAME = "routeE-t032-kit-v1.zip"
+ZIP_NAME = "routeE-t032-kit-v2.zip"
 ALLOWED_SUFFIXES = {".py", ".sh", ".md"}
 EXCLUDED_FILES = {ZIP_NAME, f"{ZIP_NAME}.sha256", "SHA256SUMS"}
 

@@ -24,14 +24,19 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from common_utils import check_grading_packages, grade_math_response, strip_teacher_controls
+from common_utils import check_grading_packages, grade_math_response, sha256_file, strip_teacher_controls
 from leakage_judges import (
     AsyncJudgeClient,
     Layer1RuleScreener,
     evaluate_combined_4layer,
     parse_checklist_vote,
 )
-from p1_math_checkup import format_gsm8k_4shot_prompt, format_math500_prompt, score_benchmark_items
+from p1_math_checkup import (
+    compute_all_pairwise_comparisons,
+    format_gsm8k_4shot_prompt,
+    format_math500_prompt,
+    score_benchmark_items,
+)
 from p2_calibrate_consistency import compute_cohens_kappa, compute_prf1, run_calibration
 from p2_export_claude30 import export_claude_30
 from p2_gold_sampling import UnsealGateError, sample_blind_gold_set, unseal_mapping_key
@@ -39,6 +44,7 @@ from p2_view_dialogue import format_blind_dialogue
 from p3_rejudge_494 import summarize_rejudged_records
 from p4_contrastive_data import (
     ContaminationError,
+    assert_zero_split_overlap,
     build_contrastive_pairs,
     length_diff_within_tolerance,
 )
@@ -47,7 +53,11 @@ from p4_e0_methods import (
     fit_all_e0_methods_for_base,
     verify_unplug_greedy_exact_match,
 )
-from p4_eval_val100 import summarize_against_base
+from p4_eval_val100 import (
+    render_val100_markdown_table,
+    select_paired_baseline,
+    summarize_against_base,
+)
 
 HERETIC_LOCAL_ROOT = Path(os.environ.get("HERETIC_ROOT", "/tmp/t032_inspect/heretic"))
 
@@ -543,6 +553,29 @@ class TestRouteET032(unittest.TestCase):
 
             val_pq = tmp / "val.parquet"
             pd.DataFrame([{"extra_info": {"problem": "Forbidden val problem?"}}]).to_parquet(val_pq, index=False)
+            test_pq = tmp / "test.parquet"
+            pd.DataFrame([{"extra_info": {"problem": "Forbidden test 494 problem?"}}]).to_parquet(test_pq, index=False)
+            test_pq_sha = sha256_file(test_pq)
+
+            # Mandatory test_parquet guard MUST fail if omitted, missing, wrong sha256, or overlapping
+            with self.assertRaises(ContaminationError):
+                assert_zero_split_overlap(["Clean train problem"], val_parquet=val_pq, test_parquet=None)
+            with self.assertRaises(ContaminationError):
+                assert_zero_split_overlap(["Clean train problem"], val_parquet=val_pq, test_parquet=tmp / "missing.parquet")
+            with self.assertRaises(ContaminationError):
+                assert_zero_split_overlap(
+                    ["Clean train problem"],
+                    val_parquet=val_pq,
+                    test_parquet=test_pq,
+                    expected_test_sha256="0" * 64,
+                )
+            with self.assertRaises(ContaminationError):
+                assert_zero_split_overlap(
+                    ["Forbidden test 494 problem?"],
+                    val_parquet=val_pq,
+                    test_parquet=test_pq,
+                    expected_test_sha256=test_pq_sha,
+                )
 
             # Contamination check MUST fail if train overlaps val
             with self.assertRaises(ContaminationError):
@@ -551,6 +584,8 @@ class TestRouteET032(unittest.TestCase):
                         conversations=[{"problem": "Forbidden val problem?", "answer": "5", "raw_messages": []}],
                         rewriter_client=AsyncJudgeClient(completion_fn=lambda p: "{}"),
                         val_parquet=val_pq,
+                        test_parquet=test_pq,
+                        expected_test_sha256=test_pq_sha,
                         min_pairs=1,
                     )
                 )
@@ -596,12 +631,16 @@ class TestRouteET032(unittest.TestCase):
                     conversations=convs,
                     rewriter_client=AsyncJudgeClient(completion_fn=fake_rewriter),
                     val_parquet=val_pq,
+                    test_parquet=test_pq,
+                    expected_test_sha256=test_pq_sha,
                     target_pairs=10,
                     min_pairs=6,
                     max_pairs=12,
                     seed=42,
                 )
             )
+            self.assertTrue(pair_res["stats"]["test_guard_checked"])
+            self.assertEqual(pair_res["stats"]["test_parquet_sha256"], test_pq_sha)
             fit_pairs = pair_res["fit"]
             held_pairs = pair_res["heldout"]
             self.assertGreaterEqual(len(fit_pairs), 4)
@@ -734,6 +773,148 @@ class TestRouteET032(unittest.TestCase):
                 check=True,
             )
             self.assertEqual(prog.stdout.strip(), "labeled: 0/20")
+
+    def test_inbox1_three_model_p1_hf_pairing_and_guards(self) -> None:
+        # 1. P1 3-model pairwise comparisons (base_4b, a_group_step100, route_a_step100)
+        res_by_model = {
+            "base_4b": {"math500": {"correct_vec": [1, 0, 1, 0]}},
+            "a_group_step100": {"math500": {"correct_vec": [1, 1, 1, 0]}},
+            "route_a_step100": {"math500": {"correct_vec": [1, 1, 1, 1]}},
+        }
+        pairs = compute_all_pairwise_comparisons(
+            ["base_4b", "a_group_step100", "route_a_step100"],
+            res_by_model,
+            ["math500"],
+            draws=200,
+            seed=42,
+        )
+        self.assertEqual(
+            set(pairs.keys()),
+            {
+                "a_group_step100_minus_base_4b",
+                "route_a_step100_minus_base_4b",
+                "route_a_step100_minus_a_group_step100",
+            },
+        )
+        self.assertAlmostEqual(pairs["route_a_step100_minus_a_group_step100"]["math500"]["diff_mean"], 0.25, places=6)
+
+        # 2. P4 Method 3 (steering_hook) MUST pair against unmodified_hf; vLLM arms pair against unmodified_vllm
+        vllm_items = [
+            {"row_index": i, "delta_transfer": 0.10, "delta_same": 0.20, "leaked": int(i < 5), "empty_turn_rate": 0.05}
+            for i in range(10)
+        ]
+        hf_items = [
+            {"row_index": i, "delta_transfer": 0.15, "delta_same": 0.25, "leaked": int(i < 4), "empty_turn_rate": 0.02}
+            for i in range(10)
+        ]
+        arm_hf_items = [
+            {"row_index": i, "delta_transfer": 0.16, "delta_same": 0.26, "leaked": int(i < 2), "empty_turn_rate": 0.02}
+            for i in range(10)
+        ]
+        eng_s, ref_s, base_s, m5_s = select_paired_baseline(
+            kind="steering_hook",
+            vllm_baseline=(vllm_items, [1] * 8 + [0] * 2),
+            hf_baseline=(hf_items, [1] * 7 + [0] * 3),
+        )
+        self.assertEqual((eng_s, ref_s), ("hf", "unmodified_hf"))
+        self.assertIs(base_s, hf_items)
+        self.assertEqual(m5_s, [1] * 7 + [0] * 3)
+
+        eng_v, ref_v, base_v, _ = select_paired_baseline(
+            kind="peft_lora",
+            vllm_baseline=(vllm_items, [1] * 8 + [0] * 2),
+            hf_baseline=(hf_items, [1] * 7 + [0] * 3),
+        )
+        self.assertEqual((eng_v, ref_v), ("vllm", "unmodified_vllm"))
+        self.assertIs(base_v, vllm_items)
+
+        with self.assertRaises(RuntimeError):
+            select_paired_baseline(
+                kind="steering_hook",
+                vllm_baseline=(vllm_items, [1] * 10),
+                hf_baseline=None,
+            )
+
+        rows = [
+            summarize_against_base(
+                arm_name="unmodified_vllm",
+                base_label="base_4b",
+                arm_items=vllm_items,
+                base_items=vllm_items,
+                arm_math500_vec=[1] * 8 + [0] * 2,
+                base_math500_vec=[1] * 8 + [0] * 2,
+                engine="vllm",
+                paired_against="unmodified_vllm",
+                draws=200,
+                seed=42,
+            ),
+            summarize_against_base(
+                arm_name="unmodified_hf",
+                base_label="base_4b",
+                arm_items=hf_items,
+                base_items=vllm_items,
+                arm_math500_vec=[1] * 7 + [0] * 3,
+                base_math500_vec=[1] * 8 + [0] * 2,
+                engine="hf",
+                paired_against="unmodified_vllm",
+                draws=200,
+                seed=42,
+            ),
+            summarize_against_base(
+                arm_name="dir_addition",
+                base_label="base_4b",
+                arm_items=arm_hf_items,
+                base_items=hf_items,
+                arm_math500_vec=[1] * 7 + [0] * 3,
+                base_math500_vec=[1] * 7 + [0] * 3,
+                engine="hf",
+                paired_against="unmodified_hf",
+                draws=200,
+                seed=42,
+            ),
+        ]
+        self.assertAlmostEqual(rows[2]["leak_rel_drop_vs_base"], 0.50, places=6)
+        self.assertEqual(rows[2]["paired_against"], "unmodified_hf")
+        md = render_val100_markdown_table(rows)
+        self.assertIn("unmodified_vllm", md)
+        self.assertIn("unmodified_hf", md)
+        self.assertIn("dir_addition", md)
+
+        # 3. CLI guard: p4_contrastive_data.py requires --test-parquet-guard
+        proc_no_guard = subprocess.run(
+            [
+                sys.executable,
+                str(HERE / "p4_contrastive_data.py"),
+                "--data-dir",
+                "/tmp",
+                "--out-dir",
+                "/tmp",
+                "--rewriter-api-base",
+                "http://127.0.0.1:9/v1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc_no_guard.returncode, 0)
+        self.assertIn("--test-parquet-guard", proc_no_guard.stderr)
+
+        # 4. Shared 27B concurrency guard in run_stage2_pro5000.sh rejects > 8
+        proc_conc = subprocess.run(
+            [
+                "bash",
+                str(HERE / "run_stage2_pro5000.sh"),
+                "--step",
+                "status",
+                "--shared-judge-api-base",
+                "http://127.0.0.1:18862/v1",
+                "--judge-concurrency",
+                "16",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(proc_conc.returncode, 0)
+        self.assertIn("<= 8", proc_conc.stderr)
 
 
 if __name__ == "__main__":

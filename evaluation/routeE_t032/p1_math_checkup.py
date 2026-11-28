@@ -285,6 +285,30 @@ def compare_model_results(
     return paired
 
 
+def compute_all_pairwise_comparisons(
+    model_labels: Sequence[str],
+    results_by_model: dict[str, dict[str, Any]],
+    benchmarks: Sequence[str],
+    *,
+    draws: int = 10000,
+    seed: int = 42,
+) -> dict[str, dict[str, Any]]:
+    """Compute all pairwise paired-bootstrap diffs (target - ref) for every pair (i < j)."""
+    paired_comparisons: dict[str, dict[str, Any]] = {}
+    for i, ref_label in enumerate(model_labels):
+        for target_label in model_labels[i + 1 :]:
+            paired_comparisons[f"{target_label}_minus_{ref_label}"] = {
+                b: compare_model_results(
+                    results_by_model[ref_label][b],
+                    results_by_model[target_label][b],
+                    draws=draws,
+                    seed=seed,
+                )
+                for b in benchmarks
+            }
+    return paired_comparisons
+
+
 def _parse_models_arg(raw: str) -> list[tuple[str, str]]:
     pairs: list[tuple[str, str]] = []
     for item in raw.split(","):
@@ -361,19 +385,13 @@ def main() -> None:
         finally:
             gen.close()
 
-    paired_comparisons: dict[str, Any] = {}
-    if len(model_specs) >= 2:
-        base_label = model_specs[0][0]
-        for target_label, _ in model_specs[1:]:
-            paired_comparisons[f"{target_label}_minus_{base_label}"] = {
-                b: compare_model_results(
-                    results_by_model[base_label][b],
-                    results_by_model[target_label][b],
-                    draws=args.draws,
-                    seed=args.seed,
-                )
-                for b in benchmarks
-            }
+    paired_comparisons = compute_all_pairwise_comparisons(
+        [label for label, _ in model_specs],
+        results_by_model,
+        benchmarks,
+        draws=args.draws,
+        seed=args.seed,
+    )
 
     clean_models = {
         label: {

@@ -16,6 +16,7 @@ STEP100_DIR="${A_GROUP_STEP100:-${BASE}/runs/stage3_formal_20261121_144311/expor
 STUDENT_MODEL_DIR="${STUDENT_MODEL:-/dev/shm/zhujie_a_group/Meta-Llama-3.1-8B-Instruct}"
 JUDGE_MODEL_DIR="${JUDGE_MODEL_DIR:-/dev/shm/zhujie_a_group/Qwen3.6-27B}"
 HERETIC_ROOT="${HERETIC_ROOT:-${BASE}/external/heretic-d89c7a2d}"
+TEST_494_PARQUET="${TEST_494_PARQUET:-${BASE}/data/author494_eval/test.parquet}"
 
 STEP="all"
 RUN_DIR="${BASE}/runs/t032_stage3_e0"
@@ -23,6 +24,7 @@ SHARED_STUDENT_URL=""
 SHARED_JUDGE_URL=""
 STUDENT_PORT="18992"
 JUDGE_PORT="18993"
+JUDGE_CONCURRENCY=""
 ARA_SMALL_RANK="16"
 
 while [ "$#" -gt 0 ]; do
@@ -32,10 +34,23 @@ while [ "$#" -gt 0 ]; do
     --heretic-root) HERETIC_ROOT="$2"; shift 2 ;;
     --shared-student-api-base) SHARED_STUDENT_URL="$2"; shift 2 ;;
     --shared-judge-api-base) SHARED_JUDGE_URL="$2"; shift 2 ;;
+    --judge-concurrency) JUDGE_CONCURRENCY="$2"; shift 2 ;;
+    --test-parquet-guard) TEST_494_PARQUET="$2"; shift 2 ;;
     --ara-small-rank) ARA_SMALL_RANK="$2"; shift 2 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "${SHARED_JUDGE_URL}" ]; then
+  if [ -z "${JUDGE_CONCURRENCY}" ]; then
+    JUDGE_CONCURRENCY="8"
+  elif [ "${JUDGE_CONCURRENCY}" -gt 8 ]; then
+    echo "ERROR: shared 27B concurrency must be <= 8 (got ${JUDGE_CONCURRENCY})" >&2
+    exit 2
+  fi
+else
+  JUDGE_CONCURRENCY="${JUDGE_CONCURRENCY:-16}"
+fi
 
 unset LD_LIBRARY_PATH HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy CUDA_VISIBLE_DEVICES AGNES_API_KEY GEMINI_API_KEY || true
 export LD_LIBRARY_PATH="${ENV_DIR}/lib"
@@ -149,8 +164,10 @@ run_contrastive() {
     --data-dir "${BASE}/data/author_prepared" \
     --out-dir "${RUN_DIR}/contrastive" \
     --rewriter-api-base "${J_URL}" \
+    --rewriter-concurrency "${JUDGE_CONCURRENCY}" \
     --tutor-model "${STEP100_DIR}" \
     --student-api-base "${STU_URL}" \
+    --test-parquet-guard "${TEST_494_PARQUET}" \
     --require-math-verify
 }
 
@@ -179,6 +196,7 @@ run_eval_val100() {
     --out-dir "${RUN_DIR}/val100" \
     --student-api-base "${STU_URL}" \
     --judge-api-base "${J_URL}" \
+    --judge-concurrency "${JUDGE_CONCURRENCY}" \
     --require-math-verify
 }
 
